@@ -12,18 +12,31 @@ android {
         applicationId = "com.sonify.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "8.0.0"
+        versionCode = 9
+        versionName = "9.0.0"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     signingConfigs {
         create("release") {
             val keystoreFile = file("release.keystore")
             if (keystoreFile.exists()) {
+                val pass = System.getenv("KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() } ?: "SonifyRelease2026!"
+                val alias = System.getenv("KEY_ALIAS")?.takeIf { it.isNotBlank() } ?: "sonify"
+                val keyPass = System.getenv("KEY_PASSWORD")?.takeIf { it.isNotBlank() } ?: pass
                 storeFile = keystoreFile
-                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
-                keyAlias = System.getenv("KEY_ALIAS") ?: ""
-                keyPassword = System.getenv("KEY_PASSWORD") ?: ""
+                storePassword = pass
+                keyAlias = alias
+                keyPassword = keyPass
             }
         }
     }
@@ -73,6 +86,9 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.4.1")
     implementation("androidx.media3:media3-session:1.4.1")
     implementation("androidx.media3:media3-common:1.4.1")
+
+    // Embedded yt-dlp engine for reliable offline downloads
+    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
 
     // Real QR Code Generator & Offline Camera Scanner
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
