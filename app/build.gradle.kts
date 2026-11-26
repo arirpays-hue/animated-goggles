@@ -12,8 +12,8 @@ android {
         applicationId = "com.sonify.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "7.0.0"
+        versionCode = 8
+        versionName = "8.0.0"
     }
 
     signingConfigs {
@@ -73,6 +73,10 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.4.1")
     implementation("androidx.media3:media3-session:1.4.1")
     implementation("androidx.media3:media3-common:1.4.1")
+
+    // Real QR Code Generator & Offline Camera Scanner
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("com.google.zxing:core:3.5.3")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.coil-kt:coil-compose:2.7.0")
