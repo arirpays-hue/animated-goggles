@@ -20,7 +20,7 @@ class StreamRepository(private val context: Context) {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(16, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
@@ -31,17 +31,18 @@ class StreamRepository(private val context: Context) {
         "https://pipedapi.leptons.xyz"
     )
 
+    private val invidiousInstances = listOf(
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://yewtu.be"
+    )
+
     private val offlineDir: File
         get() = File(context.filesDir, "offline_tracks").apply { if (!exists()) mkdirs() }
 
     fun getOfflineFile(trackId: String): File {
         val safe = trackId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
         return File(offlineDir, "$safe.media")
-    }
-
-    fun isTrackOffline(trackId: String): Boolean {
-        val f = getOfflineFile(trackId)
-        return f.exists() && f.length() > 1024
     }
 
     fun getOfflineTrackIds(): Set<String> {
@@ -55,60 +56,46 @@ class StreamRepository(private val context: Context) {
     suspend fun searchTracks(
         query: String,
         settings: AppSettings,
-        podcastsOnly: Boolean = false
+        podcastsOnly: Boolean = false,
+        filterLongCompilations: Boolean = !podcastsOnly
     ): List<Track> = withContext(Dispatchers.IO) {
         val cleanQuery = if (podcastsOnly && !query.contains("podcast", true) && !query.contains("פודקאסט")) {
             "$query podcast"
         } else query
 
+        val allowLong = !filterLongCompilations ||
+            query.contains("mix", true) ||
+            query.contains("playlist", true) ||
+            query.contains("מיקס") ||
+            query.contains("פודקאסט") ||
+            query.contains("סט")
+
         when (settings.streamSource) {
-            StreamSource.YOUTUBE -> searchYouTube(cleanQuery, podcastsOnly)
+            StreamSource.YOUTUBE -> searchYouTube(cleanQuery, podcastsOnly, allowLong)
             StreamSource.OPENSUBSONIC -> searchSubsonic(cleanQuery, settings)
             StreamSource.LOCAL -> searchLocalAudio(cleanQuery)
         }
     }
 
-    private fun searchYouTube(query: String, isPodcast: Boolean): List<Track> {
-        // 1) Direct YouTube InnerTube Web Search (fast & no API key needed)
-        val innerTubeResults = runCatching { searchInnerTube(query, isPodcast) }.getOrDefault(emptyList())
-        if (innerTubeResults.isNotEmpty()) return innerTubeResults
+    private fun searchYouTube(query: String, isPodcast: Boolean, allowLong: Boolean): List<Track> {
+        val raw = runCatching { searchInnerTube(query, isPodcast) }.getOrDefault(emptyList())
+            .ifEmpty { searchPiped(query, isPodcast) }
+            .ifEmpty { searchInvidious(query, isPodcast) }
 
-        // 2) Fallback to Piped instances
-        val encoded = URLEncoder.encode(query, "UTF-8")
-        for (base in pipedInstances) {
-            val res = runCatching {
-                val req = Request.Builder()
-                    .url("$base/search?q=$encoded&filter=music_songs")
-                    .header("User-Agent", "Mozilla/5.0")
-                    .build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use emptyList()
-                    val json = JSONObject(resp.body?.string() ?: return@use emptyList())
-                    val items = json.optJSONArray("items") ?: return@use emptyList()
-                    buildList {
-                        for (i in 0 until items.length()) {
-                            val o = items.optJSONObject(i) ?: continue
-                            val url = o.optString("url")
-                            val id = url.substringAfter("v=", "").substringBefore("&")
-                            if (id.isBlank()) continue
-                            add(
-                                Track(
-                                    id = id,
-                                    title = o.optString("title", "ללא שם"),
-                                    artist = o.optString("uploaderName", "אמן לא ידוע"),
-                                    artworkUrl = o.optString("thumbnail").ifBlank { "https://i.ytimg.com/vi/$id/hqdefault.jpg" },
-                                    durationMs = o.optLong("duration", 0L) * 1000L,
-                                    source = StreamSource.YOUTUBE,
-                                    isPodcast = isPodcast
-                                )
-                            )
-                        }
-                    }
-                }
-            }.getOrDefault(emptyList())
-            if (res.isNotEmpty()) return res
+        if (allowLong) return raw.distinctBy { it.id }.take(20)
+
+        val filtered = raw.filter { t ->
+            val under12Min = t.durationMs == 0L || t.durationMs in 45_000L..720_000L
+            val lower = t.title.lowercase()
+            val notCompilation = !lower.contains("1 hour") &&
+                !lower.contains("2 hour") &&
+                !lower.contains("hour playlist") &&
+                !lower.contains("full album") &&
+                !lower.contains("nonstop") &&
+                !lower.contains("compilation")
+            under12Min && notCompilation
         }
-        return emptyList()
+        return (if (filtered.size >= 4) filtered else raw).distinctBy { it.id }.take(20)
     }
 
     private fun searchInnerTube(query: String, isPodcast: Boolean): List<Track> {
@@ -134,12 +121,86 @@ class StreamRepository(private val context: Context) {
             val root = JSONObject(resp.body?.string() ?: return emptyList())
             val out = mutableListOf<Track>()
             extractVideoRenderers(root, out, isPodcast)
-            out.distinctBy { it.id }.take(20)
+            out.distinctBy { it.id }
         }
     }
 
+    private fun searchPiped(query: String, isPodcast: Boolean): List<Track> {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        for (base in pipedInstances) {
+            val res = runCatching {
+                val req = Request.Builder()
+                    .url("$base/search?q=$encoded&filter=music_songs")
+                    .header("User-Agent", "Mozilla/5.0")
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use emptyList()
+                    val json = JSONObject(resp.body?.string() ?: return@use emptyList())
+                    val items = json.optJSONArray("items") ?: return@use emptyList()
+                    buildList {
+                        for (i in 0 until items.length()) {
+                            val o = items.optJSONObject(i) ?: continue
+                            val url = o.optString("url")
+                            val id = url.substringAfter("v=", "").substringBefore("&")
+                            if (id.length != 11) continue
+                            add(
+                                Track(
+                                    id = id,
+                                    title = o.optString("title", "ללא שם"),
+                                    artist = o.optString("uploaderName", "אמן לא ידוע"),
+                                    artworkUrl = o.optString("thumbnail").ifBlank { "https://i.ytimg.com/vi/$id/hqdefault.jpg" },
+                                    durationMs = o.optLong("duration", 0L) * 1000L,
+                                    source = StreamSource.YOUTUBE,
+                                    isPodcast = isPodcast
+                                )
+                            )
+                        }
+                    }
+                }
+            }.getOrDefault(emptyList())
+            if (res.isNotEmpty()) return res
+        }
+        return emptyList()
+    }
+
+    private fun searchInvidious(query: String, isPodcast: Boolean): List<Track> {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        for (base in invidiousInstances) {
+            val res = runCatching {
+                val req = Request.Builder()
+                    .url("$base/api/v1/search?q=$encoded&type=video")
+                    .header("User-Agent", "Mozilla/5.0")
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use emptyList()
+                    val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
+                    buildList {
+                        for (i in 0 until arr.length().coerceAtMost(20)) {
+                            val o = arr.optJSONObject(i) ?: continue
+                            val id = o.optString("videoId")
+                            if (id.length != 11) continue
+                            add(
+                                Track(
+                                    id = id,
+                                    title = o.optString("title", "ללא שם"),
+                                    artist = o.optString("author", "YouTube"),
+                                    artworkUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
+                                    durationMs = o.optLong("lengthSeconds", 0L) * 1000L,
+                                    source = StreamSource.YOUTUBE,
+                                    isPodcast = isPodcast
+                                )
+                            )
+                        }
+                    }
+                }
+            }.getOrDefault(emptyList())
+            if (res.isNotEmpty()) return res
+        }
+        return emptyList()
+    }
+
     private fun extractVideoRenderers(node: Any?, out: MutableList<Track>, isPodcast: Boolean) {
-        if (out.size >= 25 || node == null) return
+        if (out.size >= 30 || node == null) return
         when (node) {
             is JSONObject -> {
                 if (node.has("videoRenderer")) {
@@ -201,31 +262,26 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    suspend fun resolveStreams(track: Track, settings: AppSettings): ResolvedStreams? = withContext(Dispatchers.IO) {
-        // 1) Offline downloaded file first
+    suspend fun resolveStreams(track: Track, settings: AppSettings, attemptIndex: Int = 0): ResolvedStreams? = withContext(Dispatchers.IO) {
         val offlineFile = getOfflineFile(track.id)
         if (offlineFile.exists() && offlineFile.length() > 1024) {
             return@withContext ResolvedStreams(
                 audioUrl = offlineFile.toURI().toString(),
-                videoUrl = null,
                 isLossless = track.source != StreamSource.YOUTUBE,
                 isOffline = true,
                 codecLabel = "OFFLINE"
             )
         }
 
-        // 2) Local device file
         if (track.source == StreamSource.LOCAL && !track.localUri.isNullOrBlank()) {
             val isFlac = track.title.endsWith(".flac", true) || track.album.contains("FLAC", true)
             return@withContext ResolvedStreams(
                 audioUrl = track.localUri,
-                videoUrl = null,
                 isLossless = isFlac,
                 codecLabel = if (isFlac) "FLAC Lossless" else "LOCAL"
             )
         }
 
-        // 3) OpenSubsonic / Navidrome server (True Lossless FLAC)
         if (track.source == StreamSource.OPENSUBSONIC && settings.subsonicUrl.isNotBlank()) {
             val auth = buildSubsonicAuth(settings.subsonicUser, settings.subsonicPass)
             val formatParam = if (settings.quality == AudioQuality.LOSSLESS) "format=raw" else "maxBitRate=${settings.quality.kbps}"
@@ -233,34 +289,34 @@ class StreamRepository(private val context: Context) {
             val url = "$base/rest/stream.view?id=${URLEncoder.encode(track.id, "UTF-8")}&$formatParam&$auth"
             return@withContext ResolvedStreams(
                 audioUrl = url,
-                videoUrl = null,
                 isLossless = settings.quality == AudioQuality.LOSSLESS,
                 codecLabel = if (settings.quality == AudioQuality.LOSSLESS) "FLAC Lossless" else "${settings.quality.kbps}kbps"
             )
         }
 
-        // 4) YouTube Audio + Video Clip resolution
-        resolveYouTubeStreams(track.id, settings.quality)
+        resolveYouTubeStreams(track.id, settings.quality, attemptIndex)
     }
 
-    private fun resolveYouTubeStreams(videoId: String, quality: AudioQuality): ResolvedStreams? {
-        // Try InnerTube ANDROID_VR & IOS clients (direct non-deciphered URLs)
-        val clients = listOf(
-            Triple("ANDROID_VR", "1.60.19", "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"),
-            Triple("IOS", "20.03.02", "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X)")
+    private fun resolveYouTubeStreams(videoId: String, quality: AudioQuality, startIndex: Int): ResolvedStreams? {
+        data class ClientSpec(val name: String, val version: String, val idHeader: String, val ua: String)
+        val specs = listOf(
+            ClientSpec("IOS", "20.10.4", "5", "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)"),
+            ClientSpec("ANDROID_VR", "1.61.48", "28", "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"),
+            ClientSpec("ANDROID_TESTSUITE", "1.9", "30", "com.google.android.youtube/1.9 (Linux; U; Android 11) gzip")
         )
-        for ((clientName, clientVersion, ua) in clients) {
-            val resolved = runCatching { fetchInnerTubePlayer(videoId, clientName, clientVersion, ua, quality) }.getOrNull()
+
+        val ordered = specs.drop(startIndex) + specs.take(startIndex.coerceAtMost(specs.size))
+        for (spec in ordered) {
+            val resolved = runCatching {
+                fetchInnerTubePlayer(videoId, spec.name, spec.version, spec.idHeader, spec.ua, quality)
+            }.getOrNull()
             if (resolved != null) return resolved
         }
 
-        // Fallback: Piped API streams
+        // Fallback 1: Piped API
         for (base in pipedInstances) {
             val resolved = runCatching {
-                val req = Request.Builder()
-                    .url("$base/streams/$videoId")
-                    .header("User-Agent", "Mozilla/5.0")
-                    .build()
+                val req = Request.Builder().url("$base/streams/$videoId").header("User-Agent", "Mozilla/5.0").build()
                 client.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return@use null
                     val json = JSONObject(resp.body?.string() ?: return@use null)
@@ -279,23 +335,79 @@ class StreamRepository(private val context: Context) {
                     }
                     val chosenAudio = pickAudioByQuality(audioStreams, quality) ?: hls ?: return@use null
 
-                    var chosenVideo: String? = hls
+                    var muxedVideo: String? = hls
+                    var videoOnly: String? = null
                     if (videoArr != null) {
                         for (i in 0 until videoArr.length()) {
                             val v = videoArr.optJSONObject(i) ?: continue
-                            val videoOnly = v.optBoolean("videoOnly", true)
+                            val vo = v.optBoolean("videoOnly", true)
                             val u = v.optString("url")
-                            if (!videoOnly && u.startsWith("http")) {
-                                chosenVideo = u
+                            val q = v.optString("quality")
+                            if (!u.startsWith("http")) continue
+                            if (!vo) {
+                                muxedVideo = u
                                 break
+                            } else if (videoOnly == null || q.contains("720") || q.contains("480")) {
+                                videoOnly = u
                             }
                         }
                     }
                     ResolvedStreams(
                         audioUrl = chosenAudio,
-                        videoUrl = chosenVideo,
-                        isLossless = false,
+                        videoUrl = muxedVideo,
+                        videoOnlyUrl = videoOnly,
+                        userAgent = "Mozilla/5.0",
                         codecLabel = "${quality.kbps.coerceAtMost(256)}kbps"
+                    )
+                }
+            }.getOrNull()
+            if (resolved != null) return resolved
+        }
+
+        // Fallback 2: Invidious API
+        for (base in invidiousInstances) {
+            val resolved = runCatching {
+                val req = Request.Builder().url("$base/api/v1/videos/$videoId").header("User-Agent", "Mozilla/5.0").build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    val json = JSONObject(resp.body?.string() ?: return@use null)
+                    val formats = json.optJSONArray("formatStreams")
+                    val adaptive = json.optJSONArray("adaptiveFormats")
+                    var muxed: String? = null
+                    val audios = mutableListOf<Pair<Int, String>>()
+                    var videoOnly: String? = null
+
+                    if (formats != null) {
+                        for (i in 0 until formats.length()) {
+                            val f = formats.optJSONObject(i) ?: continue
+                            val u = f.optString("url")
+                            if (u.startsWith("http")) {
+                                muxed = u
+                                audios.add(128 to u)
+                            }
+                        }
+                    }
+                    if (adaptive != null) {
+                        for (i in 0 until adaptive.length()) {
+                            val f = adaptive.optJSONObject(i) ?: continue
+                            val type = f.optString("type")
+                            val u = f.optString("url")
+                            if (!u.startsWith("http")) continue
+                            if (type.startsWith("audio/")) {
+                                val br = f.optString("bitrate").toIntOrNull()?.div(1000) ?: 128
+                                audios.add(br to u)
+                            } else if (type.startsWith("video/mp4") && videoOnly == null) {
+                                videoOnly = u
+                            }
+                        }
+                    }
+                    val chosenAudio = pickAudioByQuality(audios, quality) ?: muxed ?: return@use null
+                    ResolvedStreams(
+                        audioUrl = chosenAudio,
+                        videoUrl = muxed,
+                        videoOnlyUrl = videoOnly,
+                        userAgent = "Mozilla/5.0",
+                        codecLabel = "256kbps"
                     )
                 }
             }.getOrNull()
@@ -308,6 +420,7 @@ class StreamRepository(private val context: Context) {
         videoId: String,
         clientName: String,
         clientVersion: String,
+        clientIdHeader: String,
         userAgent: String,
         quality: AudioQuality
     ): ResolvedStreams? {
@@ -328,15 +441,21 @@ class StreamRepository(private val context: Context) {
             .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
             .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
             .header("User-Agent", userAgent)
+            .header("X-YouTube-Client-Name", clientIdHeader)
+            .header("X-YouTube-Client-Version", clientVersion)
+            .header("Origin", "https://www.youtube.com")
             .build()
 
         return client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return null
             val root = JSONObject(resp.body?.string() ?: return null)
+            val status = root.optJSONObject("playabilityStatus")?.optString("status")
+            if (status != null && status != "OK") return null
             val sd = root.optJSONObject("streamingData") ?: return null
             val hls = sd.optString("hlsManifestUrl").takeIf { it.startsWith("http") }
 
             val audioCandidates = mutableListOf<Pair<Int, String>>()
+            val videoCandidates = mutableListOf<Pair<Int, String>>()
             var muxedVideoUrl: String? = null
 
             val formats = sd.optJSONArray("formats")
@@ -358,18 +477,27 @@ class StreamRepository(private val context: Context) {
                     val f = adaptive.optJSONObject(i) ?: continue
                     val mime = f.optString("mimeType")
                     val u = f.optString("url")
-                    if (mime.startsWith("audio/") && u.startsWith("http")) {
+                    if (!u.startsWith("http")) continue
+                    if (mime.startsWith("audio/")) {
                         val br = f.optInt("bitrate", 128000) / 1000
                         audioCandidates.add(br to u)
+                    } else if (mime.startsWith("video/mp4")) {
+                        val h = f.optInt("height", 360)
+                        if (h in 240..720) videoCandidates.add(h to u)
                     }
                 }
             }
 
             val bestAudio = pickAudioByQuality(audioCandidates, quality) ?: hls ?: return null
-            val bestVideo = muxedVideoUrl ?: hls
+            val bestVideoOnly = videoCandidates.sortedBy { it.first }
+                .lastOrNull { it.first <= 720 }?.second
+            val bestMuxedOrHls = muxedVideoUrl ?: hls
+
             ResolvedStreams(
                 audioUrl = bestAudio,
-                videoUrl = bestVideo,
+                videoUrl = bestMuxedOrHls,
+                videoOnlyUrl = bestVideoOnly,
+                userAgent = userAgent,
                 isLossless = false,
                 codecLabel = when (quality) {
                     AudioQuality.LOW -> "64kbps"
@@ -390,12 +518,170 @@ class StreamRepository(private val context: Context) {
         }
     }
 
+    // ---------- Smart AI Playlist Curating Engine ----------
+    suspend fun buildAiPlaylist(prompt: String, settings: AppSettings): Pair<String, List<Track>> = withContext(Dispatchers.IO) {
+        val cleanPrompt = prompt.trim()
+
+        // Mode 1: If user provided a Gemini API key, ask Gemini to pick 12 exact songs
+        if (settings.geminiApiKey.isNotBlank()) {
+            val geminiPlan = runCatching { requestGeminiSongList(cleanPrompt, settings.geminiApiKey) }.getOrNull()
+            if (geminiPlan != null && geminiPlan.second.isNotEmpty()) {
+                val curated = mutableListOf<Track>()
+                for (songQuery in geminiPlan.second.take(12)) {
+                    val found = searchTracks("$songQuery official audio", settings, podcastsOnly = false, filterLongCompilations = true)
+                    found.firstOrNull { cand -> curated.none { it.id == cand.id } }?.let { curated.add(it) }
+                }
+                if (curated.isNotEmpty()) {
+                    return@withContext geminiPlan.first to curated
+                }
+            }
+        }
+
+        // Mode 2: Built-in Smart Multi-Query Curator (No API key needed, supports Hebrew + English)
+        val (playlistTitle, queries) = expandPromptIntoSmartQueries(cleanPrompt)
+        val curated = mutableListOf<Track>()
+        val seenTitles = mutableSetOf<String>()
+
+        for (q in queries) {
+            val results = searchTracks(q, settings, podcastsOnly = false, filterLongCompilations = true)
+            for (t in results) {
+                val normTitle = t.title.lowercase().replace(Regex("[^a-z0-9א-ת]"), "").take(18)
+                if (curated.none { it.id == t.id } && seenTitles.add(normTitle)) {
+                    curated.add(t)
+                    if (curated.size >= 14) break
+                }
+            }
+            if (curated.size >= 14) break
+        }
+
+        // Last-resort fallback if prompt was super abstract
+        if (curated.isEmpty()) {
+            val fallback = searchTracks("$cleanPrompt song", settings, podcastsOnly = false, filterLongCompilations = false)
+            curated.addAll(fallback.take(10))
+        }
+
+        playlistTitle to curated.shuffled()
+    }
+
+    private fun expandPromptIntoSmartQueries(prompt: String): Pair<String, List<String>> {
+        val lower = prompt.lowercase()
+        val isHebrewPrompt = prompt.any { it in '\u0590'..'\u05FF' }
+        val wantsEnglish = lower.contains("אנגלית") || lower.contains("english") || lower.contains("לועזי")
+        val wantsHebrew = lower.contains("עברית") || lower.contains("ישראלי") || lower.contains("hebrew") || (isHebrewPrompt && !wantsEnglish)
+
+        val queries = mutableListOf<String>()
+
+        when {
+            lower.contains("אימון") || lower.contains("כושר") || lower.contains("ריצה") || lower.contains("workout") || lower.contains("gym") -> {
+                if (wantsHebrew) {
+                    queries += listOf("שירי אימון ישראלי קצבי", "ראפ ישראלי אנרגטי שיר", "פופ ישראלי קצבי להיטים")
+                }
+                queries += listOf("gym workout rap songs official audio", "high energy phonk edm song", "running motivation hits song")
+            }
+            lower.contains("לילה") || lower.contains("רגוע") || lower.contains("שינה") || lower.contains("צ'יל") || lower.contains("chill") || lower.contains("sleep") -> {
+                if (wantsHebrew) {
+                    queries += listOf("שירים ישראליים שקטים ללילה", "בלדות ישראליות רגועות")
+                }
+                queries += listOf("chill late night r&b song", "acoustic indie chill song", "lofi chill song official audio")
+            }
+            lower.contains("מסיבה") || lower.contains("קלאב") || lower.contains("ריקוד") || lower.contains("party") || lower.contains("club") -> {
+                if (wantsHebrew) queries += listOf("להיטי מסיבות ישראל 2025 2026", "מזרחית שמח להיטים")
+                queries += listOf("party dance hits official audio", "club edm top songs")
+            }
+            lower.contains("עצוב") || lower.contains("שבור") || lower.contains("בלד") || lower.contains("sad") -> {
+                if (wantsHebrew) queries += listOf("שירים עצובים בעברית", "בלדות ישראליות מרגשות")
+                queries += listOf("emotional sad pop song official audio", "slow heartbreak ballad song")
+            }
+            lower.contains("למידה") || lower.contains("פוקוס") || lower.contains("ריכוז") || lower.contains("study") || lower.contains("focus") -> {
+                queries += listOf("instrumental focus beats song", "ambient piano focus track", "chill electronic study track")
+            }
+            lower.contains("נסיעה") || lower.contains("אוטו") || lower.contains("כביש") || lower.contains("drive") -> {
+                if (wantsHebrew) queries += listOf("שירים לנסיעה בעברית להיטים", "רוק ישראלי לנסיעה")
+                queries += listOf("night drive synthwave song", "road trip pop rock hits song")
+            }
+            lower.contains("רוק") || lower.contains("rock") || lower.contains("מטאל") || lower.contains("metal") -> {
+                if (wantsHebrew) queries += listOf("רוק ישראלי קלאסי שיר", "רוק ישראלי מודרני")
+                queries += listOf("best rock songs official audio", "alternative rock hits song")
+            }
+            lower.contains("ראפ") || lower.contains("היפ") || lower.contains("rap") || lower.contains("hip hop") -> {
+                if (wantsHebrew) queries += listOf("ראפ ישראלי להיטים שיר", "טונה רביד פלוטניק שירים")
+                queries += listOf("hip hop rap hits official audio", "trap rap banger official audio")
+            }
+            lower.contains("מזרחית") || lower.contains("ים תיכוני") -> {
+                queries += listOf("שירים מזרחיים חדשים 2026", "עומר אדם עדן חסון להיטים", "אייל גולן פאר טסי שירים")
+            }
+            else -> {
+                queries += listOf(
+                    "$prompt שיר",
+                    "$prompt official audio",
+                    "$prompt best songs",
+                    "$prompt hits"
+                )
+            }
+        }
+
+        val cleanTitle = "AI • ${prompt.take(28)}"
+        return cleanTitle to queries.distinct()
+    }
+
+    private fun requestGeminiSongList(prompt: String, apiKey: String): Pair<String, List<String>>? {
+        val sysPrompt = """
+            Build a 12-song music playlist for this user request: "$prompt".
+            Reply ONLY with valid JSON: {"title": "Short catchy playlist title in the user's language", "songs": ["Artist - Song Title", ...]}
+        """.trimIndent()
+        val payload = JSONObject().apply {
+            put("contents", JSONArray().put(
+                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sysPrompt)))
+            ))
+        }
+        val req = Request.Builder()
+            .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        return client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val root = JSONObject(resp.body?.string() ?: return null)
+            val text = root.optJSONArray("candidates")
+                ?.optJSONObject(0)
+                ?.optJSONObject("content")
+                ?.optJSONArray("parts")
+                ?.optJSONObject(0)
+                ?.optString("text") ?: return null
+            val jsonSlice = text.substringAfter("{").substringBeforeLast("}")
+            val parsed = JSONObject("{$jsonSlice}")
+            val title = parsed.optString("title", "AI • ${prompt.take(24)}")
+            val songsArr = parsed.optJSONArray("songs") ?: return null
+            val songs = buildList {
+                for (i in 0 until songsArr.length()) {
+                    songsArr.optString(i).takeIf { it.isNotBlank() }?.let { add(it) }
+                }
+            }
+            title to songs
+        }
+    }
+
+    // ---------- OpenSubsonic / Navidrome ----------
+    suspend fun testSubsonicConnection(settings: AppSettings): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        if (settings.subsonicUrl.isBlank()) return@withContext false to "יש להזין כתובת שרת"
+        runCatching {
+            val base = settings.subsonicUrl.trimEnd('/')
+            val auth = buildSubsonicAuth(settings.subsonicUser, settings.subsonicPass)
+            val req = Request.Builder().url("$base/rest/ping.view?$auth").build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use false to "שגיאת HTTP ${resp.code}"
+                val json = JSONObject(resp.body?.string() ?: "")
+                val ok = json.optJSONObject("subsonic-response")?.optString("status") == "ok"
+                if (ok) true to "חיבור לשרת Lossless הצליח!" else false to "שם משתמש או סיסמה שגויים"
+            }
+        }.getOrElse { false to "לא ניתן להתחבר לשרת: ${it.message}" }
+    }
+
     private fun searchSubsonic(query: String, settings: AppSettings): List<Track> {
         if (settings.subsonicUrl.isBlank()) return emptyList()
         return runCatching {
             val base = settings.subsonicUrl.trimEnd('/')
             val auth = buildSubsonicAuth(settings.subsonicUser, settings.subsonicPass)
-            val q = URLEncoder.encode(query.ifBlank { "a" }, "UTF-8")
+            val q = URLEncoder.encode(query.ifBlank { "" }, "UTF-8")
             val req = Request.Builder()
                 .url("$base/rest/search3.view?query=$q&songCount=30&$auth")
                 .build()
@@ -435,6 +721,7 @@ class StreamRepository(private val context: Context) {
         return "u=${URLEncoder.encode(user, "UTF-8")}&t=$digest&s=$salt&v=1.16.1&c=Sonify&f=json"
     }
 
+    // ---------- Local Device Audio ----------
     fun searchLocalAudio(query: String): List<Track> {
         val list = mutableListOf<Track>()
         runCatching {
@@ -494,31 +781,55 @@ class StreamRepository(private val context: Context) {
         return list
     }
 
+    // ---------- Synced Lyrics (LRCLIB Exact + Search Fallback) ----------
     suspend fun fetchSyncedLyrics(artist: String, title: String): List<LyricLine> = withContext(Dispatchers.IO) {
         val cleanTitle = title
             .replace(Regex("\\(.*?\\)|\\[.*?]"), "")
             .replace("Official Video", "", true)
             .replace("Official Audio", "", true)
+            .replace("Official Music Video", "", true)
+            .replace("Lyric Video", "", true)
+            .replace("קליפ רשמי", "")
             .trim()
-        val cleanArtist = artist.replace("- Topic", "", true).trim()
+        val cleanArtist = artist.replace("- Topic", "", true).replace("VEVO", "", true).trim()
 
-        runCatching {
+        // 1) Exact match
+        val exact = runCatching {
             val url = "https://lrclib.net/api/get?artist_name=${URLEncoder.encode(cleanArtist, "UTF-8")}&track_name=${URLEncoder.encode(cleanTitle, "UTF-8")}"
-            val req = Request.Builder().url(url).header("User-Agent", "Sonify/1.0").build()
+            val req = Request.Builder().url(url).header("User-Agent", "Sonify/2.0").build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@use emptyList()
-                val json = JSONObject(resp.body?.string() ?: return@use emptyList())
-                val synced = json.optString("syncedLyrics")
-                if (synced.isNotBlank()) return@use parseLrc(synced)
-                val plain = json.optString("plainLyrics")
-                if (plain.isNotBlank()) {
-                    return@use plain.lines().filter { it.isNotBlank() }.mapIndexed { idx, line ->
-                        LyricLine(idx * 3500L, line.trim())
-                    }
+                parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
+            }
+        }.getOrDefault(emptyList())
+        if (exact.isNotEmpty()) return@withContext exact
+
+        // 2) Broad search fallback
+        runCatching {
+            val q = URLEncoder.encode("$cleanArtist $cleanTitle".trim(), "UTF-8")
+            val req = Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/2.0").build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use emptyList()
+                val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
+                for (i in 0 until arr.length().coerceAtMost(5)) {
+                    val parsed = parseLyricsJson(arr.optJSONObject(i) ?: continue)
+                    if (parsed.isNotEmpty()) return@use parsed
                 }
                 emptyList()
             }
         }.getOrDefault(emptyList())
+    }
+
+    private fun parseLyricsJson(json: JSONObject): List<LyricLine> {
+        val synced = json.optString("syncedLyrics")
+        if (synced.isNotBlank()) return parseLrc(synced)
+        val plain = json.optString("plainLyrics")
+        if (plain.isNotBlank()) {
+            return plain.lines().filter { it.isNotBlank() }.mapIndexed { idx, line ->
+                LyricLine(idx * 3500L, line.trim())
+            }
+        }
+        return emptyList()
     }
 
     private fun parseLrc(lrc: String): List<LyricLine> {
@@ -540,7 +851,7 @@ class StreamRepository(private val context: Context) {
         runCatching {
             val req = Request.Builder()
                 .url(resolved.audioUrl)
-                .header("User-Agent", "Mozilla/5.0")
+                .header("User-Agent", resolved.userAgent)
                 .build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@use false
