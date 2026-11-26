@@ -2,13 +2,24 @@
 
 package com.sonify.app
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.audiofx.Equalizer
 import android.media.audiofx.LoudnessEnhancer
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.view.ViewGroup
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -17,7 +28,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource
@@ -32,6 +43,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 
 object PlayerHolder {
     @Volatile
@@ -72,11 +85,257 @@ class PlaybackService : MediaSessionService() {
     }
 }
 
+// ---------- Built-In Bulletproof YouTube Web Engine (Immune to HTTP 403) ----------
+class WebPlaybackEngine(private val context: Context) {
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var webView: WebView? = null
+    private var isMobileWatchFallback = false
+    private var currentVideoId: String = ""
+    @Volatile var isActive: Boolean = false
+        private set
+    @Volatile var isPlaying: Boolean = false
+        private set
+
+    var onProgress: ((Long, Long, Boolean, Boolean) -> Unit)? = null
+    var onEnded: (() -> Unit)? = null
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun getOrCreateWebView(): WebView {
+        webView?.let { return it }
+        return WebView(context.applicationContext).apply {
+            setBackgroundColor(android.graphics.Color.BLACK)
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.mediaPlaybackRequiresUserGesture = false
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            settings.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+            webChromeClient = WebChromeClient()
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    if (isMobileWatchFallback) {
+                        injectMobileWatchHook()
+                    }
+                }
+            }
+            addJavascriptInterface(JsBridge(), "SonifyBridge")
+            webView = this
+        }
+    }
+
+    fun attachTo(container: FrameLayout) {
+        mainHandler.post {
+            val wv = getOrCreateWebView()
+            if (wv.parent !== container) {
+                (wv.parent as? ViewGroup)?.removeView(wv)
+                container.removeAllViews()
+                container.addView(
+                    wv,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                )
+            }
+            wv.onResume()
+            wv.resumeTimers()
+        }
+    }
+
+    fun playVideo(videoId: String) {
+        currentVideoId = videoId
+        isActive = true
+        isMobileWatchFallback = false
+        mainHandler.post {
+            val wv = getOrCreateWebView()
+            wv.onResume()
+            wv.resumeTimers()
+            val html = """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+                <style>
+                  html, body, #player { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+                </style>
+                </head>
+                <body>
+                <div id="player"></div>
+                <script src="https://www.youtube.com/iframe_api"></script>
+                <script>
+                  var player;
+                  function onYouTubeIframeAPIReady() {
+                    player = new YT.Player('player', {
+                      width: '100%',
+                      height: '100%',
+                      videoId: '$videoId',
+                      playerVars: {
+                        'autoplay': 1,
+                        'playsinline': 1,
+                        'controls': 0,
+                        'rel': 0,
+                        'modestbranding': 1,
+                        'enablejsapi': 1,
+                        'origin': 'https://www.youtube.com'
+                      },
+                      events: {
+                        'onReady': function(e) {
+                          e.target.playVideo();
+                        },
+                        'onStateChange': function(e) {
+                          if (e.data === YT.PlayerState.ENDED) {
+                            SonifyBridge.onEnded();
+                          }
+                        },
+                        'onError': function(e) {
+                          SonifyBridge.onEmbedError(e.data);
+                        }
+                      }
+                    });
+                  }
+                  setInterval(function() {
+                    if (player && typeof player.getCurrentTime === 'function') {
+                      var pos = Math.floor((player.getCurrentTime() || 0) * 1000);
+                      var dur = Math.floor((player.getDuration() || 0) * 1000);
+                      var st = player.getPlayerState ? player.getPlayerState() : -1;
+                      var playing = (st === 1);
+                      var buffering = (st === 3 || st === -1);
+                      SonifyBridge.onProgress(pos, dur, playing, buffering);
+                    }
+                  }, 350);
+                  window.sonifyToggle = function() {
+                    if (!player) return;
+                    if (player.getPlayerState() === 1) player.pauseVideo(); else player.playVideo();
+                  };
+                  window.sonifyPause = function() { if (player && player.pauseVideo) player.pauseVideo(); };
+                  window.sonifySeek = function(sec) { if (player && player.seekTo) player.seekTo(sec, true); };
+                  window.sonifyVolume = function(pct) { if (player && player.setVolume) player.setVolume(pct); };
+                </script>
+                </body>
+                </html>
+            """.trimIndent()
+            wv.loadDataWithBaseURL("https://www.youtube.com", html, "text/html", "UTF-8", null)
+        }
+    }
+
+    private fun switchToMobileWatchFallback() {
+        if (currentVideoId.isBlank() || isMobileWatchFallback) return
+        isMobileWatchFallback = true
+        mainHandler.post {
+            getOrCreateWebView().loadUrl("https://m.youtube.com/watch?v=$currentVideoId")
+        }
+    }
+
+    private fun injectMobileWatchHook() {
+        val js = """
+            (function() {
+              if (window.__sonifyHooked) return;
+              window.__sonifyHooked = true;
+              setInterval(function() {
+                var v = document.querySelector('video');
+                if (!v) return;
+                if (!window.__sonifyAutoPlayed) {
+                  v.muted = false;
+                  v.play().catch(function(){});
+                  window.__sonifyAutoPlayed = true;
+                }
+                var pos = Math.floor((v.currentTime || 0) * 1000);
+                var dur = Math.floor((isFinite(v.duration) ? v.duration : 0) * 1000);
+                var playing = !v.paused && !v.ended && v.readyState > 2;
+                var buffering = !v.paused && v.readyState <= 2;
+                SonifyBridge.onProgress(pos, dur, playing, buffering);
+                if (v.ended && !window.__sonifyEndedFired) {
+                  window.__sonifyEndedFired = true;
+                  SonifyBridge.onEnded();
+                }
+              }, 350);
+              window.sonifyToggle = function() {
+                var v = document.querySelector('video');
+                if (!v) return;
+                if (v.paused) v.play(); else v.pause();
+              };
+              window.sonifyPause = function() {
+                var v = document.querySelector('video');
+                if (v) v.pause();
+              };
+              window.sonifySeek = function(sec) {
+                var v = document.querySelector('video');
+                if (v) v.currentTime = sec;
+              };
+              window.sonifyVolume = function(pct) {
+                var v = document.querySelector('video');
+                if (v) v.volume = Math.max(0, Math.min(1, pct / 100));
+              };
+            })();
+        """.trimIndent()
+        mainHandler.post { webView?.evaluateJavascript(js, null) }
+    }
+
+    fun togglePlayPause() {
+        mainHandler.post { webView?.evaluateJavascript("if(window.sonifyToggle) window.sonifyToggle();", null) }
+    }
+
+    fun pause() {
+        mainHandler.post { webView?.evaluateJavascript("if(window.sonifyPause) window.sonifyPause();", null) }
+    }
+
+    fun seekTo(ms: Long) {
+        val sec = (ms / 1000.0).coerceAtLeast(0.0)
+        mainHandler.post { webView?.evaluateJavascript("if(window.sonifySeek) window.sonifySeek($sec);", null) }
+    }
+
+    fun setVolume(fraction: Float) {
+        val pct = (fraction * 100).toInt().coerceIn(0, 100)
+        mainHandler.post { webView?.evaluateJavascript("if(window.sonifyVolume) window.sonifyVolume($pct);", null) }
+    }
+
+    fun stop() {
+        isActive = false
+        isPlaying = false
+        mainHandler.post {
+            webView?.evaluateJavascript("if(window.sonifyPause) window.sonifyPause();", null)
+            webView?.loadUrl("about:blank")
+        }
+    }
+
+    private inner class JsBridge {
+        @JavascriptInterface
+        fun onProgress(posMs: Long, durMs: Long, playing: Boolean, buffering: Boolean) {
+            if (!isActive) return
+            isPlaying = playing
+            mainHandler.post { onProgress?.invoke(posMs, durMs, playing, buffering) }
+        }
+
+        @JavascriptInterface
+        fun onEnded() {
+            if (!isActive) return
+            mainHandler.post { onEnded?.invoke() }
+        }
+
+        @JavascriptInterface
+        fun onEmbedError(code: Int) {
+            if (!isActive) return
+            // Error 101 / 150 = label disabled embed -> switch seamlessly to m.youtube.com HTML5 video
+            if (code == 101 || code == 150 || code == 153 || code == 5) {
+                switchToMobileWatchFallback()
+            }
+        }
+    }
+}
+
 class AudioEngine(private val context: Context) {
 
     val player: ExoPlayer = PlayerHolder.getOrCreate(context)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    val webEngine = WebPlaybackEngine(context)
 
+    private val okHttpClient = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(16, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var equalizer: Equalizer? = null
     private var loudnessEnhancer: LoudnessEnhancer? = null
     private var lastSettings: AppSettings = AppSettings()
@@ -90,13 +349,27 @@ class AudioEngine(private val context: Context) {
     var onProgressUpdate: ((Long, Long, Boolean, Boolean) -> Unit)? = null
 
     init {
+        webEngine.onProgress = { pos, dur, playing, buffering ->
+            if (webEngine.isActive) {
+                onProgressUpdate?.invoke(pos, dur, playing, buffering)
+            }
+        }
+        webEngine.onEnded = {
+            if (sleepEndOfTrack) {
+                sleepEndOfTrack = false
+                webEngine.pause()
+            } else {
+                onTrackEnded?.invoke()
+            }
+        }
+
         player.addListener(object : Player.Listener {
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
                 attachAudioEffects(audioSessionId)
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_ENDED) {
+                if (playbackState == Player.STATE_ENDED && !webEngine.isActive) {
                     if (sleepEndOfTrack) {
                         sleepEndOfTrack = false
                         player.pause()
@@ -107,49 +380,47 @@ class AudioEngine(private val context: Context) {
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                onPlaybackError?.invoke(error.errorCodeName)
+                if (!webEngine.isActive) {
+                    onPlaybackError?.invoke(error.errorCodeName)
+                }
             }
         })
 
-        runCatching {
-            context.startService(Intent(context, PlaybackService::class.java))
-        }
+        runCatching { context.startService(Intent(context, PlaybackService::class.java)) }
 
         scope.launch {
             while (isActive) {
-                val pos = player.currentPosition.coerceAtLeast(0L)
-                val dur = player.duration.coerceAtLeast(0L)
-                val buffering = player.playbackState == Player.STATE_BUFFERING
-                onProgressUpdate?.invoke(pos, dur, player.isPlaying, buffering)
+                if (!webEngine.isActive) {
+                    val pos = player.currentPosition.coerceAtLeast(0L)
+                    val dur = player.duration.coerceAtLeast(0L)
+                    val buffering = player.playbackState == Player.STATE_BUFFERING
+                    onProgressUpdate?.invoke(pos, dur, player.isPlaying, buffering)
 
-                val cfMs = lastSettings.crossfadeSeconds * 1000L
-                if (cfMs > 0 && dur > cfMs && player.isPlaying) {
-                    val remaining = dur - pos
-                    if (remaining in 1..cfMs) {
-                        player.volume = (remaining.toFloat() / cfMs.toFloat()).coerceIn(0.05f, 1f)
-                    } else if (pos < cfMs / 2) {
-                        player.volume = (pos.toFloat() / (cfMs / 2f)).coerceIn(0.15f, 1f)
-                    } else {
+                    val cfMs = lastSettings.crossfadeSeconds * 1000L
+                    if (cfMs > 0 && dur > cfMs && player.isPlaying) {
+                        val remaining = dur - pos
+                        if (remaining in 1..cfMs) {
+                            player.volume = (remaining.toFloat() / cfMs.toFloat()).coerceIn(0.05f, 1f)
+                        } else if (pos < cfMs / 2) {
+                            player.volume = (pos.toFloat() / (cfMs / 2f)).coerceIn(0.15f, 1f)
+                        } else {
+                            player.volume = 1f
+                        }
+                    } else if (sleepJob == null || !sleepJob!!.isActive) {
                         player.volume = 1f
                     }
-                } else if (sleepJob == null || !sleepJob!!.isActive) {
-                    player.volume = 1f
                 }
                 delay(300)
             }
         }
     }
 
+    fun attachWebView(container: FrameLayout) = webEngine.attachTo(container)
+
     private fun attachAudioEffects(sessionId: Int) {
         if (sessionId == C.AUDIO_SESSION_ID_UNSET || sessionId <= 0) return
-        runCatching {
-            equalizer?.release()
-            equalizer = Equalizer(0, sessionId)
-        }
-        runCatching {
-            loudnessEnhancer?.release()
-            loudnessEnhancer = LoudnessEnhancer(sessionId)
-        }
+        runCatching { equalizer?.release(); equalizer = Equalizer(0, sessionId) }
+        runCatching { loudnessEnhancer?.release(); loudnessEnhancer = LoudnessEnhancer(sessionId) }
         applySettings(lastSettings)
     }
 
@@ -169,8 +440,7 @@ class AudioEngine(private val context: Context) {
                 val minLvl = range[0].toInt()
                 val maxLvl = range[1].toInt()
                 for (i in 0 until bands.coerceAtMost(settings.eqBands.size)) {
-                    val norm = settings.eqBands[i]
-                    val lvl = ((norm / 10f) * (maxLvl - minLvl) / 2f).toInt().coerceIn(minLvl, maxLvl)
+                    val lvl = ((settings.eqBands[i] / 10f) * (maxLvl - minLvl) / 2f).toInt().coerceIn(minLvl, maxLvl)
                     eq.setBandLevel(i.toShort(), lvl.toShort())
                 }
             }
@@ -178,12 +448,8 @@ class AudioEngine(private val context: Context) {
     }
 
     private fun buildSingleSource(url: String, metadata: MediaMetadata, userAgent: String): MediaSource {
-        val httpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(userAgent)
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(12_000)
-            .setReadTimeoutMs(15_000)
-        val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
+        val okHttpFactory = OkHttpDataSource.Factory(okHttpClient).setUserAgent(userAgent)
+        val dataSourceFactory = DefaultDataSource.Factory(context, okHttpFactory)
         val item = MediaItem.Builder().setUri(url).setMediaMetadata(metadata).build()
         return if (url.contains(".m3u8", ignoreCase = true) || url.contains("manifest/hls", ignoreCase = true)) {
             HlsMediaSource.Factory(dataSourceFactory).createMediaSource(item)
@@ -199,21 +465,16 @@ class AudioEngine(private val context: Context) {
         startPositionMs: Long = 0L,
         playImmediately: Boolean = true
     ) {
-        val metadata = MediaMetadata.Builder()
-            .setTitle(track.title)
-            .setArtist(track.artist)
-            .setAlbumTitle(track.album)
-            .build()
+        webEngine.stop()
+        val metadata = MediaMetadata.Builder().setTitle(track.title).setArtist(track.artist).setAlbumTitle(track.album).build()
 
         val source: MediaSource = if (videoMode) {
             when {
-                !resolved.videoUrl.isNullOrBlank() ->
-                    buildSingleSource(resolved.videoUrl, metadata, resolved.userAgent)
-                !resolved.videoOnlyUrl.isNullOrBlank() -> {
-                    val vSrc = buildSingleSource(resolved.videoOnlyUrl, metadata, resolved.userAgent)
-                    val aSrc = buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent)
-                    MergingMediaSource(vSrc, aSrc)
-                }
+                !resolved.videoUrl.isNullOrBlank() -> buildSingleSource(resolved.videoUrl, metadata, resolved.userAgent)
+                !resolved.videoOnlyUrl.isNullOrBlank() -> MergingMediaSource(
+                    buildSingleSource(resolved.videoOnlyUrl, metadata, resolved.userAgent),
+                    buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent)
+                )
                 else -> buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent)
             }
         } else {
@@ -223,9 +484,13 @@ class AudioEngine(private val context: Context) {
         player.setMediaSource(source, startPositionMs)
         player.prepare()
         player.playWhenReady = playImmediately
-        if (player.audioSessionId > 0 && equalizer == null) {
-            attachAudioEffects(player.audioSessionId)
-        }
+        if (player.audioSessionId > 0 && equalizer == null) attachAudioEffects(player.audioSessionId)
+    }
+
+    fun playViaWebEngine(track: Track) {
+        player.stop()
+        player.clearMediaItems()
+        webEngine.playVideo(track.id)
     }
 
     fun seamlessSwitchVideoMode(resolved: ResolvedStreams, track: Track, toVideo: Boolean) {
@@ -235,61 +500,54 @@ class AudioEngine(private val context: Context) {
     }
 
     fun togglePlayPause(onNeedRetry: () -> Unit) {
+        if (webEngine.isActive) {
+            webEngine.togglePlayPause()
+            return
+        }
         when {
             player.playbackState == Player.STATE_IDLE -> onNeedRetry()
-            player.playbackState == Player.STATE_ENDED -> {
-                player.seekTo(0L)
-                player.play()
-            }
+            player.playbackState == Player.STATE_ENDED -> { player.seekTo(0L); player.play() }
             player.isPlaying -> player.pause()
             else -> player.play()
         }
     }
 
     fun seekTo(positionMs: Long) {
-        player.seekTo(positionMs.coerceAtLeast(0L))
+        if (webEngine.isActive) webEngine.seekTo(positionMs)
+        else player.seekTo(positionMs.coerceAtLeast(0L))
     }
 
     fun startSleepTimer(minutes: Int, onRemainingChange: (Int?) -> Unit) {
-        sleepJob?.cancel()
-        sleepJob = null
-        sleepEndOfTrack = false
-        player.volume = 1f
-        if (minutes <= 0) {
-            onRemainingChange(null)
-            return
-        }
+        sleepJob?.cancel(); sleepJob = null; sleepEndOfTrack = false
+        player.volume = 1f; webEngine.setVolume(1f)
+        if (minutes <= 0) { onRemainingChange(null); return }
         sleepJob = scope.launch {
             var remainingSec = minutes * 60
             while (remainingSec > 0 && isActive) {
                 onRemainingChange((remainingSec + 59) / 60)
                 if (remainingSec <= 5) {
-                    player.volume = (remainingSec / 5f).coerceIn(0.05f, 1f)
+                    val v = (remainingSec / 5f).coerceIn(0.05f, 1f)
+                    player.volume = v
+                    if (webEngine.isActive) webEngine.setVolume(v)
                 }
                 delay(1000)
                 remainingSec--
             }
-            player.pause()
-            player.volume = 1f
+            if (webEngine.isActive) webEngine.pause() else player.pause()
+            player.volume = 1f; webEngine.setVolume(1f)
             onRemainingChange(null)
         }
     }
 
     fun setSleepEndOfTrack(enabled: Boolean) {
-        sleepJob?.cancel()
-        sleepJob = null
-        sleepEndOfTrack = enabled
+        sleepJob?.cancel(); sleepJob = null; sleepEndOfTrack = enabled
     }
 
     fun openSystemAudioSettings() {
         runCatching {
-            val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(intent)
+            context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }.onFailure {
-            runCatching {
-                val intent = Intent(Settings.ACTION_SOUND_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(intent)
-            }
+            runCatching { context.startActivity(Intent(Settings.ACTION_SOUND_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
         }
     }
 
@@ -312,12 +570,7 @@ class AudioEngine(private val context: Context) {
                 else -> return@mapNotNull null
             }
             val active = if (hasExternal) d.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER else d.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-            AudioOutputItem(
-                id = d.id,
-                name = d.productName?.toString()?.takeIf { it.isNotBlank() } ?: typeLabel,
-                typeLabel = typeLabel,
-                isActive = active
-            )
+            AudioOutputItem(id = d.id, name = d.productName?.toString()?.takeIf { it.isNotBlank() } ?: typeLabel, typeLabel = typeLabel, isActive = active)
         }.distinctBy { it.typeLabel }
     }
 }
