@@ -15,6 +15,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.LibraryMusic
@@ -72,12 +73,11 @@ private fun SonifyAppRoot(vm: AppViewModel) {
     val state by vm.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    // Proper Android Back button handling
-    BackHandler(enabled = state.showNowPlaying || state.showSettings || state.openedPlaylistId != null || state.selectedTab != MainTab.HOME) {
+    BackHandler(enabled = state.showNowPlaying || state.showSettings || state.openedPlaylist != null || state.selectedTab != MainTab.HOME) {
         when {
             state.showNowPlaying -> vm.setShowNowPlaying(false)
             state.showSettings -> vm.setShowSettings(false)
-            state.openedPlaylistId != null -> vm.openPlaylist(null)
+            state.openedPlaylist != null -> vm.openPlaylist(null)
             state.selectedTab != MainTab.HOME -> vm.selectTab(MainTab.HOME)
         }
     }
@@ -88,10 +88,9 @@ private fun SonifyAppRoot(vm: AppViewModel) {
         vm.clearStatus()
     }
 
-    val openedPlaylist = state.playlists.firstOrNull { it.id == state.openedPlaylistId }
+    val openedPlaylist = state.openedPlaylist
 
     Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
-        // Main Content
         when {
             state.showSettings -> SettingsScreen(state, vm)
             openedPlaylist != null -> PlaylistDetailScreen(openedPlaylist, state, vm)
@@ -102,16 +101,13 @@ private fun SonifyAppRoot(vm: AppViewModel) {
             }
         }
 
-        // Bottom Area: MiniPlayer + Bottom Nav (hidden inside Settings)
         if (!state.showSettings) {
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .background(
-                        Brush.verticalGradient(
-                            listOf(Color.Transparent, SpotifyBlack.copy(alpha = 0.94f), SpotifyBlack)
-                        )
+                        Brush.verticalGradient(listOf(Color.Transparent, SpotifyBlack.copy(alpha = 0.94f), SpotifyBlack))
                     )
                     .navigationBarsPadding()
             ) {
@@ -120,9 +116,7 @@ private fun SonifyAppRoot(vm: AppViewModel) {
                 }
 
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(60.dp),
+                    modifier = Modifier.fillMaxWidth().height(60.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -154,7 +148,6 @@ private fun SonifyAppRoot(vm: AppViewModel) {
             }
         }
 
-        // Full Now Playing Screen Overlay
         AnimatedVisibility(
             visible = state.showNowPlaying && state.currentTrack != null,
             enter = slideInVertically { it },
@@ -163,18 +156,10 @@ private fun SonifyAppRoot(vm: AppViewModel) {
             NowPlayingScreen(state, vm)
         }
 
-        // Bottom Sheets
-        if (state.showCreateSheet) {
-            CreateBottomSheet(state, vm)
-        }
-        if (state.showDevicesSheet) {
-            DevicesBottomSheet(state, vm)
-        }
-        state.trackForOptions?.let { track ->
-            TrackOptionsBottomSheet(track, state, vm)
-        }
+        if (state.showCreateSheet) CreateBottomSheet(state, vm)
+        if (state.showDevicesSheet) DevicesBottomSheet(state, vm)
+        state.trackForOptions?.let { track -> TrackOptionsBottomSheet(track, state, vm) }
 
-        // AI Playlist building indicator
         if (state.isBuildingAiPlaylist) {
             LinearProgressIndicator(
                 modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter).statusBarsPadding(),
@@ -183,19 +168,28 @@ private fun SonifyAppRoot(vm: AppViewModel) {
             )
         }
 
+        // Sleek Spotify-style dark Snackbar positioned cleanly at the bottom (never covers top bar!)
         SnackbarHost(
             hostState = snackbarHostState,
-            modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 8.dp)
-        )
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(bottom = if (state.showNowPlaying || state.showSettings) 16.dp else 132.dp, start = 16.dp, end = 16.dp)
+        ) { data ->
+            Snackbar(
+                snackbarData = data,
+                containerColor = SpotifyElevated,
+                contentColor = SpotifyWhite,
+                shape = RoundedCornerShape(10.dp)
+            )
+        }
     }
 }
 
 @Composable
 private fun BottomNavItem(label: String, icon: ImageVector, selected: Boolean, onClick: () -> Unit) {
     Column(
-        modifier = Modifier
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 4.dp),
+        modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 4.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Icon(icon, contentDescription = label, tint = if (selected) SpotifyWhite else SpotifySubtle, modifier = Modifier.size(24.dp))
