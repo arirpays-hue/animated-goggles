@@ -11,9 +11,11 @@ import android.media.AudioManager
 import android.media.audiofx.DynamicsProcessing
 import android.media.audiofx.Equalizer
 import android.media.audiofx.LoudnessEnhancer
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -61,6 +63,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import java.io.File
 import java.io.FileOutputStream
@@ -122,14 +125,24 @@ object PlayerHolder {
     fun getOrCreate(context: Context): ExoPlayer {
         return player ?: synchronized(this) {
             player ?: run {
+                val prefs = context.applicationContext.getSharedPreferences("sonify_prefs", Context.MODE_PRIVATE)
+                val profile = runCatching {
+                    AudioBufferProfile.valueOf(prefs.getString("buffer_profile", AudioBufferProfile.HIGH_STABILITY.name)!!)
+                }.getOrDefault(AudioBufferProfile.HIGH_STABILITY)
+
                 val renderersFactory = object : DefaultRenderersFactory(context.applicationContext) {
                     override fun buildAudioSink(ctx: Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): AudioSink {
-                        return DefaultAudioSink.Builder(ctx).setAudioProcessors(arrayOf(balanceMonoProcessor)).build()
+                        return DefaultAudioSink.Builder(ctx)
+                            .setAudioProcessors(arrayOf(balanceMonoProcessor))
+                            .build()
                     }
                 }
-                // Deep buffer + fast recovery + WAKE_MODE_NETWORK to prevent CPU/network stutters
+
+                // Deep anti-stutter buffer with high-stability back buffer
                 val loadControl = DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(30_000, 90_000, 1_500, 2_500)
+                    .setBufferDurationsMs(profile.minMs, profile.maxMs, profile.playMs, profile.rebufferMs)
+                    .setBackBuffer(10_000, true)
+                    .setPrioritizeTimeOverSizeThresholds(true)
                     .build()
 
                 ExoPlayer.Builder(context.applicationContext, renderersFactory)
@@ -208,6 +221,10 @@ class WebPlaybackEngine(private val context: Context) {
         return WebView(context.applicationContext).apply {
             setBackgroundColor(android.graphics.Color.BLACK)
             setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            // Keep WebView renderer at high OS priority so audio never stutters in background/audio mode!
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                runCatching { setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false) }
+            }
             isVerticalScrollBarEnabled = false
             isHorizontalScrollBarEnabled = false
             val cm = CookieManager.getInstance()
@@ -261,7 +278,6 @@ class WebPlaybackEngine(private val context: Context) {
         }
     }
 
-    // Zero-overhead fast path when already attached to the same container (prevents stutter!)
     fun attachTo(container: FrameLayout) {
         val existing = webView
         if (existing != null && existing.parent === container && pendingVideoId == null) return
@@ -302,7 +318,6 @@ class WebPlaybackEngine(private val context: Context) {
         }
     }
 
-    // Vertical 150vh overscan inside 16:9 container pushes ALL YouTube top/bottom chrome out of view without cropping video!
     private fun loadIframePlayer(wv: WebView, safeId: String, startSec: Double) {
         wv.onResume()
         wv.resumeTimers()
@@ -326,6 +341,7 @@ class WebPlaybackEngine(private val context: Context) {
               var player = null;
               var userPaused = false;
               var lastKick = 0;
+              var lastSentKey = '';
               function onYouTubeIframeAPIReady() {
                 player = new YT.Player('player', {
                   width: '100%', height: '100%', videoId: '$safeId',
@@ -350,13 +366,17 @@ class WebPlaybackEngine(private val context: Context) {
                   var dur = Math.floor((player.getDuration() || 0) * 1000);
                   var st = player.getPlayerState ? player.getPlayerState() : -1;
                   var now = Date.now();
-                  if (st === -1 && !userPaused && now - lastKick > 2000) {
+                  if (st === -1 && !userPaused && now - lastKick > 2500) {
                     lastKick = now;
                     try { player.playVideo(); } catch(err) {}
                   }
-                  SonifyBridge.onProgress(pos, dur, st === 1, st === 3);
+                  var key = Math.floor(pos / 500) + '_' + st;
+                  if (key !== lastSentKey) {
+                    lastSentKey = key;
+                    SonifyBridge.onProgress(pos, dur, st === 1, st === 3);
+                  }
                 }
-              }, 500);
+              }, 650);
               window.sonifyPlay = function() { userPaused = false; if (player && player.playVideo) player.playVideo(); };
               window.sonifyPause = function() { userPaused = true; if (player && player.pauseVideo) player.pauseVideo(); };
               window.sonifyToggle = function() { if (!player) return; if (player.getPlayerState && player.getPlayerState() === 1) window.sonifyPause(); else window.sonifyPlay(); };
@@ -378,7 +398,7 @@ class WebPlaybackEngine(private val context: Context) {
             }
         }
         watchdogRunnable = r
-        mainHandler.postDelayed(r, 3000L)
+        mainHandler.postDelayed(r, 3200L)
     }
 
     private fun cancelWatchdog() {
@@ -510,7 +530,7 @@ class WebPlaybackEngine(private val context: Context) {
 
             mainHandler.post { wv.evaluateJavascript(js, null) }
 
-            val ok = withTimeoutOrNull(30_000L) { deferred.await() } ?: false
+            val ok = withTimeoutOrNull(28_000L) { deferred.await() } ?: false
             if (ok) return true
             activeDownloads.remove(dlId)?.let { dl ->
                 runCatching { dl.outStream.close() }
@@ -552,6 +572,7 @@ class WebPlaybackEngine(private val context: Context) {
         mainHandler.post { webView?.evaluateJavascript(js, null) }
     }
 
+    // Zero DOM thrashing inside interval -> eliminates WebView audio hiccups!
     private fun injectMobileWatchHook(startSec: Double) {
         val css = cleanMobileCssString()
         val js = """
@@ -560,6 +581,7 @@ class WebPlaybackEngine(private val context: Context) {
               window.__sonifyEndedFired = false;
               window.__sonifySeekedOnce = false;
               window.__sonifyLastPlayTry = 0;
+              window.__sonifyLastKey = '';
               if (window.__sonifyTimer) clearInterval(window.__sonifyTimer);
 
               function enforceCleanCss() {
@@ -568,8 +590,8 @@ class WebPlaybackEngine(private val context: Context) {
                   s = document.createElement('style');
                   s.id = 'sonify-clean-css';
                   (document.head || document.documentElement).appendChild(s);
+                  s.textContent = "$css";
                 }
-                if (s.textContent !== "$css") s.textContent = "$css";
               }
               enforceCleanCss();
 
@@ -599,11 +621,8 @@ class WebPlaybackEngine(private val context: Context) {
               } catch(e) {}
 
               window.__sonifyTimer = setInterval(function() {
-                enforceCleanCss();
                 var skip = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern');
                 if (skip) { try { skip.click(); } catch(e){} }
-                var unmuteBtn = document.querySelector('.ytp-unmute');
-                if (unmuteBtn && unmuteBtn.offsetParent !== null) { try { unmuteBtn.click(); } catch(e){} }
                 var v = document.querySelector('video');
                 if (!v) return;
                 if (!window.__sonifySeekedOnce && $startSec >= 1 && v.readyState >= 1) {
@@ -615,8 +634,7 @@ class WebPlaybackEngine(private val context: Context) {
                 if (!window.__sonifyUserPaused) {
                   if (v.muted) v.muted = false;
                   if (v.volume === 0) v.volume = 1.0;
-                  // Only kick play() when buffer is ready & throttled to every 2s to avoid stutters!
-                  if (v.paused && !v.ended && v.readyState >= 2 && (now - window.__sonifyLastPlayTry > 2000)) {
+                  if (v.paused && !v.ended && v.readyState >= 2 && (now - window.__sonifyLastPlayTry > 2500)) {
                     window.__sonifyLastPlayTry = now;
                     v.play().catch(function(){});
                   }
@@ -625,9 +643,13 @@ class WebPlaybackEngine(private val context: Context) {
                 var dur = Math.floor((isFinite(v.duration) && v.duration > 0 ? v.duration : 0) * 1000);
                 var playing = !v.paused && !v.ended && v.readyState >= 2;
                 var buffering = !window.__sonifyUserPaused && !playing && v.readyState < 3;
-                SonifyBridge.onProgress(pos, dur, playing, buffering);
+                var key = Math.floor(pos / 500) + '_' + playing + '_' + buffering;
+                if (key !== window.__sonifyLastKey) {
+                  window.__sonifyLastKey = key;
+                  SonifyBridge.onProgress(pos, dur, playing, buffering);
+                }
                 if (v.ended && !window.__sonifyEndedFired) { window.__sonifyEndedFired = true; SonifyBridge.onEnded(); }
-              }, 500);
+              }, 650);
 
               window.sonifyPlay = function() { window.__sonifyUserPaused = false; var v = document.querySelector('video'); if (v) { v.muted = false; v.play().catch(function(){}); } };
               window.sonifyPause = function() { window.__sonifyUserPaused = true; var v = document.querySelector('video'); if (v) v.pause(); };
@@ -696,6 +718,7 @@ class WebPlaybackEngine(private val context: Context) {
             val dl = activeDownloads.remove(dlId) ?: return
             runCatching { dl.outStream.flush(); dl.outStream.close() }
             if (success && dl.tmpFile.exists() && dl.tmpFile.length() > 16_384) {
+                if (dl.targetFile.exists()) dl.targetFile.delete()
                 dl.tmpFile.renameTo(dl.targetFile)
                 dl.onProgress(100)
                 dl.deferred.complete(true)
@@ -714,7 +737,9 @@ class AudioEngine(private val context: Context) {
 
     private val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(16, TimeUnit.SECONDS)
+        .readTimeout(18, TimeUnit.SECONDS)
+        .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+        .retryOnConnectionFailure(true)
         .followRedirects(true)
         .build()
 
@@ -723,6 +748,24 @@ class AudioEngine(private val context: Context) {
     private var dynamicsProcessing: DynamicsProcessing? = null
     private var loudnessEnhancer: LoudnessEnhancer? = null
     private var lastSettings: AppSettings = AppSettings()
+
+    // Anti-stutter CPU + Wi-Fi power locks (held ONLY while audio is actively playing!)
+    private val wakeLock: PowerManager.WakeLock? = runCatching {
+        (context.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Sonify::AudioPlaybackLock")
+            ?.apply { setReferenceCounted(false) }
+    }.getOrNull()
+
+    private val wifiLock: WifiManager.WifiLock? = runCatching {
+        val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            @Suppress("DEPRECATION")
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
+        wm?.createWifiLock(mode, "Sonify::AudioWifiLock")?.apply { setReferenceCounted(false) }
+    }.getOrNull()
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -751,16 +794,23 @@ class AudioEngine(private val context: Context) {
         }
 
         webEngine.onProgress = { pos, dur, playing, buffering ->
-            if (webEngine.isActive) onProgressUpdate?.invoke(pos, dur, playing, buffering)
+            if (webEngine.isActive) {
+                updatePlaybackLocks(playing || buffering)
+                onProgressUpdate?.invoke(pos, dur, playing, buffering)
+            }
         }
         webEngine.onEnded = {
-            if (sleepEndOfTrack) { sleepEndOfTrack = false; webEngine.pause() } else onTrackEnded?.invoke()
+            if (sleepEndOfTrack) { sleepEndOfTrack = false; webEngine.pause(); updatePlaybackLocks(false) } else onTrackEnded?.invoke()
         }
 
         player.addListener(object : Player.Listener {
             override fun onAudioSessionIdChanged(audioSessionId: Int) = attachAudioEffects(audioSessionId)
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (!webEngine.isActive) updatePlaybackLocks(isPlaying)
+            }
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED && !webEngine.isActive) {
+                    updatePlaybackLocks(false)
                     if (sleepEndOfTrack) { sleepEndOfTrack = false; player.pause() } else onTrackEnded?.invoke()
                 }
             }
@@ -777,11 +827,13 @@ class AudioEngine(private val context: Context) {
                     val pos = player.currentPosition.coerceAtLeast(0L)
                     val dur = player.duration.coerceAtLeast(0L)
                     val buffering = player.playbackState == Player.STATE_BUFFERING
-                    onProgressUpdate?.invoke(pos, dur, player.isPlaying, buffering)
+                    val playing = player.isPlaying
+                    updatePlaybackLocks(playing || buffering)
+                    onProgressUpdate?.invoke(pos, dur, playing, buffering)
 
                     val effectiveFadeSec = if (lastSettings.automixEnabled && lastSettings.crossfadeSeconds == 0) 4 else lastSettings.crossfadeSeconds
                     val cfMs = effectiveFadeSec * 1000L
-                    val targetVol = if (cfMs > 0 && dur > cfMs && player.isPlaying) {
+                    val targetVol = if (cfMs > 0 && dur > cfMs && playing) {
                         val remaining = dur - pos
                         when {
                             remaining in 1..cfMs -> (remaining.toFloat() / cfMs.toFloat()).coerceIn(0.05f, 1f)
@@ -792,15 +844,29 @@ class AudioEngine(private val context: Context) {
                         1f
                     } else null
 
-                    // Only touch audio sink gain when volume actually changed (prevents audio glitching)
                     if (targetVol != null && abs(player.volume - targetVol) > 0.01f) {
                         player.volume = targetVol
                     }
                 }
-                delay(400)
+                delay(450)
             }
         }
     }
+
+    private fun updatePlaybackLocks(shouldHold: Boolean) {
+        val allowed = shouldHold && lastSettings.keepWakeLockAudio
+        runCatching {
+            if (allowed) {
+                if (wakeLock?.isHeld == false) wakeLock.acquire(4L * 60L * 60L * 1000L)
+                if (wifiLock?.isHeld == false) wifiLock.acquire()
+            } else {
+                if (wakeLock?.isHeld == true) wakeLock.release()
+                if (wifiLock?.isHeld == true) wifiLock.release()
+            }
+        }
+    }
+
+    fun releaseLocks() = updatePlaybackLocks(false)
 
     private fun duckVolume(duck: Boolean) {
         scope.launch {
@@ -842,6 +908,7 @@ class AudioEngine(private val context: Context) {
 
     fun applySettings(settings: AppSettings) {
         lastSettings = settings
+        if (!settings.keepWakeLockAudio) updatePlaybackLocks(false)
         PlayerHolder.balanceMonoProcessor.monoEnabled = settings.monoAudio
         PlayerHolder.balanceMonoProcessor.balance = settings.audioBalance
         player.playbackParameters = PlaybackParameters(settings.playbackSpeed.coerceIn(0.5f, 3.5f))
@@ -915,12 +982,14 @@ class AudioEngine(private val context: Context) {
         player.setMediaSource(source, startPositionMs)
         player.prepare()
         player.playWhenReady = playImmediately
+        updatePlaybackLocks(playImmediately)
         if (player.audioSessionId > 0 && dynamicsProcessing == null && equalizer == null) attachAudioEffects(player.audioSessionId)
     }
 
     fun playViaWebEngine(videoId: String, startPositionMs: Long = 0L) {
         player.stop()
         player.clearMediaItems()
+        updatePlaybackLocks(true)
         webEngine.playVideo(videoId, startPositionMs)
     }
 
@@ -936,6 +1005,14 @@ class AudioEngine(private val context: Context) {
             player.playbackState == Player.STATE_ENDED -> { player.seekTo(0L); player.play() }
             player.isPlaying -> player.pause()
             else -> player.play()
+        }
+    }
+
+    fun setPlaying(play: Boolean) {
+        if (webEngine.isActive) {
+            if (play) webEngine.play() else webEngine.pause()
+        } else {
+            if (play) player.play() else player.pause()
         }
     }
 
@@ -960,6 +1037,7 @@ class AudioEngine(private val context: Context) {
                 remainingSec--
             }
             if (webEngine.isActive) webEngine.pause() else player.pause()
+            updatePlaybackLocks(false)
             player.volume = 1f; webEngine.setVolume(1f)
             onRemainingChange(null)
         }
