@@ -18,6 +18,7 @@ import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Base64
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -70,6 +71,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 class ChannelBalanceMonoProcessor : BaseAudioProcessor() {
     @Volatile var monoEnabled: Boolean = false
@@ -125,13 +127,14 @@ object PlayerHolder {
                         return DefaultAudioSink.Builder(ctx).setAudioProcessors(arrayOf(balanceMonoProcessor)).build()
                     }
                 }
-                // Generous cellular-friendly buffers to eliminate audio stutter
+                // Deep buffer + fast recovery + WAKE_MODE_NETWORK to prevent CPU/network stutters
                 val loadControl = DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(20_000, 60_000, 2_500, 5_000)
+                    .setBufferDurationsMs(30_000, 90_000, 1_500, 2_500)
                     .build()
 
                 ExoPlayer.Builder(context.applicationContext, renderersFactory)
                     .setLoadControl(loadControl)
+                    .setWakeMode(C.WAKE_MODE_NETWORK)
                     .setAudioAttributes(
                         AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(),
                         true
@@ -204,6 +207,7 @@ class WebPlaybackEngine(private val context: Context) {
         webView?.let { return it }
         return WebView(context.applicationContext).apply {
             setBackgroundColor(android.graphics.Color.BLACK)
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
             isVerticalScrollBarEnabled = false
             isHorizontalScrollBarEnabled = false
             val cm = CookieManager.getInstance()
@@ -257,25 +261,21 @@ class WebPlaybackEngine(private val context: Context) {
         }
     }
 
-    // FIXED: Never re-trigger onResume / resumeTimers / CSS injection on Compose recompositions when already attached!
+    // Zero-overhead fast path when already attached to the same container (prevents stutter!)
     fun attachTo(container: FrameLayout) {
+        val existing = webView
+        if (existing != null && existing.parent === container && pendingVideoId == null) return
+
         mainHandler.post {
             val wv = getOrCreateWebView()
-            if (wv.parent === container) {
-                val pending = pendingVideoId
-                if (isActive && !pending.isNullOrBlank()) {
-                    val startS = pendingStartSec
-                    pendingVideoId = null
-                    loadIframePlayer(wv, pending, startS)
-                }
-                return@post
+            if (wv.parent !== container) {
+                (wv.parent as? ViewGroup)?.removeView(wv)
+                container.removeAllViews()
+                container.addView(wv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                wv.onResume()
+                wv.resumeTimers()
+                if (isActive && isMobileWatchFallback) injectCleanVideoCssOnly()
             }
-            (wv.parent as? ViewGroup)?.removeView(wv)
-            container.removeAllViews()
-            container.addView(wv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-            wv.onResume()
-            wv.resumeTimers()
-            if (isActive && isMobileWatchFallback) injectCleanVideoCssOnly()
             val pending = pendingVideoId
             if (isActive && !pending.isNullOrBlank()) {
                 val startS = pendingStartSec
@@ -302,6 +302,7 @@ class WebPlaybackEngine(private val context: Context) {
         }
     }
 
+    // Vertical 150vh overscan inside 16:9 container pushes ALL YouTube top/bottom chrome out of view without cropping video!
     private fun loadIframePlayer(wv: WebView, safeId: String, startSec: Double) {
         wv.onResume()
         wv.resumeTimers()
@@ -313,7 +314,10 @@ class WebPlaybackEngine(private val context: Context) {
             <html>
             <head>
             <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-            <style>html, body, #player { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }</style>
+            <style>
+              html, body { margin:0; padding:0; width:100vw; height:100vh; background:#000; overflow:hidden; }
+              #player { position:fixed; left:0; width:100vw; height:150vh; top:-25vh; border:0; background:#000; pointer-events:none; }
+            </style>
             </head>
             <body>
             <div id="player"></div>
@@ -321,11 +325,12 @@ class WebPlaybackEngine(private val context: Context) {
             <script>
               var player = null;
               var userPaused = false;
+              var lastKick = 0;
               function onYouTubeIframeAPIReady() {
                 player = new YT.Player('player', {
                   width: '100%', height: '100%', videoId: '$safeId',
                   host: 'https://www.youtube-nocookie.com',
-                  playerVars: { 'autoplay': 1, 'start': $startInt, 'playsinline': 1, 'controls': 0, 'rel': 0, 'fs': 0, 'iv_load_policy': 3, 'modestbranding': 1, 'enablejsapi': 1, 'origin': 'https://www.youtube-nocookie.com' },
+                  playerVars: { 'autoplay': 1, 'start': $startInt, 'playsinline': 1, 'controls': 0, 'rel': 0, 'fs': 0, 'iv_load_policy': 3, 'modestbranding': 1, 'disablekb': 1, 'enablejsapi': 1, 'origin': 'https://www.youtube-nocookie.com' },
                   events: {
                     'onReady': function(e) {
                       try {
@@ -344,7 +349,11 @@ class WebPlaybackEngine(private val context: Context) {
                   var pos = Math.floor((player.getCurrentTime() || 0) * 1000);
                   var dur = Math.floor((player.getDuration() || 0) * 1000);
                   var st = player.getPlayerState ? player.getPlayerState() : -1;
-                  if (st === -1 && !userPaused) { try { player.playVideo(); } catch(err) {} }
+                  var now = Date.now();
+                  if (st === -1 && !userPaused && now - lastKick > 2000) {
+                    lastKick = now;
+                    try { player.playVideo(); } catch(err) {}
+                  }
                   SonifyBridge.onProgress(pos, dur, st === 1, st === 3);
                 }
               }, 500);
@@ -390,7 +399,6 @@ class WebPlaybackEngine(private val context: Context) {
         }
     }
 
-    // Preserves every query parameter listed inside YouTube's signed `sparams` so URL never returns 403
     private fun sanitizeSignedUrl(url: String): String {
         val sparamsRaw = Regex("[?&]sparams=([^&]+)").find(url)?.groupValues?.get(1).orEmpty()
         val signedParams = runCatching { URLDecoder.decode(sparamsRaw, "UTF-8") }
@@ -412,7 +420,6 @@ class WebPlaybackEngine(private val context: Context) {
             .trimEnd('&', '?')
     }
 
-    // FIXED: No `credentials: 'include'` (prevents CORS rejection) + preserves `sparams` + handles ALR redirects
     suspend fun downloadViaWebViewFetch(
         videoId: String,
         targetFile: File,
@@ -464,7 +471,7 @@ class WebPlaybackEngine(private val context: Context) {
                     const clen = clenMatch ? parseInt(clenMatch[1], 10) : 0;
                     if (clen > 0 && clen < 75000000) {
                       let offset = 0;
-                      const chunk = 512 * 1024;
+                      const chunk = 1024 * 1024;
                       while (offset < clen) {
                         const end = Math.min(offset + chunk - 1, clen - 1);
                         let res = null;
@@ -503,7 +510,7 @@ class WebPlaybackEngine(private val context: Context) {
 
             mainHandler.post { wv.evaluateJavascript(js, null) }
 
-            val ok = withTimeoutOrNull(35_000L) { deferred.await() } ?: false
+            val ok = withTimeoutOrNull(30_000L) { deferred.await() } ?: false
             if (ok) return true
             activeDownloads.remove(dlId)?.let { dl ->
                 runCatching { dl.outStream.close() }
@@ -513,42 +520,65 @@ class WebPlaybackEngine(private val context: Context) {
         return false
     }
 
+    private fun cleanMobileCssString(): String = """
+        html, body { background:#000 !important; margin:0 !important; padding:0 !important; width:100vw !important; height:100vh !important; overflow:hidden !important; }
+        ytm-mobile-topbar-renderer, .mobile-topbar-header, #header-bar, header,
+        .watch-below-the-player, ytm-watch-metadata, ytm-slim-video-metadata-section-renderer,
+        ytm-item-section-renderer, ytm-engagement-panel-section-list-renderer,
+        ytm-single-column-watch-next-results-renderer, .ytm-autonav-bar, ytm-app-header,
+        #player-control-overlay, .player-controls-content, .player-controls-background,
+        .player-controls-background-container, .player-controls-top, .player-controls-middle,
+        .player-controls-bottom, .ytp-chrome-top, .ytp-chrome-bottom, .ytp-gradient-top,
+        .ytp-gradient-bottom, .ytp-pause-overlay, .ytp-watermark, .ytp-bezel-text-wrapper,
+        .ytp-doubletap-ui-legacy, .ytm-custom-control-host, .ytp-spinner, .ytp-mweb-player-chrome,
+        .ytp-cued-thumbnail-overlay, .ytp-large-play-button, ytm-promoted-sparkles-web-renderer,
+        .ytp-endscreen-content, .ytp-ce-element, .ytp-suggested-action, .ytp-cards-teaser {
+          display:none !important; opacity:0 !important; visibility:hidden !important; pointer-events:none !important;
+        }
+        #player-container-id, .player-container, #player, #movie_player, .html5-video-player, .html5-video-container {
+          position:fixed !important; top:0 !important; left:0 !important; right:0 !important; bottom:0 !important;
+          width:100vw !important; height:100vh !important; max-width:100vw !important; max-height:100vh !important;
+          margin:0 !important; padding:0 !important; background:#000 !important; z-index:99999 !important;
+        }
+        video, video.html5-main-video {
+          position:fixed !important; top:0 !important; left:0 !important; width:100vw !important; height:100vh !important;
+          object-fit:contain !important; background:#000 !important; transform:none !important; z-index:2147483647 !important;
+        }
+    """.trimIndent().replace("\n", " ")
+
     private fun injectCleanVideoCssOnly() {
-        val css = """
-            html, body { background:#000 !important; margin:0 !important; padding:0 !important; width:100vw !important; height:100vh !important; overflow:hidden !important; }
-            ytm-mobile-topbar-renderer, .mobile-topbar-header, #header-bar, header,
-            .watch-below-the-player, ytm-watch-metadata, ytm-slim-video-metadata-section-renderer,
-            ytm-item-section-renderer, ytm-engagement-panel-section-list-renderer,
-            ytm-single-column-watch-next-results-renderer, .ytm-autonav-bar,
-            #player-control-overlay, .player-controls-content, .player-controls-background,
-            .player-controls-background-container, .player-controls-top, .player-controls-middle,
-            .player-controls-bottom, .ytp-chrome-top, .ytp-chrome-bottom, .ytp-gradient-top,
-            .ytp-gradient-bottom, .ytp-pause-overlay, .ytp-watermark, .ytp-bezel-text-wrapper,
-            .ytp-doubletap-ui-legacy, .ytm-custom-control-host, .ytp-spinner,
-            .ytp-cued-thumbnail-overlay, .ytp-large-play-button, ytm-promoted-sparkles-web-renderer {
-              display:none !important; opacity:0 !important; visibility:hidden !important; pointer-events:none !important;
-            }
-            #player-container-id, .player-container, #player, #movie_player, .html5-video-player, .html5-video-container {
-              position:fixed !important; top:0 !important; left:0 !important; right:0 !important; bottom:0 !important;
-              width:100vw !important; height:100vh !important; max-width:100vw !important; max-height:100vh !important;
-              margin:0 !important; padding:0 !important; background:#000 !important; z-index:99999 !important;
-            }
-            video, video.html5-main-video {
-              position:fixed !important; top:0 !important; left:0 !important; width:100vw !important; height:100vh !important;
-              object-fit:contain !important; background:#000 !important; transform:none !important;
-            }
-        """.trimIndent().replace("\n", " ")
+        val css = cleanMobileCssString()
         val js = "(function(){var s=document.getElementById('sonify-clean-css');if(!s){s=document.createElement('style');s.id='sonify-clean-css';(document.head||document.documentElement).appendChild(s);}s.textContent=\"$css\";})();"
         mainHandler.post { webView?.evaluateJavascript(js, null) }
     }
 
     private fun injectMobileWatchHook(startSec: Double) {
+        val css = cleanMobileCssString()
         val js = """
             (function() {
               window.__sonifyUserPaused = false;
               window.__sonifyEndedFired = false;
               window.__sonifySeekedOnce = false;
+              window.__sonifyLastPlayTry = 0;
               if (window.__sonifyTimer) clearInterval(window.__sonifyTimer);
+
+              function enforceCleanCss() {
+                var s = document.getElementById('sonify-clean-css');
+                if (!s) {
+                  s = document.createElement('style');
+                  s.id = 'sonify-clean-css';
+                  (document.head || document.documentElement).appendChild(s);
+                }
+                if (s.textContent !== "$css") s.textContent = "$css";
+              }
+              enforceCleanCss();
+
+              if (!window.__sonifyObserver && document.documentElement) {
+                window.__sonifyObserver = new MutationObserver(function() {
+                  if (!document.getElementById('sonify-clean-css')) enforceCleanCss();
+                });
+                window.__sonifyObserver.observe(document.documentElement, { childList: true, subtree: false });
+              }
 
               try {
                 var sd = window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.streamingData;
@@ -569,6 +599,7 @@ class WebPlaybackEngine(private val context: Context) {
               } catch(e) {}
 
               window.__sonifyTimer = setInterval(function() {
+                enforceCleanCss();
                 var skip = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern');
                 if (skip) { try { skip.click(); } catch(e){} }
                 var unmuteBtn = document.querySelector('.ytp-unmute');
@@ -580,10 +611,15 @@ class WebPlaybackEngine(private val context: Context) {
                   try { v.currentTime = $startSec; } catch(e){}
                 }
                 if (Math.abs(v.playbackRate - $currentSpeed) > 0.05) { try { v.playbackRate = $currentSpeed; } catch(e){} }
+                var now = Date.now();
                 if (!window.__sonifyUserPaused) {
                   if (v.muted) v.muted = false;
                   if (v.volume === 0) v.volume = 1.0;
-                  if (v.paused && !v.ended) v.play().catch(function(){});
+                  // Only kick play() when buffer is ready & throttled to every 2s to avoid stutters!
+                  if (v.paused && !v.ended && v.readyState >= 2 && (now - window.__sonifyLastPlayTry > 2000)) {
+                    window.__sonifyLastPlayTry = now;
+                    v.play().catch(function(){});
+                  }
                 }
                 var pos = Math.floor((v.currentTime || 0) * 1000);
                 var dur = Math.floor((isFinite(v.duration) && v.duration > 0 ? v.duration : 0) * 1000);
@@ -745,18 +781,23 @@ class AudioEngine(private val context: Context) {
 
                     val effectiveFadeSec = if (lastSettings.automixEnabled && lastSettings.crossfadeSeconds == 0) 4 else lastSettings.crossfadeSeconds
                     val cfMs = effectiveFadeSec * 1000L
-                    if (cfMs > 0 && dur > cfMs && player.isPlaying) {
+                    val targetVol = if (cfMs > 0 && dur > cfMs && player.isPlaying) {
                         val remaining = dur - pos
-                        player.volume = when {
+                        when {
                             remaining in 1..cfMs -> (remaining.toFloat() / cfMs.toFloat()).coerceIn(0.05f, 1f)
                             pos < cfMs / 2 -> (pos.toFloat() / (cfMs / 2f)).coerceIn(0.15f, 1f)
                             else -> 1f
                         }
                     } else if (sleepJob == null || !sleepJob!!.isActive) {
-                        player.volume = 1f
+                        1f
+                    } else null
+
+                    // Only touch audio sink gain when volume actually changed (prevents audio glitching)
+                    if (targetVol != null && abs(player.volume - targetVol) > 0.01f) {
+                        player.volume = targetVol
                     }
                 }
-                delay(350)
+                delay(400)
             }
         }
     }
