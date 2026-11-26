@@ -2,13 +2,20 @@ package com.sonify.app
 
 import android.app.Application
 import android.content.Context
+import android.graphics.drawable.BitmapDrawable
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.palette.graphics.Palette
+import coil.imageLoader
+import coil.request.ImageRequest
+import coil.request.SuccessResult
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
@@ -19,7 +26,12 @@ data class UiState(
     val showSettings: Boolean = false,
     val showNowPlaying: Boolean = false,
     val showCreateSheet: Boolean = false,
+    val showDevicesSheet: Boolean = false,
+    val openedPlaylistId: String? = null,
+    val trackForOptions: Track? = null,
     val homeFilter: HomeFilter = HomeFilter.ALL,
+    val isLoadingHome: Boolean = false,
+    val isBuildingAiPlaylist: Boolean = false,
     val libraryFilter: LibraryFilter = LibraryFilter.ALL,
     val librarySort: LibrarySort = LibrarySort.RECENT,
     val libraryGridView: Boolean = false,
@@ -34,6 +46,7 @@ data class UiState(
     val daylistTracks: List<Track> = emptyList(),
     val searchQuery: String = "",
     val searchResults: List<Track> = emptyList(),
+    val hasSearched: Boolean = false,
     val isSearching: Boolean = false,
     val likedTracks: List<Track> = emptyList(),
     val playlists: List<Playlist> = emptyList(),
@@ -45,6 +58,7 @@ data class UiState(
     val currentIndex: Int = -1,
     val currentTrack: Track? = null,
     val resolvedStreams: ResolvedStreams? = null,
+    val dynamicAccentColor: Long = 0xFF1F3B33,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
     val isVideoMode: Boolean = false,
@@ -70,29 +84,33 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(UiState())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
+    private var retryAttemptForCurrent = 0
+
     val genres = listOf(
-        GenreCard("פופ ישראלי", "פופ ישראלי להיטים", 0xFFE8115B),
-        GenreCard("היפ-הופ וראפ", "hip hop hits 2026", 0xFFBC5900),
-        GenreCard("ים תיכוני", "מוזיקה מזרחית חדשה", 0xFF1E3264),
-        GenreCard("אימון ואנרגיה", "workout gym music high energy", 0xFF148A08),
-        GenreCard("צ'יל ופוקוס", "lofi chill beats study", 0xFF503750),
-        GenreCard("רוק ואלטרנטיבי", "rock classics hits", 0xFFE91429),
-        GenreCard("אלקטרוני ודאנס", "electronic dance club", 0xFF0D73EC),
-        GenreCard("פודקאסטים", "פודקאסט ישראלי", 0xFF006450)
+        GenreCard("פופ ישראלי", "פופ ישראלי להיטים שיר", 0xFFE8115B),
+        GenreCard("היפ-הופ וראפ", "hip hop rap hits official audio", 0xFFBC5900),
+        GenreCard("ים תיכוני", "שירים מזרחיים חדשים", 0xFF1E3264),
+        GenreCard("אימון ואנרגיה", "gym workout music official audio", 0xFF148A08),
+        GenreCard("צ'יל ופוקוס", "lofi chill song official audio", 0xFF503750),
+        GenreCard("רוק ואלטרנטיבי", "rock classics hits official audio", 0xFFE91429),
+        GenreCard("אלקטרוני ודאנס", "electronic dance hits official audio", 0xFF0D73EC),
+        GenreCard("פודקאסטים", "פודקאסט ישראלי פרק מלא", 0xFF006450)
     )
 
     init {
         loadSavedState()
-        audioEngine.onProgressUpdate = { pos, dur, playing ->
+        audioEngine.onProgressUpdate = { pos, dur, playing, buffering ->
             _uiState.update {
                 it.copy(
                     positionMs = pos,
                     durationMs = if (dur > 0) dur else it.currentTrack?.durationMs ?: 0L,
-                    isPlaying = playing
+                    isPlaying = playing,
+                    isBuffering = buffering || (it.isBuffering && !playing && pos == 0L)
                 )
             }
         }
         audioEngine.onTrackEnded = { handleTrackEnded() }
+        audioEngine.onPlaybackError = { code -> handlePlaybackError(code) }
         refreshHomeContent()
     }
 
@@ -112,6 +130,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             subsonicUrl = prefs.getString("subsonic_url", "") ?: "",
             subsonicUser = prefs.getString("subsonic_user", "") ?: "",
             subsonicPass = prefs.getString("subsonic_pass", "") ?: "",
+            geminiApiKey = prefs.getString("gemini_key", "") ?: "",
             normalizeVolume = prefs.getBoolean("norm_vol", true),
             gaplessPlayback = prefs.getBoolean("gapless", true),
             crossfadeSeconds = prefs.getInt("crossfade", 0),
@@ -151,21 +170,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshHomeContent() {
         viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingHome = true) }
             val s = _uiState.value.settings
             val isPod = _uiState.value.homeFilter == HomeFilter.PODCASTS
             val dayQuery = when (Calendar.getInstance().get(Calendar.HOUR_OF_DAY)) {
-                in 5..11 -> "morning upbeat hits"
-                in 12..16 -> "top hits 2026"
-                in 17..21 -> "workout energy music"
-                else -> "night chill vibes"
+                in 5..11 -> "morning upbeat pop song official audio"
+                in 12..16 -> "top songs 2026 official audio"
+                in 17..21 -> "workout energy song official audio"
+                else -> "night chill song official audio"
             }
-            val daily = repo.searchTracks(if (isPod) "פודקאסטים מובילים" else "להיטים מובילים ישראל", s, isPod)
-            val discover = repo.searchTracks(if (isPod) "tech podcast" else "discover new music hits", s, isPod)
-            val radar = repo.searchTracks(if (isPod) "history podcast" else "new music release 2026", s, isPod)
+            val daily = repo.searchTracks(if (isPod) "פודקאסט ישראלי פרק" else "להיטים חדשים ישראל שיר", s, isPod)
+            val discover = repo.searchTracks(if (isPod) "tech science podcast" else "new pop hits official audio", s, isPod)
+            val radar = repo.searchTracks(if (isPod) "history podcast" else "new music release official audio", s, isPod)
             val daylist = repo.searchTracks(dayQuery, s, isPod)
 
             _uiState.update { state ->
                 state.copy(
+                    isLoadingHome = false,
                     daylistTitle = computeDaylistTitle(),
                     dailyMixTracks = daily.take(10),
                     discoverTracks = discover.take(10),
@@ -177,10 +198,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun selectTab(tab: MainTab) = _uiState.update { it.copy(selectedTab = tab, showSettings = false) }
+    fun selectTab(tab: MainTab) = _uiState.update {
+        it.copy(selectedTab = tab, showSettings = false, openedPlaylistId = null)
+    }
     fun setShowSettings(show: Boolean) = _uiState.update { it.copy(showSettings = show) }
     fun setShowNowPlaying(show: Boolean) = _uiState.update { it.copy(showNowPlaying = show) }
     fun setShowCreateSheet(show: Boolean) = _uiState.update { it.copy(showCreateSheet = show) }
+    fun setShowDevicesSheet(show: Boolean) = _uiState.update { it.copy(showDevicesSheet = show) }
+    fun openPlaylist(playlistId: String?) = _uiState.update { it.copy(openedPlaylistId = playlistId, showSettings = false) }
+    fun openTrackOptions(track: Track?) = _uiState.update { it.copy(trackForOptions = track) }
     fun clearStatus() = _uiState.update { it.copy(statusMessage = null) }
 
     fun setHomeFilter(filter: HomeFilter) {
@@ -202,6 +228,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             .putString("subsonic_url", newSettings.subsonicUrl)
             .putString("subsonic_user", newSettings.subsonicUser)
             .putString("subsonic_pass", newSettings.subsonicPass)
+            .putString("gemini_key", newSettings.geminiApiKey)
             .putBoolean("norm_vol", newSettings.normalizeVolume)
             .putBoolean("gapless", newSettings.gaplessPlayback)
             .putInt("crossfade", newSettings.crossfadeSeconds)
@@ -214,20 +241,42 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (sourceChanged) refreshHomeContent()
     }
 
+    fun testSubsonicServer() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(statusMessage = "בודק חיבור לשרת...") }
+            val (_, msg) = repo.testSubsonicConnection(_uiState.value.settings)
+            _uiState.update { it.copy(statusMessage = msg) }
+        }
+    }
+
+    fun scanLocalFiles() {
+        viewModelScope.launch {
+            val found = withContext(Dispatchers.IO) { repo.searchLocalAudio("") }
+            _uiState.update {
+                it.copy(
+                    recentTracks = if (found.isNotEmpty()) found.take(12) else it.recentTracks,
+                    statusMessage = if (found.isEmpty()) "לא נמצאו קובצי אודיו במכשיר (בדוק הרשאות)" else "נמצאו ${found.size} קובצי אודיו במכשיר"
+                )
+            }
+        }
+    }
+
     fun onSearchQueryChange(query: String) {
-        _uiState.update { it.copy(searchQuery = query) }
+        _uiState.update { it.copy(searchQuery = query, hasSearched = if (query.isBlank()) false else it.hasSearched) }
     }
 
     fun performSearch(query: String = _uiState.value.searchQuery) {
-        if (query.isBlank()) return
-        _uiState.update { it.copy(searchQuery = query, isSearching = true) }
+        val clean = query.trim()
+        if (clean.isBlank()) return
+        _uiState.update { it.copy(searchQuery = clean, isSearching = true, hasSearched = true) }
         viewModelScope.launch {
-            val res = repo.searchTracks(query, _uiState.value.settings)
+            val res = repo.searchTracks(clean, _uiState.value.settings)
             _uiState.update { it.copy(searchResults = res, isSearching = false) }
         }
     }
 
-    fun playTrack(track: Track, list: List<Track> = listOf(track)) {
+    fun playTrack(track: Track, list: List<Track> = listOf(track), openVideoImmediately: Boolean = false) {
+        retryAttemptForCurrent = 0
         val finalQueue = if (list.any { it.id == track.id }) list else listOf(track) + list
         val idx = finalQueue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
         val updatedRecent = (listOf(track) + _uiState.value.recentTracks.filterNot { it.id == track.id }).take(12)
@@ -239,24 +288,36 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 currentIndex = idx,
                 currentTrack = track,
                 recentTracks = updatedRecent,
+                resolvedStreams = null,
                 isBuffering = true,
                 isVideoMode = false,
+                positionMs = 0L,
+                durationMs = track.durationMs,
                 lyrics = emptyList(),
                 isLoadingLyrics = true
             )
         }
 
+        extractDynamicColor(track.artworkUrl)
+        resolveAndStartTrack(track, attempt = 0, forceVideo = openVideoImmediately)
+
         viewModelScope.launch {
-            val resolved = repo.resolveStreams(track, _uiState.value.settings)
+            val lyrics = repo.fetchSyncedLyrics(track.artist, track.title)
+            _uiState.update { it.copy(lyrics = lyrics, isLoadingLyrics = false) }
+        }
+    }
+
+    private fun resolveAndStartTrack(track: Track, attempt: Int, forceVideo: Boolean = false) {
+        viewModelScope.launch {
+            val resolved = repo.resolveStreams(track, _uiState.value.settings, attemptIndex = attempt)
             if (resolved == null) {
                 _uiState.update {
-                    it.copy(isBuffering = false, statusMessage = "לא נמצא זרם זמין לשיר זה — נסה מקור אחר בהגדרות")
+                    it.copy(isBuffering = false, statusMessage = "לא הצלחנו לטעון זרם לשיר זה — נסה שיר אחר או בדוק אינטרנט")
                 }
                 return@launch
             }
-            val startInVideo = _uiState.value.settings.autoVideoOnWifi && !resolved.videoUrl.isNullOrBlank()
-            val startUrl = if (startInVideo) resolved.videoUrl!! else resolved.audioUrl
-            audioEngine.playMedia(startUrl, track)
+            val startInVideo = (forceVideo || _uiState.value.settings.autoVideoOnWifi) && resolved.hasVideoClip
+            audioEngine.playResolved(resolved, track, videoMode = startInVideo)
             _uiState.update {
                 it.copy(
                     resolvedStreams = resolved,
@@ -264,8 +325,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     isVideoMode = startInVideo
                 )
             }
-            val lyrics = repo.fetchSyncedLyrics(track.artist, track.title)
-            _uiState.update { it.copy(lyrics = lyrics, isLoadingLyrics = false) }
+        }
+    }
+
+    private fun handlePlaybackError(code: String) {
+        val track = _uiState.value.currentTrack ?: return
+        if (retryAttemptForCurrent < 2 && track.source == StreamSource.YOUTUBE) {
+            retryAttemptForCurrent++
+            _uiState.update { it.copy(isBuffering = true, statusMessage = "מחליף שרת הזרמה אוטומטית...") }
+            resolveAndStartTrack(track, attempt = retryAttemptForCurrent)
+        } else {
+            _uiState.update { it.copy(isBuffering = false, statusMessage = "שגיאת ניגון ($code) — נסה להפעיל מחדש") }
+        }
+    }
+
+    private fun extractDynamicColor(artworkUrl: String) {
+        if (artworkUrl.isBlank()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val app = getApplication<Application>()
+                val request = ImageRequest.Builder(app)
+                    .data(artworkUrl)
+                    .allowHardware(false)
+                    .size(128)
+                    .build()
+                val result = app.imageLoader.execute(request)
+                val bmp = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap ?: return@launch
+                val palette = Palette.from(bmp).generate()
+                val picked = palette.getDarkVibrantColor(
+                    palette.getDarkMutedColor(palette.getDominantColor(0xFF1F3B33.toInt()))
+                )
+                val argb = (0xFF000000L or (picked.toLong() and 0x00FFFFFFL))
+                _uiState.update { it.copy(dynamicAccentColor = argb) }
+            }
         }
     }
 
@@ -274,32 +366,63 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val track = state.currentTrack ?: return
         val resolved = state.resolvedStreams ?: return
         if (!state.isVideoMode) {
-            val vUrl = resolved.videoUrl
-            if (vUrl.isNullOrBlank()) {
+            if (!resolved.hasVideoClip) {
                 _uiState.update { it.copy(statusMessage = "אין קליפ וידאו זמין למקור השמע הנוכחי") }
                 return
             }
-            audioEngine.seamlessSwitchStream(vUrl, track)
+            audioEngine.seamlessSwitchVideoMode(resolved, track, toVideo = true)
             _uiState.update { it.copy(isVideoMode = true) }
         } else {
-            audioEngine.seamlessSwitchStream(resolved.audioUrl, track)
+            audioEngine.seamlessSwitchVideoMode(resolved, track, toVideo = false)
             _uiState.update { it.copy(isVideoMode = false) }
         }
     }
 
-    fun togglePlayPause() = audioEngine.togglePlayPause()
-    fun seekTo(ms: Long) = audioEngine.seekTo(ms)
+    fun togglePlayPause() {
+        val current = _uiState.value.currentTrack
+        audioEngine.togglePlayPause(onNeedRetry = {
+            if (current != null) {
+                retryAttemptForCurrent = 0
+                _uiState.update { it.copy(isBuffering = true) }
+                resolveAndStartTrack(current, attempt = 0)
+            }
+        })
+    }
+
+    fun seekTo(ms: Long) {
+        _uiState.update { it.copy(positionMs = ms.coerceAtLeast(0L)) }
+        audioEngine.seekTo(ms)
+    }
 
     fun skipNext() {
         val state = _uiState.value
         if (state.queue.isEmpty()) return
         val nextIdx = when {
-            state.shuffleEnabled -> (state.queue.indices).random()
+            state.shuffleEnabled && state.queue.size > 1 -> {
+                var r = state.queue.indices.random()
+                if (r == state.currentIndex) r = (state.currentIndex + 1) % state.queue.size
+                r
+            }
             state.currentIndex + 1 < state.queue.size -> state.currentIndex + 1
             state.repeatMode == RepeatMode.ALL -> 0
-            else -> return
+            else -> -1
         }
-        playTrack(state.queue[nextIdx], state.queue)
+        if (nextIdx >= 0) {
+            playTrack(state.queue[nextIdx], state.queue)
+        } else {
+            // Autoplay next related track so Next ALWAYS responds!
+            val current = state.currentTrack ?: return
+            _uiState.update { it.copy(statusMessage = "מחפש שיר המשך אוטומטי...") }
+            viewModelScope.launch {
+                val related = repo.searchTracks("${current.artist} song", _uiState.value.settings)
+                    .filterNot { cand -> _uiState.value.queue.any { it.id == cand.id } }
+                    .take(5)
+                if (related.isNotEmpty()) {
+                    val newQueue = _uiState.value.queue + related
+                    playTrack(related.first(), newQueue)
+                }
+            }
+        }
     }
 
     fun skipPrevious() {
@@ -309,7 +432,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (state.queue.isEmpty()) return
-        val prevIdx = (state.currentIndex - 1).coerceAtLeast(0)
+        val prevIdx = if (state.currentIndex > 0) state.currentIndex - 1 else 0
         playTrack(state.queue[prevIdx], state.queue)
     }
 
@@ -326,21 +449,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun cycleShuffleMode() {
         val state = _uiState.value
         when {
-            !state.shuffleEnabled -> _uiState.update { it.copy(shuffleEnabled = true, smartShuffleEnabled = false) }
+            !state.shuffleEnabled -> _uiState.update {
+                it.copy(shuffleEnabled = true, smartShuffleEnabled = false, statusMessage = "ערבוב הופעל")
+            }
             !state.smartShuffleEnabled -> {
-                _uiState.update { it.copy(shuffleEnabled = true, smartShuffleEnabled = true, statusMessage = "Smart Shuffle הופעל — מוזרקים שירים מומלצים לתור") }
+                _uiState.update {
+                    it.copy(shuffleEnabled = true, smartShuffleEnabled = true, statusMessage = "Smart Shuffle הופעל — מוזרקים שירים דומים")
+                }
                 injectSmartShuffleTracks()
             }
-            else -> _uiState.update { it.copy(shuffleEnabled = false, smartShuffleEnabled = false) }
+            else -> _uiState.update {
+                it.copy(shuffleEnabled = false, smartShuffleEnabled = false, statusMessage = "ערבוב כובה")
+            }
         }
     }
 
     private fun injectSmartShuffleTracks() {
         val current = _uiState.value.currentTrack ?: return
         viewModelScope.launch {
-            val similar = repo.searchTracks("${current.artist} similar songs", _uiState.value.settings)
+            val similar = repo.searchTracks("${current.artist} similar song", _uiState.value.settings)
                 .filterNot { cand -> _uiState.value.queue.any { it.id == cand.id } }
-                .take(3)
+                .take(4)
                 .map { it.copy(isSmartInjected = true) }
             if (similar.isNotEmpty()) {
                 _uiState.update { it.copy(queue = it.queue + similar) }
@@ -355,7 +484,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 RepeatMode.ALL -> RepeatMode.ONE
                 RepeatMode.ONE -> RepeatMode.OFF
             }
-            it.copy(repeatMode = next)
+            val msg = when (next) {
+                RepeatMode.OFF -> "חזרה כובתה"
+                RepeatMode.ALL -> "חזור על כל התור"
+                RepeatMode.ONE -> "חזור על השיר הנוכחי"
+            }
+            it.copy(repeatMode = next, statusMessage = msg)
         }
     }
 
@@ -405,7 +539,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
-        _uiState.update { it.copy(downloadingIds = it.downloadingIds + track.id) }
+        _uiState.update { it.copy(downloadingIds = it.downloadingIds + track.id, statusMessage = "מוריד לאופליין...") }
         viewModelScope.launch {
             val ok = repo.downloadTrackOffline(track, _uiState.value.settings)
             _uiState.update {
@@ -418,53 +552,141 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun createPlaylist(name: String, initialTracks: List<Track> = emptyList()) {
-        if (name.isBlank()) return
-        val pl = Playlist(name = name.trim(), tracks = initialTracks)
-        val updated = listOf(pl) + _uiState.value.playlists
+    // ---------- Playlists Management ----------
+    private fun savePlaylists(updated: List<Playlist>) {
         prefs.edit().putString("playlists", encodePlaylists(updated)).apply()
-        _uiState.update { it.copy(playlists = updated, showCreateSheet = false, statusMessage = "הפלייליסט \"$name\" נוצר") }
+        _uiState.update { it.copy(playlists = updated) }
+    }
+
+    fun createPlaylist(name: String, initialTracks: List<Track> = emptyList()) {
+        val clean = name.trim()
+        if (clean.isBlank()) {
+            _uiState.update { it.copy(statusMessage = "יש להזין שם לפלייליסט") }
+            return
+        }
+        val pl = Playlist(name = clean, tracks = initialTracks)
+        savePlaylists(listOf(pl) + _uiState.value.playlists)
+        _uiState.update {
+            it.copy(
+                showCreateSheet = false,
+                openedPlaylistId = pl.id,
+                selectedTab = MainTab.LIBRARY,
+                statusMessage = "הפלייליסט \"$clean\" נוצר"
+            )
+        }
+    }
+
+    fun addTrackToPlaylist(playlistId: String, track: Track) {
+        val updated = _uiState.value.playlists.map { pl ->
+            if (pl.id == playlistId) {
+                if (pl.tracks.any { it.id == track.id }) pl
+                else pl.copy(tracks = pl.tracks + track)
+            } else pl
+        }
+        savePlaylists(updated)
+        _uiState.update { it.copy(trackForOptions = null, statusMessage = "השיר נוסף לפלייליסט") }
+    }
+
+    fun removeTrackFromPlaylist(playlistId: String, trackId: String) {
+        val updated = _uiState.value.playlists.map { pl ->
+            if (pl.id == playlistId) pl.copy(tracks = pl.tracks.filterNot { it.id == trackId }) else pl
+        }
+        savePlaylists(updated)
+        _uiState.update { it.copy(statusMessage = "השיר הוסר מהפלייליסט") }
+    }
+
+    fun deletePlaylist(playlistId: String) {
+        val updated = _uiState.value.playlists.filterNot { it.id == playlistId }
+        savePlaylists(updated)
+        _uiState.update { it.copy(openedPlaylistId = null, statusMessage = "הפלייליסט נמחק") }
     }
 
     fun createBlend(friendName: String) {
-        val name = if (friendName.isBlank()) "Blend משותף" else "Blend • אתה + $friendName"
-        val match = (74..98).random()
-        val combined = (_uiState.value.likedTracks.take(4) + _uiState.value.discoverTracks.take(4)).distinctBy { it.id }
-        val pl = Playlist(
-            name = name,
-            creator = "Blend",
-            description = "התאמה מוזיקלית של $match%",
-            tracks = combined,
-            isBlend = true,
-            blendMatchPercent = match
-        )
-        val updated = listOf(pl) + _uiState.value.playlists
-        prefs.edit().putString("playlists", encodePlaylists(updated)).apply()
-        _uiState.update { it.copy(playlists = updated, showCreateSheet = false, statusMessage = "נוצר Blend עם $match% התאמה") }
-    }
-
-    fun createAiPlaylist(prompt: String) {
-        if (prompt.isBlank()) return
-        _uiState.update { it.copy(showCreateSheet = false, statusMessage = "AI Playlist בונה עבורך רשימה...") }
+        val cleanFriend = friendName.trim().ifBlank { "חבר" }
+        _uiState.update { it.copy(showCreateSheet = false, statusMessage = "מרכיב Blend עם $cleanFriend...") }
         viewModelScope.launch {
-            val results = repo.searchTracks(prompt, _uiState.value.settings).take(10)
-            if (results.isNotEmpty()) {
-                val pl = Playlist(name = "AI • $prompt", creator = "AI Playlist", tracks = results)
-                val updated = listOf(pl) + _uiState.value.playlists
-                prefs.edit().putString("playlists", encodePlaylists(updated)).apply()
-                _uiState.update { it.copy(playlists = updated, statusMessage = "הפלייליסט מוכן (${results.size} שירים)") }
-                playTrack(results.first(), results)
+            val baseTracks = (_uiState.value.likedTracks.take(5) + _uiState.value.discoverTracks.take(5)).distinctBy { it.id }
+            val tracks = if (baseTracks.size >= 4) baseTracks else {
+                repo.searchTracks("top hits song official audio", _uiState.value.settings).take(10)
+            }
+            val match = (76..98).random()
+            val pl = Playlist(
+                name = "Blend • אתה + $cleanFriend",
+                creator = "Blend",
+                description = "התאמה מוזיקלית של $match%",
+                tracks = tracks,
+                isBlend = true,
+                blendMatchPercent = match
+            )
+            savePlaylists(listOf(pl) + _uiState.value.playlists)
+            _uiState.update {
+                it.copy(
+                    openedPlaylistId = pl.id,
+                    selectedTab = MainTab.LIBRARY,
+                    statusMessage = "נוצר Blend עם $match% התאמה (${tracks.size} שירים)"
+                )
             }
         }
     }
 
+    fun createAiPlaylist(prompt: String) {
+        val clean = prompt.trim()
+        if (clean.isBlank()) {
+            _uiState.update { it.copy(statusMessage = "תאר איזה פלייליסט תרצה שה-AI יבנה") }
+            return
+        }
+        _uiState.update {
+            it.copy(
+                showCreateSheet = false,
+                isBuildingAiPlaylist = true,
+                statusMessage = "AI Playlist בונה עבורך רשימת שירים..."
+            )
+        }
+        viewModelScope.launch {
+            val (title, tracks) = repo.buildAiPlaylist(clean, _uiState.value.settings)
+            if (tracks.isEmpty()) {
+                _uiState.update {
+                    it.copy(
+                        isBuildingAiPlaylist = false,
+                        statusMessage = "לא נמצאו שירים לתיאור הזה — נסה תיאור קצר יותר (למשל: היפ הופ לאימון)"
+                    )
+                }
+                return@launch
+            }
+            val pl = Playlist(
+                name = title,
+                creator = "AI Playlist",
+                description = "נבנה לפי: $clean",
+                tracks = tracks
+            )
+            savePlaylists(listOf(pl) + _uiState.value.playlists)
+            _uiState.update {
+                it.copy(
+                    isBuildingAiPlaylist = false,
+                    openedPlaylistId = pl.id,
+                    selectedTab = MainTab.LIBRARY,
+                    statusMessage = "הפלייליסט מוכן עם ${tracks.size} שירים!"
+                )
+            }
+            playTrack(tracks.first(), tracks)
+        }
+    }
+
     fun startAiDj() {
-        val mix = (_uiState.value.recentTracks.take(3) + _uiState.value.discoverTracks.take(4) + _uiState.value.daylistTracks.take(4))
-            .distinctBy { it.id }
-            .shuffled()
-        if (mix.isNotEmpty()) {
-            _uiState.update { it.copy(showCreateSheet = false, statusMessage = "AI DJ: מרכיב לך סט מותאם אישית") }
-            playTrack(mix.first(), mix)
+        _uiState.update { it.copy(showCreateSheet = false, statusMessage = "AI DJ מכין לך סט אישי...") }
+        viewModelScope.launch {
+            val existing = (_uiState.value.recentTracks.take(4) + _uiState.value.discoverTracks.take(5) + _uiState.value.daylistTracks.take(5))
+                .distinctBy { it.id }
+                .shuffled()
+            val mix = if (existing.size >= 3) existing else {
+                repo.searchTracks("top hits 2026 official audio", _uiState.value.settings).take(12)
+            }
+            if (mix.isNotEmpty()) {
+                playTrack(mix.first(), mix)
+                _uiState.update { it.copy(showNowPlaying = true, statusMessage = "AI DJ מנגן עכשיו סט של ${mix.size} שירים") }
+            } else {
+                _uiState.update { it.copy(statusMessage = "לא הצלחנו לטעון שירים ל-AI DJ — בדוק חיבור אינטרנט") }
+            }
         }
     }
 
@@ -489,7 +711,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(sleepMinutesLeft = left, sleepEndOfTrack = false) }
         }
         _uiState.update {
-            it.copy(statusMessage = if (minutes > 0) "טיימר שינה הופעל ל-$minutes דקות" else "טיימר השינה בוטל")
+            it.copy(
+                sleepEndOfTrack = false,
+                statusMessage = if (minutes > 0) "טיימר שינה הופעל ל-$minutes דקות" else "טיימר השינה בוטל"
+            )
         }
     }
 
@@ -498,7 +723,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(sleepMinutesLeft = null, sleepEndOfTrack = true, statusMessage = "הניגון ייעצר בסיום השיר הנוכחי") }
     }
 
-    // Simple JSON serialization
+    fun retryLyrics(customQuery: String? = null) {
+        val track = _uiState.value.currentTrack ?: return
+        _uiState.update { it.copy(isLoadingLyrics = true) }
+        viewModelScope.launch {
+            val lyrics = if (!customQuery.isNullOrBlank()) {
+                repo.fetchSyncedLyrics("", customQuery)
+            } else {
+                repo.fetchSyncedLyrics(track.artist, track.title)
+            }
+            _uiState.update { it.copy(lyrics = lyrics, isLoadingLyrics = false) }
+        }
+    }
+
     private fun encodeTracks(tracks: List<Track>): String {
         val arr = JSONArray()
         tracks.forEach { t ->
