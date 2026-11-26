@@ -1,4 +1,3 @@
-@file:kotlin.OptIn(ExperimentalMaterial3Api::class)
 
 package com.sonify.app
 
