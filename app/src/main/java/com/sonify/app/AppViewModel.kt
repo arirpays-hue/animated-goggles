@@ -40,7 +40,6 @@ data class UiState(
     val libraryGridView: Boolean = false,
     val settings: AppSettings = AppSettings(),
 
-    // Home & Search Content
     val recentTracks: List<Track> = emptyList(),
     val homeMixPlaylists: List<Playlist> = emptyList(),
     val daylistPlaylist: Playlist? = null,
@@ -60,6 +59,7 @@ data class UiState(
     val currentIndex: Int = -1,
     val currentTrack: Track? = null,
     val resolvedStreams: ResolvedStreams? = null,
+    val isUsingWebEngine: Boolean = false,
     val dynamicAccentColor: Long = 0xFF1F3B33,
     val isPlaying: Boolean = false,
     val isResolvingStream: Boolean = false,
@@ -121,17 +121,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun loadSavedState() {
         val schemaVer = prefs.getInt("schema_version", 1)
-        val source = runCatching {
-            StreamSource.valueOf(prefs.getString("stream_source", StreamSource.YOUTUBE.name)!!)
-        }.getOrDefault(StreamSource.YOUTUBE)
-        val quality = runCatching {
-            AudioQuality.valueOf(prefs.getString("audio_quality", AudioQuality.HIGH.name)!!)
-        }.getOrDefault(AudioQuality.HIGH)
+        val source = runCatching { StreamSource.valueOf(prefs.getString("stream_source", StreamSource.YOUTUBE.name)!!) }.getOrDefault(StreamSource.YOUTUBE)
+        val ytMode = runCatching { YouTubeEngineMode.valueOf(prefs.getString("yt_engine_mode", YouTubeEngineMode.AUTO.name)!!) }.getOrDefault(YouTubeEngineMode.AUTO)
+        val quality = runCatching { AudioQuality.valueOf(prefs.getString("audio_quality", AudioQuality.HIGH.name)!!) }.getOrDefault(AudioQuality.HIGH)
         val eqStr = prefs.getString("eq_bands", "0,0,0,0,0") ?: "0,0,0,0,0"
         val eqBands = eqStr.split(",").mapNotNull { it.toIntOrNull() }.ifEmpty { listOf(0, 0, 0, 0, 0) }
 
         val settings = AppSettings(
             streamSource = source,
+            ytEngineMode = ytMode,
             quality = quality,
             subsonicUrl = prefs.getString("subsonic_url", "") ?: "",
             subsonicUser = prefs.getString("subsonic_user", "") ?: "",
@@ -152,25 +150,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         var recent = decodeTracks(prefs.getString("recent_tracks", "[]") ?: "[]")
         val playlists = decodePlaylists(prefs.getString("playlists", "[]") ?: "[]")
 
-        // v3 migration: purge old 1-2 hour YouTube compilation videos mistakenly cached earlier
         if (schemaVer < 3) {
             recent = recent.filter { it.isPodcast || it.durationMs <= 600_000L }
             liked = liked.filter { it.isPodcast || it.durationMs <= 600_000L }
-            prefs.edit()
-                .putInt("schema_version", 3)
-                .putString("recent_tracks", encodeTracks(recent))
-                .putString("liked_tracks", encodeTracks(liked))
-                .apply()
+            prefs.edit().putInt("schema_version", 3).putString("recent_tracks", encodeTracks(recent)).putString("liked_tracks", encodeTracks(liked)).apply()
         }
 
         _uiState.update {
-            it.copy(
-                settings = settings,
-                likedTracks = liked,
-                recentTracks = recent,
-                playlists = playlists,
-                offlineTrackIds = repo.getOfflineTrackIds()
-            )
+            it.copy(settings = settings, likedTracks = liked, recentTracks = recent, playlists = playlists, offlineTrackIds = repo.getOfflineTrackIds())
         }
     }
 
@@ -204,43 +191,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val dayTracks = dDaylist.await().take(12)
 
             val mixes = buildList {
-                if (mix1Tracks.isNotEmpty()) add(
-                    Playlist(
-                        id = "home_daily_1", name = "Daily Mix 1 • ישראלי", creator = "Sonify",
-                        description = "הלהיטים המובילים בעברית — ${mix1Tracks.size} שירים",
-                        coverUrl = mix1Tracks.first().artworkUrl, tracks = mix1Tracks, isRemote = true
-                    )
-                )
-                if (mix2Tracks.isNotEmpty()) add(
-                    Playlist(
-                        id = "home_daily_2", name = "Daily Mix 2 • בינלאומי", creator = "Sonify",
-                        description = "פופ ומוזיקה בינלאומית — ${mix2Tracks.size} שירים",
-                        coverUrl = mix2Tracks.first().artworkUrl, tracks = mix2Tracks, isRemote = true
-                    )
-                )
-                if (discoverTracks.isNotEmpty()) add(
-                    Playlist(
-                        id = "home_discover", name = "Discover Weekly", creator = "Sonify",
-                        description = "גילוי שבועי של שירים חדשים עבורך",
-                        coverUrl = discoverTracks.first().artworkUrl, tracks = discoverTracks, isRemote = true
-                    )
-                )
-                if (radarTracks.isNotEmpty()) add(
-                    Playlist(
-                        id = "home_radar", name = "Release Radar", creator = "Sonify",
-                        description = "שחרורים חדשים ורעננים",
-                        coverUrl = radarTracks.first().artworkUrl, tracks = radarTracks, isRemote = true
-                    )
-                )
+                if (mix1Tracks.isNotEmpty()) add(Playlist(id = "home_daily_1", name = "Daily Mix 1 • ישראלי", creator = "Sonify", description = "הלהיטים המובילים בעברית — ${mix1Tracks.size} שירים", coverUrl = mix1Tracks.first().artworkUrl, tracks = mix1Tracks, isRemote = true))
+                if (mix2Tracks.isNotEmpty()) add(Playlist(id = "home_daily_2", name = "Daily Mix 2 • בינלאומי", creator = "Sonify", description = "פופ ומוזיקה בינלאומית — ${mix2Tracks.size} שירים", coverUrl = mix2Tracks.first().artworkUrl, tracks = mix2Tracks, isRemote = true))
+                if (discoverTracks.isNotEmpty()) add(Playlist(id = "home_discover", name = "Discover Weekly", creator = "Sonify", description = "גילוי שבועי של שירים חדשים עבורך", coverUrl = discoverTracks.first().artworkUrl, tracks = discoverTracks, isRemote = true))
+                if (radarTracks.isNotEmpty()) add(Playlist(id = "home_radar", name = "Release Radar", creator = "Sonify", description = "שחרורים חדשים ורעננים", coverUrl = radarTracks.first().artworkUrl, tracks = radarTracks, isRemote = true))
             }
 
-            val dayPlaylist = if (dayTracks.isNotEmpty()) {
-                Playlist(
-                    id = "home_daylist", name = dayTitle, creator = "Sonify",
-                    description = "פלייליסט דינמי שמתעדכן לפי השעה ביום",
-                    coverUrl = dayTracks.first().artworkUrl, tracks = dayTracks, isRemote = true
-                )
-            } else null
+            val dayPlaylist = if (dayTracks.isNotEmpty()) Playlist(id = "home_daylist", name = dayTitle, creator = "Sonify", description = "פלייליסט דינמי שמתעדכן לפי השעה ביום", coverUrl = dayTracks.first().artworkUrl, tracks = dayTracks, isRemote = true) else null
 
             _uiState.update { state ->
                 state.copy(
@@ -254,9 +211,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun selectTab(tab: MainTab) = _uiState.update {
-        it.copy(selectedTab = tab, showSettings = false, openedPlaylist = null)
-    }
+    fun selectTab(tab: MainTab) = _uiState.update { it.copy(selectedTab = tab, showSettings = false, openedPlaylist = null) }
     fun setShowSettings(show: Boolean) = _uiState.update { it.copy(showSettings = show) }
     fun setShowNowPlaying(show: Boolean) = _uiState.update { it.copy(showNowPlaying = show) }
     fun setShowCreateSheet(show: Boolean) = _uiState.update { it.copy(showCreateSheet = show) }
@@ -269,14 +224,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 isLoadingPlaylist = true,
-                openedPlaylist = Playlist(
-                    id = remote.id,
-                    name = remote.title,
-                    creator = remote.subtitle,
-                    coverUrl = remote.artworkUrl,
-                    tracks = emptyList(),
-                    isRemote = true
-                )
+                openedPlaylist = Playlist(id = remote.id, name = remote.title, creator = remote.subtitle, coverUrl = remote.artworkUrl, tracks = emptyList(), isRemote = true)
             )
         }
         viewModelScope.launch {
@@ -284,11 +232,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { state ->
                 val cur = state.openedPlaylist
                 if (cur != null && cur.id == remote.id) {
-                    state.copy(
-                        isLoadingPlaylist = false,
-                        openedPlaylist = cur.copy(tracks = tracks),
-                        statusMessage = if (tracks.isEmpty()) "לא ניתן לטעון שירים מפלייליסט זה" else null
-                    )
+                    state.copy(isLoadingPlaylist = false, openedPlaylist = cur.copy(tracks = tracks), statusMessage = if (tracks.isEmpty()) "לא ניתן לטעון שירים מפלייליסט זה" else null)
                 } else state.copy(isLoadingPlaylist = false)
             }
         }
@@ -300,16 +244,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(openedPlaylist = saved, statusMessage = "הפלייליסט נשמר בספרייה שלך!") }
     }
 
-    fun setHomeFilter(filter: HomeFilter) {
-        _uiState.update { it.copy(homeFilter = filter) }
-        refreshHomeContent()
-    }
-
-    fun setSearchMode(mode: SearchMode) {
-        _uiState.update { it.copy(searchMode = mode) }
-        if (_uiState.value.searchQuery.isNotBlank()) performSearch()
-    }
-
+    fun setHomeFilter(filter: HomeFilter) { _uiState.update { it.copy(homeFilter = filter) }; refreshHomeContent() }
+    fun setSearchMode(mode: SearchMode) { _uiState.update { it.copy(searchMode = mode) }; if (_uiState.value.searchQuery.isNotBlank()) performSearch() }
     fun setLibraryFilter(filter: LibraryFilter) = _uiState.update { it.copy(libraryFilter = filter) }
     fun setLibrarySort(sort: LibrarySort) = _uiState.update { it.copy(librarySort = sort) }
     fun toggleLibraryGrid() = _uiState.update { it.copy(libraryGridView = !it.libraryGridView) }
@@ -320,6 +256,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         audioEngine.applySettings(newSettings)
         prefs.edit()
             .putString("stream_source", newSettings.streamSource.name)
+            .putString("yt_engine_mode", newSettings.ytEngineMode.name)
             .putString("audio_quality", newSettings.quality.name)
             .putString("subsonic_url", newSettings.subsonicUrl)
             .putString("subsonic_user", newSettings.subsonicUser)
@@ -396,6 +333,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val updatedRecent = (listOf(track) + _uiState.value.recentTracks.filterNot { it.id == track.id }).take(12)
         prefs.edit().putString("recent_tracks", encodeTracks(updatedRecent)).apply()
 
+        val settings = _uiState.value.settings
+        val useWebDirect = track.source == StreamSource.YOUTUBE &&
+            settings.ytEngineMode == YouTubeEngineMode.WEB_DIRECT &&
+            !_uiState.value.offlineTrackIds.contains(track.id)
+
         _uiState.update {
             it.copy(
                 queue = finalQueue,
@@ -403,9 +345,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 currentTrack = track,
                 recentTracks = updatedRecent,
                 resolvedStreams = null,
-                isResolvingStream = true,
-                isPlayerBuffering = false,
-                isVideoMode = false,
+                isUsingWebEngine = useWebDirect,
+                isResolvingStream = !useWebDirect,
+                isPlayerBuffering = useWebDirect,
+                isVideoMode = openVideoImmediately || (useWebDirect && settings.autoVideoOnWifi),
                 positionMs = 0L,
                 durationMs = track.durationMs,
                 lyrics = emptyList(),
@@ -414,7 +357,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         extractDynamicColor(track.artworkUrl)
-        resolveAndStartTrack(track, attempt = 0, forceVideo = openVideoImmediately)
+
+        if (useWebDirect) {
+            audioEngine.playViaWebEngine(track)
+        } else {
+            resolveAndStartTrack(track, attempt = 0, forceVideo = openVideoImmediately)
+        }
 
         viewModelScope.launch {
             val lyrics = repo.fetchSyncedLyrics(track.artist, track.title)
@@ -422,45 +370,56 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun activateWebFallback(track: Track, forceVideo: Boolean = false) {
+        _uiState.update {
+            it.copy(
+                isUsingWebEngine = true,
+                isResolvingStream = false,
+                isPlayerBuffering = true,
+                isVideoMode = forceVideo || it.isVideoMode || it.settings.autoVideoOnWifi,
+                statusMessage = "מנגן דרך מנוע YouTube המובנה"
+            )
+        }
+        audioEngine.playViaWebEngine(track)
+    }
+
     private fun resolveAndStartTrack(track: Track, attempt: Int, forceVideo: Boolean = false) {
         viewModelScope.launch {
-            val resolved = repo.resolveStreams(track, _uiState.value.settings, attemptIndex = attempt)
+            val settings = _uiState.value.settings
+            val resolved = repo.resolveStreams(track, settings, attemptIndex = attempt)
             if (resolved == null) {
-                _uiState.update {
-                    it.copy(
-                        isResolvingStream = false,
-                        isPlayerBuffering = false,
-                        statusMessage = "לא הצלחנו לפתוח זרם פעיל לשיר — נסה שיר אחר"
-                    )
+                if (track.source == StreamSource.YOUTUBE && settings.ytEngineMode != YouTubeEngineMode.EXOPLAYER_ONLY) {
+                    activateWebFallback(track, forceVideo)
+                } else {
+                    _uiState.update {
+                        it.copy(isResolvingStream = false, isPlayerBuffering = false, statusMessage = "לא נמצא זרם ישיר — נסה להפעיל מצב אוטומטי בהגדרות")
+                    }
                 }
                 return@launch
             }
-            val startInVideo = (forceVideo || _uiState.value.settings.autoVideoOnWifi) && resolved.hasVideoClip
+            val startInVideo = (forceVideo || settings.autoVideoOnWifi) && resolved.hasVideoClip
             audioEngine.playResolved(resolved, track, videoMode = startInVideo)
             _uiState.update {
-                it.copy(
-                    resolvedStreams = resolved,
-                    isResolvingStream = false,
-                    isVideoMode = startInVideo
-                )
+                it.copy(isUsingWebEngine = false, resolvedStreams = resolved, isResolvingStream = false, isVideoMode = startInVideo)
             }
         }
     }
 
     private fun handlePlaybackError(code: String) {
-        val track = _uiState.value.currentTrack ?: return
-        if (retryAttemptForCurrent < 2 && track.source == StreamSource.YOUTUBE) {
-            retryAttemptForCurrent++
-            _uiState.update { it.copy(isResolvingStream = true, statusMessage = "מנסה שרת חלופי...") }
-            resolveAndStartTrack(track, attempt = retryAttemptForCurrent)
-        } else {
-            _uiState.update {
-                it.copy(
-                    isResolvingStream = false,
-                    isPlayerBuffering = false,
-                    statusMessage = "שגיאת ניגון ($code) — לחץ Play לניסיון חוזר"
-                )
+        val state = _uiState.value
+        val track = state.currentTrack ?: return
+        if (track.source == StreamSource.YOUTUBE) {
+            if (retryAttemptForCurrent < 5) {
+                retryAttemptForCurrent++
+                _uiState.update { it.copy(isResolvingStream = true) }
+                resolveAndStartTrack(track, attempt = retryAttemptForCurrent, forceVideo = state.isVideoMode)
+            } else if (state.settings.ytEngineMode != YouTubeEngineMode.EXOPLAYER_ONLY) {
+                activateWebFallback(track, forceVideo = state.isVideoMode)
+            } else {
+                _uiState.update { it.copy(isResolvingStream = false, isPlayerBuffering = false, statusMessage = "שגיאת ניגון ($code)") }
             }
+        } else {
+            _uiState.update { it.copy(isResolvingStream = false, isPlayerBuffering = false, statusMessage = "שגיאת ניגון ($code)") }
         }
     }
 
@@ -473,9 +432,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val result = app.imageLoader.execute(request)
                 val bmp = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap ?: return@launch
                 val palette = Palette.from(bmp).generate()
-                val picked = palette.getDarkVibrantColor(
-                    palette.getDarkMutedColor(palette.getDominantColor(0xFF1F3B33.toInt()))
-                )
+                val picked = palette.getDarkVibrantColor(palette.getDarkMutedColor(palette.getDominantColor(0xFF1F3B33.toInt())))
                 _uiState.update { it.copy(dynamicAccentColor = (0xFF000000L or (picked.toLong() and 0x00FFFFFFL))) }
             }
         }
@@ -484,6 +441,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleVideoClipMode() {
         val state = _uiState.value
         val track = state.currentTrack ?: return
+        if (state.isUsingWebEngine) {
+            // Instant zero-reload switch between album cover and live YouTube video clip!
+            _uiState.update { it.copy(isVideoMode = !it.isVideoMode) }
+            return
+        }
         val resolved = state.resolvedStreams ?: return
         if (!state.isVideoMode) {
             if (!resolved.hasVideoClip) {
@@ -502,9 +464,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val current = _uiState.value.currentTrack
         audioEngine.togglePlayPause(onNeedRetry = {
             if (current != null) {
-                retryAttemptForCurrent = 0
-                _uiState.update { it.copy(isResolvingStream = true) }
-                resolveAndStartTrack(current, attempt = 0)
+                if (current.source == StreamSource.YOUTUBE && _uiState.value.settings.ytEngineMode != YouTubeEngineMode.EXOPLAYER_ONLY) {
+                    activateWebFallback(current)
+                } else {
+                    retryAttemptForCurrent = 0
+                    _uiState.update { it.copy(isResolvingStream = true) }
+                    resolveAndStartTrack(current, attempt = 0)
+                }
             }
         })
     }
@@ -536,9 +502,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val related = repo.searchTracks(current.artist, _uiState.value.settings)
                     .filterNot { cand -> _uiState.value.queue.any { it.id == cand.id } }
                     .take(5)
-                if (related.isNotEmpty()) {
-                    playTrack(related.first(), _uiState.value.queue + related)
-                }
+                if (related.isNotEmpty()) playTrack(related.first(), _uiState.value.queue + related)
             }
         }
     }
@@ -555,7 +519,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val state = _uiState.value
         if (state.repeatMode == RepeatMode.ONE) {
             seekTo(0L)
-            audioEngine.player.play()
+            if (state.isUsingWebEngine) audioEngine.webEngine.togglePlayPause() else audioEngine.player.play()
         } else skipNext()
     }
 
@@ -576,8 +540,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val similar = repo.searchTracks(current.artist, _uiState.value.settings)
                 .filterNot { cand -> _uiState.value.queue.any { it.id == cand.id } }
-                .take(4)
-                .map { it.copy(isSmartInjected = true) }
+                .take(4).map { it.copy(isSmartInjected = true) }
             if (similar.isNotEmpty()) _uiState.update { it.copy(queue = it.queue + similar) }
         }
     }
@@ -602,8 +565,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val list = _uiState.value.queue.toMutableList()
         if (from !in list.indices || to !in list.indices) return
         list.add(to, list.removeAt(from))
-        val newCurrentIdx = list.indexOfFirst { it.id == _uiState.value.currentTrack?.id }
-        _uiState.update { it.copy(queue = list, currentIndex = newCurrentIdx) }
+        _uiState.update { it.copy(queue = list, currentIndex = list.indexOfFirst { t -> t.id == it.currentTrack?.id }) }
     }
 
     fun removeFromQueue(index: Int) {
@@ -614,18 +576,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(queue = list, currentIndex = newIdx) }
     }
 
-    fun addToQueue(track: Track) {
-        _uiState.update { it.copy(queue = it.queue + track, statusMessage = "נוסף לתור ההשמעה") }
-    }
+    fun addToQueue(track: Track) { _uiState.update { it.copy(queue = it.queue + track, statusMessage = "נוסף לתור ההשמעה") } }
 
     fun toggleLike(track: Track) {
         val current = _uiState.value.likedTracks
         val exists = current.any { it.id == track.id }
         val updated = if (exists) current.filterNot { it.id == track.id } else listOf(track) + current
         prefs.edit().putString("liked_tracks", encodeTracks(updated)).apply()
-        _uiState.update {
-            it.copy(likedTracks = updated, statusMessage = if (exists) "הוסר מהשירים שאהבת" else "נוסף לשירים שאהבת")
-        }
+        _uiState.update { it.copy(likedTracks = updated, statusMessage = if (exists) "הוסר מהשירים שאהבת" else "נוסף לשירים שאהבת") }
     }
 
     fun downloadOffline(track: Track) {
@@ -647,23 +605,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- Playlists ----------
     private fun savePlaylists(updated: List<Playlist>) {
         prefs.edit().putString("playlists", encodePlaylists(updated)).apply()
         _uiState.update { state ->
-            val refreshedOpen = state.openedPlaylist?.let { open ->
-                updated.firstOrNull { it.id == open.id } ?: open
-            }
+            val refreshedOpen = state.openedPlaylist?.let { open -> updated.firstOrNull { it.id == open.id } ?: open }
             state.copy(playlists = updated, openedPlaylist = refreshedOpen)
         }
     }
 
     fun createPlaylist(name: String, initialTracks: List<Track> = emptyList()) {
         val clean = name.trim()
-        if (clean.isBlank()) {
-            _uiState.update { it.copy(statusMessage = "יש להזין שם לפלייליסט") }
-            return
-        }
+        if (clean.isBlank()) { _uiState.update { it.copy(statusMessage = "יש להזין שם לפלייליסט") }; return }
         val pl = Playlist(name = clean, coverUrl = initialTracks.firstOrNull()?.artworkUrl ?: "", tracks = initialTracks)
         savePlaylists(listOf(pl) + _uiState.value.playlists)
         _uiState.update { it.copy(showCreateSheet = false, openedPlaylist = pl, selectedTab = MainTab.LIBRARY, statusMessage = "הפלייליסט \"$clean\" נוצר") }
@@ -671,19 +623,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun addTrackToPlaylist(playlistId: String, track: Track) {
         val updated = _uiState.value.playlists.map { pl ->
-            if (pl.id == playlistId && pl.tracks.none { it.id == track.id }) {
-                pl.copy(tracks = pl.tracks + track, coverUrl = pl.coverUrl.ifBlank { track.artworkUrl })
-            } else pl
+            if (pl.id == playlistId && pl.tracks.none { it.id == track.id }) pl.copy(tracks = pl.tracks + track, coverUrl = pl.coverUrl.ifBlank { track.artworkUrl }) else pl
         }
         savePlaylists(updated)
         _uiState.update { it.copy(trackForOptions = null, statusMessage = "השיר נוסף לפלייליסט") }
     }
 
     fun removeTrackFromPlaylist(playlistId: String, trackId: String) {
-        val updated = _uiState.value.playlists.map { pl ->
-            if (pl.id == playlistId) pl.copy(tracks = pl.tracks.filterNot { it.id == trackId }) else pl
-        }
-        savePlaylists(updated)
+        savePlaylists(_uiState.value.playlists.map { pl -> if (pl.id == playlistId) pl.copy(tracks = pl.tracks.filterNot { it.id == trackId }) else pl })
         _uiState.update { it.copy(statusMessage = "השיר הוסר מהפלייליסט") }
     }
 
@@ -699,12 +646,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val baseTracks = (_uiState.value.likedTracks.take(5) + _uiState.value.trendingSongs.take(5)).distinctBy { it.id }
             val tracks = if (baseTracks.size >= 4) baseTracks else repo.searchTracks("top pop hits", _uiState.value.settings).take(10)
             val match = (76..98).random()
-            val pl = Playlist(
-                name = "Blend • אתה + $cleanFriend", creator = "Blend",
-                description = "התאמה מוזיקלית של $match%",
-                coverUrl = tracks.firstOrNull()?.artworkUrl ?: "",
-                tracks = tracks, isBlend = true, blendMatchPercent = match
-            )
+            val pl = Playlist(name = "Blend • אתה + $cleanFriend", creator = "Blend", description = "התאמה מוזיקלית של $match%", coverUrl = tracks.firstOrNull()?.artworkUrl ?: "", tracks = tracks, isBlend = true, blendMatchPercent = match)
             savePlaylists(listOf(pl) + _uiState.value.playlists)
             _uiState.update { it.copy(openedPlaylist = pl, selectedTab = MainTab.LIBRARY, statusMessage = "נוצר Blend עם $match% התאמה") }
         }
@@ -712,30 +654,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun createAiPlaylist(prompt: String) {
         val clean = prompt.trim()
-        if (clean.isBlank()) {
-            _uiState.update { it.copy(statusMessage = "תאר איזה פלייליסט תרצה שה-AI יבנה") }
-            return
-        }
+        if (clean.isBlank()) { _uiState.update { it.copy(statusMessage = "תאר איזה פלייליסט תרצה שה-AI יבנה") }; return }
         _uiState.update { it.copy(showCreateSheet = false, isBuildingAiPlaylist = true, statusMessage = "AI Playlist בוחר שירים בודדים...") }
         viewModelScope.launch {
             val (title, tracks) = repo.buildAiPlaylist(clean, _uiState.value.settings)
-            if (tracks.isEmpty()) {
-                _uiState.update { it.copy(isBuildingAiPlaylist = false, statusMessage = "לא נמצאו שירים — נסה תיאור אחר") }
-                return@launch
-            }
-            val pl = Playlist(
-                name = title, creator = "AI Playlist", description = "נבנה לפי: $clean",
-                coverUrl = tracks.first().artworkUrl, tracks = tracks
-            )
+            if (tracks.isEmpty()) { _uiState.update { it.copy(isBuildingAiPlaylist = false, statusMessage = "לא נמצאו שירים — נסה תיאור אחר") }; return@launch }
+            val pl = Playlist(name = title, creator = "AI Playlist", description = "נבנה לפי: $clean", coverUrl = tracks.first().artworkUrl, tracks = tracks)
             savePlaylists(listOf(pl) + _uiState.value.playlists)
-            _uiState.update {
-                it.copy(
-                    isBuildingAiPlaylist = false,
-                    openedPlaylist = pl,
-                    selectedTab = MainTab.LIBRARY,
-                    statusMessage = "נבנה פלייליסט עם ${tracks.size} שירים!"
-                )
-            }
+            _uiState.update { it.copy(isBuildingAiPlaylist = false, openedPlaylist = pl, selectedTab = MainTab.LIBRARY, statusMessage = "נבנה פלייליסט עם ${tracks.size} שירים!") }
             playTrack(tracks.first(), tracks)
         }
     }
@@ -754,13 +680,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleJamSession() {
         val cur = _uiState.value.jamState
-        if (cur.active) {
-            _uiState.update { it.copy(jamState = JamState(), statusMessage = "סשן ה-Jam הסתיים") }
-        } else {
+        if (cur.active) _uiState.update { it.copy(jamState = JamState(), statusMessage = "סשן ה-Jam הסתיים") }
+        else {
             val code = UUID.randomUUID().toString().take(6).uppercase()
-            _uiState.update {
-                it.copy(jamState = JamState(active = true, code = code, participants = listOf("אתה (מארח)")), showCreateSheet = false, statusMessage = "Jam פעיל • קוד: $code")
-            }
+            _uiState.update { it.copy(jamState = JamState(active = true, code = code, participants = listOf("אתה (מארח)")), showCreateSheet = false, statusMessage = "Jam פעיל • קוד: $code") }
         }
     }
 
@@ -800,14 +723,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         buildList {
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                add(
-                    Track(
-                        id = o.optString("id"), title = o.optString("title"), artist = o.optString("artist"),
-                        album = o.optString("album"), artworkUrl = o.optString("art"), durationMs = o.optLong("dur"),
-                        source = runCatching { StreamSource.valueOf(o.optString("src")) }.getOrDefault(StreamSource.YOUTUBE),
-                        localUri = o.optString("local").takeIf { it.isNotBlank() }, isPodcast = o.optBoolean("pod")
-                    )
-                )
+                add(Track(id = o.optString("id"), title = o.optString("title"), artist = o.optString("artist"), album = o.optString("album"), artworkUrl = o.optString("art"), durationMs = o.optLong("dur"), source = runCatching { StreamSource.valueOf(o.optString("src")) }.getOrDefault(StreamSource.YOUTUBE), localUri = o.optString("local").takeIf { it.isNotBlank() }, isPodcast = o.optBoolean("pod")))
             }
         }
     }.getOrDefault(emptyList())
@@ -817,8 +733,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         list.forEach { p ->
             arr.put(JSONObject().apply {
                 put("id", p.id); put("name", p.name); put("creator", p.creator); put("desc", p.description)
-                put("cover", p.coverUrl); put("blend", p.isBlend); put("match", p.blendMatchPercent ?: -1)
-                put("tracks", encodeTracks(p.tracks))
+                put("cover", p.coverUrl); put("blend", p.isBlend); put("match", p.blendMatchPercent ?: -1); put("tracks", encodeTracks(p.tracks))
             })
         }
         return arr.toString()
@@ -831,13 +746,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val o = arr.optJSONObject(i) ?: continue
                 val m = o.optInt("match", -1)
                 val trks = decodeTracks(o.optString("tracks", "[]"))
-                add(
-                    Playlist(
-                        id = o.optString("id"), name = o.optString("name"), creator = o.optString("creator", "שלך"),
-                        description = o.optString("desc"), coverUrl = o.optString("cover").ifBlank { trks.firstOrNull()?.artworkUrl ?: "" },
-                        isBlend = o.optBoolean("blend"), blendMatchPercent = if (m >= 0) m else null, tracks = trks
-                    )
-                )
+                add(Playlist(id = o.optString("id"), name = o.optString("name"), creator = o.optString("creator", "שלך"), description = o.optString("desc"), coverUrl = o.optString("cover").ifBlank { trks.firstOrNull()?.artworkUrl ?: "" }, isBlend = o.optBoolean("blend"), blendMatchPercent = if (m >= 0) m else null, tracks = trks))
             }
         }
     }.getOrDefault(emptyList())
