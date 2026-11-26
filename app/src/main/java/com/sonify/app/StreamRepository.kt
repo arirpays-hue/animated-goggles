@@ -17,6 +17,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
@@ -26,22 +27,30 @@ class StreamRepository(private val context: Context) {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .callTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(14, TimeUnit.SECONDS)
+        .callTimeout(20, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
+    // Fast fail client for third-party proxies (prevents 60s stalls on dead public instances!)
+    private val fastProxyClient = OkHttpClient.Builder()
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS)
+        .callTimeout(8, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
     private val downloadClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(14, TimeUnit.SECONDS)
-        .callTimeout(22, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(12, TimeUnit.SECONDS)
+        .callTimeout(18, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
     private val probeClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
+        .connectTimeout(4, TimeUnit.SECONDS)
         .readTimeout(5, TimeUnit.SECONDS)
-        .callTimeout(8, TimeUnit.SECONDS)
+        .callTimeout(7, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
@@ -74,10 +83,16 @@ class StreamRepository(private val context: Context) {
     }
 
     fun effectiveQuality(settings: AppSettings, forDownload: Boolean = false): AudioQuality {
-        if (forDownload) return settings.downloadQuality
-        if (settings.dataSaver) return AudioQuality.LOW
-        val base = if (isOnWifi()) settings.wifiQuality else settings.cellularQuality
-        return if (settings.autoAdjustQuality && !isOnWifi() && base == AudioQuality.LOSSLESS) AudioQuality.HIGH else base
+        val raw = when {
+            forDownload -> settings.downloadQuality
+            settings.dataSaver -> AudioQuality.LOW
+            isOnWifi() -> settings.wifiQuality
+            else -> settings.cellularQuality
+        }
+        val clamped = settings.streamSource.clampQuality(raw)
+        return if (!forDownload && settings.autoAdjustQuality && !isOnWifi() && clamped == AudioQuality.LOSSLESS) {
+            AudioQuality.HIGH
+        } else clamped
     }
 
     fun getOfflineFile(trackId: String): File {
@@ -229,7 +244,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 2. Playlists Search, Browse (Up to 100+ Songs) & Import ----------
+    // ---------- 2. Playlists Search, Browse & Import ----------
     suspend fun searchPlaylists(query: String): List<RemotePlaylist> = withContext(Dispatchers.IO) {
         val bodyJson = JSONObject().apply {
             put("query", query)
@@ -257,7 +272,7 @@ class StreamRepository(private val context: Context) {
         val encoded = URLEncoder.encode(query, "UTF-8")
         for (base in pipedInstances) {
             val res = runCatching {
-                client.newCall(Request.Builder().url("$base/search?q=$encoded&filter=music_playlists").build()).execute().use { resp ->
+                fastProxyClient.newCall(Request.Builder().url("$base/search?q=$encoded&filter=music_playlists").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val items = JSONObject(resp.body?.string() ?: return@use emptyList()).optJSONArray("items") ?: return@use emptyList()
                     buildList {
@@ -303,7 +318,7 @@ class StreamRepository(private val context: Context) {
 
         for (base in pipedInstances) {
             val res = runCatching {
-                client.newCall(Request.Builder().url("$base/playlists/$rawId").build()).execute().use { resp ->
+                fastProxyClient.newCall(Request.Builder().url("$base/playlists/$rawId").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val arr = JSONObject(resp.body?.string() ?: return@use emptyList()).optJSONArray("relatedStreams") ?: return@use emptyList()
                     buildList {
@@ -450,7 +465,7 @@ class StreamRepository(private val context: Context) {
         val encoded = URLEncoder.encode(query, "UTF-8")
         for (base in pipedInstances) {
             val res = runCatching {
-                client.newCall(Request.Builder().url("$base/search?q=$encoded&filter=music_songs").header("User-Agent", "Mozilla/5.0").build()).execute().use { resp ->
+                fastProxyClient.newCall(Request.Builder().url("$base/search?q=$encoded&filter=music_songs").header("User-Agent", "Mozilla/5.0").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val items = JSONObject(resp.body?.string() ?: return@use emptyList()).optJSONArray("items") ?: return@use emptyList()
                     buildList {
@@ -473,7 +488,7 @@ class StreamRepository(private val context: Context) {
         val encoded = URLEncoder.encode(query, "UTF-8")
         for (base in invidiousInstances) {
             val res = runCatching {
-                client.newCall(Request.Builder().url("$base/api/v1/search?q=$encoded&type=video").header("User-Agent", "Mozilla/5.0").build()).execute().use { resp ->
+                fastProxyClient.newCall(Request.Builder().url("$base/api/v1/search?q=$encoded&type=video").header("User-Agent", "Mozilla/5.0").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
                     buildList {
@@ -652,7 +667,7 @@ class StreamRepository(private val context: Context) {
             .header("X-YouTube-Client-Version", verHeader)
             .build()
 
-        return client.newCall(req).execute().use { resp ->
+        return fastProxyClient.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return null
             val root = JSONObject(resp.body?.string() ?: return null)
             if (root.optJSONObject("playabilityStatus")?.optString("status") != "OK") return null
@@ -701,7 +716,7 @@ class StreamRepository(private val context: Context) {
             val res = runCatching {
                 val req = Request.Builder().url("$base/").post(body.toRequestBody("application/json".toMediaType()))
                     .header("Accept", "application/json").header("User-Agent", ua).build()
-                client.newCall(req).execute().use { resp ->
+                fastProxyClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return@use null
                     val u = JSONObject(resp.body?.string() ?: return@use null).optString("url")
                     if (u.startsWith("http") && verifyMediaStreamDeep(u, ua)) ResolvedStreams(u, userAgent = ua, codecLabel = "MP3 256kbps") else null
@@ -716,7 +731,7 @@ class StreamRepository(private val context: Context) {
         val ua = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
         for (base in pipedInstances) {
             val res = runCatching {
-                client.newCall(Request.Builder().url("$base/streams/$videoId").header("User-Agent", ua).build()).execute().use { resp ->
+                fastProxyClient.newCall(Request.Builder().url("$base/streams/$videoId").header("User-Agent", ua).build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use null
                     val json = JSONObject(resp.body?.string() ?: return@use null)
                     val audioStreams = mutableListOf<Pair<Int, String>>()
@@ -770,7 +785,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 4. Upgraded Offline Downloader (WebView JS Fetch -> OkHttp -> 6 Strategies) ----------
+    // ---------- 4. Fast & Reliable Offline Downloader (Preserves `sparams` + Fast Failover!) ----------
     suspend fun downloadTrackOffline(
         track: Track,
         settings: AppSettings,
@@ -785,8 +800,8 @@ class StreamRepository(private val context: Context) {
 
         val target = getOfflineFile(track.id)
 
-        val result = withTimeoutOrNull(85_000L) {
-            onProgress(3)
+        val result = withTimeoutOrNull(75_000L) {
+            onProgress(2)
 
             if (track.source != StreamSource.YOUTUBE) {
                 val res = resolveStreams(track, settings, forDownload = true)
@@ -796,25 +811,24 @@ class StreamRepository(private val context: Context) {
                 return@withTimeoutOrNull false to "שגיאה בהורדה מהמקור שנבחר"
             }
 
-            // Priority 1: Direct in-WebView JS fetch()
+            // Priority 1: Direct in-WebView JS fetch() (now CORS-clean + sparams-safe!)
             if (webViewDownloadFn != null && capturedStreams.isNotEmpty()) {
+                onProgress(4)
                 val wvOk = runCatching { webViewDownloadFn(target, onProgress) }.getOrDefault(false)
                 if (wvOk) return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
             }
 
-            // Priority 2: OkHttp with full captured headers/cookies
+            // Priority 2: OkHttp using captured streams with intact sparams & captured headers
             for (cap in capturedStreams.sortedByDescending { it.isAudioOnly }.take(3)) {
-                onProgress(6)
                 val cleanBase = sanitizeYouTubePlaybackUrl(cap.url)
                 if (downloadSmart(cleanBase, cap.userAgent, cap.cookie, cap.headers, target, true, onProgress)) {
                     return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
                 }
             }
 
-            // Priority 3: Single-pass YouTube strategies
+            // Priority 3: Fast single-pass YouTube strategies
             val quality = effectiveQuality(settings, forDownload = true)
             for (strategy in youtubeStrategies(track.id, quality)) {
-                onProgress(8)
                 val resolved = runCatching { strategy() }.getOrNull() ?: continue
                 if (downloadSmart(resolved.audioUrl, resolved.userAgent, resolved.cookie, emptyMap(), target, false, onProgress)) {
                     return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
@@ -827,10 +841,26 @@ class StreamRepository(private val context: Context) {
         result ?: (false to "ההורדה לקחה יותר מדי זמן — נסה שוב")
     }
 
+    // FIXED: Never strips parameters signed inside `sparams` (fixes instant 403 on chunk 1!)
     private fun sanitizeYouTubePlaybackUrl(url: String): String {
+        val sparamsRaw = Regex("[?&]sparams=([^&]+)").find(url)?.groupValues?.get(1).orEmpty()
+        val signedParams = runCatching { URLDecoder.decode(sparamsRaw, "UTF-8") }
+            .getOrDefault(sparamsRaw)
+            .split(",")
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+
+        val removable = listOf("range", "rn", "rbuf", "alr", "ump", "srfvp", "sabr")
+            .filterNot { it in signedParams }
+        if (removable.isEmpty()) return url
+
+        val pattern = Regex("([?&])(${removable.joinToString("|")})=[^&]*", RegexOption.IGNORE_CASE)
         return url
-            .replace(Regex("([?&])(range|rn|rbuf|alr|ump|srfvp|sabr)=[^&]*"), "$1")
-            .replace("?&", "?").replace(Regex("&{2,}"), "&").trimEnd('&', '?')
+            .replace(pattern, "$1")
+            .replace("?&", "?")
+            .replace(Regex("&{2,}"), "&")
+            .trimEnd('&', '?')
     }
 
     private fun downloadSmart(
@@ -964,7 +994,7 @@ class StreamRepository(private val context: Context) {
         }.getOrDefault(false)
     }
 
-    // ---------- 5. Advanced AI Playlist Studio (15 / 25 / 40 / 50 Songs) ----------
+    // ---------- 5. Advanced AI Playlist Studio ----------
     suspend fun buildAiPlaylist(config: AiPlaylistConfig, settings: AppSettings): Pair<String, List<Track>> = withContext(Dispatchers.IO) {
         val targetCount = config.targetCount.coerceIn(10, 50)
 
@@ -1047,13 +1077,7 @@ class StreamRepository(private val context: Context) {
                 queries += listOf("Arcane soundtrack", "YOASOBI anime", "LiSA anime", "Cyberpunk Edgerunners soundtrack", "Imagine Dragons Enemy", "phonk gaming")
             }
             else -> {
-                queries += listOf(
-                    "$prompt$eraSuffix$energySuffix",
-                    "$prompt best songs",
-                    "$prompt top hits",
-                    "$prompt similar artists",
-                    "$prompt essentials"
-                )
+                queries += listOf("$prompt$eraSuffix$energySuffix", "$prompt best songs", "$prompt top hits", "$prompt similar artists", "$prompt essentials")
             }
         }
         return "AI • ${prompt.take(26)}" to queries.distinct()
@@ -1113,11 +1137,10 @@ class StreamRepository(private val context: Context) {
         val cleanTitle = if (!manualOverrideQuery.isNullOrBlank()) manualOverrideQuery.trim() else cleanSongTitle(track.title)
         val cleanArtist = if (!manualOverrideQuery.isNullOrBlank()) "" else cleanArtistName(track.artist)
 
-        // Layer 1: LRCLIB Exact Match
         if (cleanArtist.isNotBlank()) {
             val exact = runCatching {
                 val url = "https://lrclib.net/api/get?artist_name=${URLEncoder.encode(cleanArtist, "UTF-8")}&track_name=${URLEncoder.encode(cleanTitle, "UTF-8")}"
-                client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/7.0").build()).execute().use { resp ->
+                client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/8.0").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
                 }
@@ -1125,7 +1148,6 @@ class StreamRepository(private val context: Context) {
             if (exact.isNotEmpty()) return@withContext exact
         }
 
-        // Layer 2: LRCLIB Broad Search
         val searchQueries = listOfNotNull(
             "$cleanArtist $cleanTitle".trim().takeIf { it.isNotBlank() },
             cleanTitle.takeIf { it.isNotBlank() && cleanArtist.isNotBlank() }
@@ -1134,7 +1156,7 @@ class StreamRepository(private val context: Context) {
         for (sq in searchQueries) {
             val found = runCatching {
                 val q = URLEncoder.encode(sq, "UTF-8")
-                client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/7.0").build()).execute().use { resp ->
+                client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/8.0").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
                     for (i in 0 until arr.length().coerceAtMost(8)) {
@@ -1154,17 +1176,15 @@ class StreamRepository(private val context: Context) {
             if (found.isNotEmpty()) return@withContext found
         }
 
-        // Layer 3: YouTube Caption Tracks
         if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
             val ytCaptions = runCatching { fetchYouTubeCaptions(track.id) }.getOrDefault(emptyList())
             if (ytCaptions.isNotEmpty()) return@withContext ytCaptions
         }
 
-        // Layer 4: Lyrics.ovh fallback
         if (cleanArtist.isNotBlank() && cleanTitle.isNotBlank()) {
             val ovh = runCatching {
                 val url = "https://api.lyrics.ovh/v1/${URLEncoder.encode(cleanArtist, "UTF-8")}/${URLEncoder.encode(cleanTitle, "UTF-8")}"
-                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/7.0").build()).execute().use { resp ->
+                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/8.0").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val plain = JSONObject(resp.body?.string() ?: return@use emptyList()).optString("lyrics")
                     plain.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("Paroles de", true) }
@@ -1253,7 +1273,7 @@ class StreamRepository(private val context: Context) {
         runCatching {
             val base = settings.subsonicUrl.trimEnd('/')
             val auth = buildSubsonicAuth(settings.subsonicUser, settings.subsonicPass)
-            client.newCall(Request.Builder().url("$base/rest/ping.view?$auth").build()).execute().use { resp ->
+            fastProxyClient.newCall(Request.Builder().url("$base/rest/ping.view?$auth").build()).execute().use { resp ->
                 if (!resp.isSuccessful) return@use false to "שגיאת HTTP ${resp.code}"
                 val ok = JSONObject(resp.body?.string() ?: "").optJSONObject("subsonic-response")?.optString("status") == "ok"
                 if (ok) true to "חיבור לשרת Lossless הצליח!" else false to "שם משתמש או סיסמה שגויים"
