@@ -3,10 +3,17 @@
 package com.sonify.app
 
 import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.media.AudioAttributes as PlatformAudioAttributes
 import android.media.AudioDeviceInfo
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.audiofx.DynamicsProcessing
 import android.media.audiofx.Equalizer
@@ -31,6 +38,8 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -138,9 +147,9 @@ object PlayerHolder {
                     }
                 }
 
-                // Deep anti-stutter buffer with high-stability back buffer
+                // Fast 650ms initial playback start + deep 45s-120s anti-stutter buffer!
                 val loadControl = DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(profile.minMs, profile.maxMs, profile.playMs, profile.rebufferMs)
+                    .setBufferDurationsMs(profile.minMs, profile.maxMs, 650, profile.rebufferMs)
                     .setBackBuffer(10_000, true)
                     .setPrioritizeTimeOverSizeThresholds(true)
                     .build()
@@ -160,14 +169,113 @@ object PlayerHolder {
     }
 }
 
+// Foreground MediaSessionService supporting BOTH ExoPlayer and Screen-Off WebView Playback!
 class PlaybackService : MediaSessionService() {
+    companion object {
+        private const val CHANNEL_ID = "sonify_bg_playback"
+        private const val WEB_NOTIF_ID = 1042
+        const val ACTION_WEB_START = "com.sonify.app.ACTION_WEB_BG_START"
+        const val ACTION_WEB_STOP = "com.sonify.app.ACTION_WEB_BG_STOP"
+        const val EXTRA_TITLE = "extra_title"
+        const val EXTRA_ARTIST = "extra_artist"
+
+        fun setWebBackgroundPlayback(context: Context, active: Boolean, title: String = "Sonify", artist: String = "") {
+            runCatching {
+                val intent = Intent(context.applicationContext, PlaybackService::class.java).apply {
+                    action = if (active) ACTION_WEB_START else ACTION_WEB_STOP
+                    putExtra(EXTRA_TITLE, title)
+                    putExtra(EXTRA_ARTIST, artist)
+                }
+                if (active) ContextCompat.startForegroundService(context.applicationContext, intent)
+                else context.applicationContext.startService(intent)
+            }
+        }
+    }
+
     private var mediaSession: MediaSession? = null
+
     override fun onCreate() {
         super.onCreate()
+        createBgChannel()
         mediaSession = MediaSession.Builder(this, PlayerHolder.getOrCreate(this)).build()
     }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_WEB_START -> {
+                val title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { "Sonify" }
+                val artist = intent.getStringExtra(EXTRA_ARTIST).orEmpty()
+                val notif = buildWebNotification(title, artist)
+                runCatching {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        startForeground(WEB_NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                    } else {
+                        startForeground(WEB_NOTIF_ID, notif)
+                    }
+                }
+            }
+            ACTION_WEB_STOP -> {
+                runCatching {
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                    nm?.cancel(WEB_NOTIF_ID)
+                    if (!PlayerHolder.getOrCreate(this).isPlaying) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            stopForeground(STOP_FOREGROUND_REMOVE)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            stopForeground(true)
+                        }
+                    }
+                }
+            }
+        }
+        super.onStartCommand(intent, flags, startId)
+        return START_STICKY
+    }
+
+    private fun createBgChannel() {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+            val ch = NotificationChannel(CHANNEL_ID, "Sonify Playback", NotificationManager.IMPORTANCE_LOW).apply {
+                setShowBadge(false)
+                setSound(null, null)
+            }
+            nm.createNotificationChannel(ch)
+        }
+    }
+
+    private fun buildWebNotification(title: String, artist: String): Notification {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val openPi = PendingIntent.getActivity(this, 0, openIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val prevPi = PendingIntent.getBroadcast(this, 1, Intent(this, SonifyWidget::class.java).setAction(SonifyWidget.ACTION_PREV), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val playPi = PendingIntent.getBroadcast(this, 2, Intent(this, SonifyWidget::class.java).setAction(SonifyWidget.ACTION_PLAY_PAUSE), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val nextPi = PendingIntent.getBroadcast(this, 3, Intent(this, SonifyWidget::class.java).setAction(SonifyWidget.ACTION_NEXT), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle(title)
+            .setContentText(artist.ifBlank { "Sonify Background Audio" })
+            .setContentIntent(openPi)
+            .setOngoing(true)
+            .setSilent(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .addAction(android.R.drawable.ic_media_previous, "Prev", prevPi)
+            .addAction(android.R.drawable.ic_media_pause, "Play/Pause", playPi)
+            .addAction(android.R.drawable.ic_media_next, "Next", nextPi)
+            .build()
+    }
+
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
     override fun onDestroy() { mediaSession?.release(); mediaSession = null; super.onDestroy() }
+}
+
+// Custom WebView that keeps Chromium media pipeline alive even when screen is locked or app is minimized!
+private class BackgroundWebView(context: Context) : WebView(context) {
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(View.VISIBLE)
+    }
 }
 
 private data class ActiveWebDownload(
@@ -202,6 +310,21 @@ class WebPlaybackEngine(private val context: Context) {
     var onProgress: ((Long, Long, Boolean, Boolean) -> Unit)? = null
     var onEnded: (() -> Unit)? = null
 
+    private val visibilitySpoofJs = """
+        (function() {
+          try {
+            Object.defineProperty(document, 'hidden', { get: function() { return false; }, configurable: true });
+            Object.defineProperty(document, 'webkitHidden', { get: function() { return false; }, configurable: true });
+            Object.defineProperty(document, 'visibilityState', { get: function() { return 'visible'; }, configurable: true });
+            var block = function(e) { e.stopImmediatePropagation(); };
+            document.addEventListener('visibilitychange', block, true);
+            document.addEventListener('webkitvisibilitychange', block, true);
+            window.addEventListener('pagehide', block, true);
+            window.addEventListener('blur', block, true);
+          } catch(e) {}
+        })();
+    """.trimIndent()
+
     private fun recordCapturedUrl(videoId: String, rawUrl: String, isAudio: Boolean, headers: Map<String, String> = emptyMap()) {
         if (videoId.isBlank() || !rawUrl.startsWith("http")) return
         if (rawUrl.contains("sabr=1", true)) return
@@ -218,10 +341,9 @@ class WebPlaybackEngine(private val context: Context) {
     @SuppressLint("SetJavaScriptEnabled")
     private fun getOrCreateWebView(): WebView {
         webView?.let { return it }
-        return WebView(context.applicationContext).apply {
+        return BackgroundWebView(context.applicationContext).apply {
             setBackgroundColor(android.graphics.Color.BLACK)
             setLayerType(View.LAYER_TYPE_HARDWARE, null)
-            // Keep WebView renderer at high OS priority so audio never stutters in background/audio mode!
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 runCatching { setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false) }
             }
@@ -263,11 +385,15 @@ class WebPlaybackEngine(private val context: Context) {
                 }
 
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                    if (isActive && isMobileWatchFallback) injectCleanVideoCssOnly()
+                    if (isActive && isMobileWatchFallback) {
+                        view?.evaluateJavascript(visibilitySpoofJs, null)
+                        injectCleanVideoCssOnly()
+                    }
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (isActive && isMobileWatchFallback) {
+                        view?.evaluateJavascript(visibilitySpoofJs, null)
                         injectCleanVideoCssOnly()
                         injectMobileWatchHook(pendingStartSec)
                     }
@@ -333,6 +459,7 @@ class WebPlaybackEngine(private val context: Context) {
               html, body { margin:0; padding:0; width:100vw; height:100vh; background:#000; overflow:hidden; }
               #player { position:fixed; left:0; width:100vw; height:150vh; top:-25vh; border:0; background:#000; pointer-events:none; }
             </style>
+            <script>$visibilitySpoofJs</script>
             </head>
             <body>
             <div id="player"></div>
@@ -355,7 +482,12 @@ class WebPlaybackEngine(private val context: Context) {
                         e.target.playVideo();
                       } catch(err) {}
                     },
-                    'onStateChange': function(e) { if (e.data === 0) SonifyBridge.onEnded(); },
+                    'onStateChange': function(e) {
+                      if (e.data === 0) SonifyBridge.onEnded();
+                      if (e.data === 2 && !userPaused) {
+                        setTimeout(function() { if (!userPaused && player && player.playVideo) try { player.playVideo(); } catch(err){} }, 250);
+                      }
+                    },
                     'onError': function(e) { SonifyBridge.onEmbedError(e.data); }
                   }
                 });
@@ -366,7 +498,7 @@ class WebPlaybackEngine(private val context: Context) {
                   var dur = Math.floor((player.getDuration() || 0) * 1000);
                   var st = player.getPlayerState ? player.getPlayerState() : -1;
                   var now = Date.now();
-                  if (st === -1 && !userPaused && now - lastKick > 2500) {
+                  if ((st === -1 || st === 2) && !userPaused && now - lastKick > 2000) {
                     lastKick = now;
                     try { player.playVideo(); } catch(err) {}
                   }
@@ -376,7 +508,7 @@ class WebPlaybackEngine(private val context: Context) {
                     SonifyBridge.onProgress(pos, dur, st === 1, st === 3);
                   }
                 }
-              }, 650);
+              }, 600);
               window.sonifyPlay = function() { userPaused = false; if (player && player.playVideo) player.playVideo(); };
               window.sonifyPause = function() { userPaused = true; if (player && player.pauseVideo) player.pauseVideo(); };
               window.sonifyToggle = function() { if (!player) return; if (player.getPlayerState && player.getPlayerState() === 1) window.sonifyPause(); else window.sonifyPlay(); };
@@ -398,7 +530,7 @@ class WebPlaybackEngine(private val context: Context) {
             }
         }
         watchdogRunnable = r
-        mainHandler.postDelayed(r, 3200L)
+        mainHandler.postDelayed(r, 2600L)
     }
 
     private fun cancelWatchdog() {
@@ -572,11 +704,11 @@ class WebPlaybackEngine(private val context: Context) {
         mainHandler.post { webView?.evaluateJavascript(js, null) }
     }
 
-    // Zero DOM thrashing inside interval -> eliminates WebView audio hiccups!
     private fun injectMobileWatchHook(startSec: Double) {
         val css = cleanMobileCssString()
         val js = """
             (function() {
+              $visibilitySpoofJs
               window.__sonifyUserPaused = false;
               window.__sonifyEndedFired = false;
               window.__sonifySeekedOnce = false;
@@ -634,7 +766,7 @@ class WebPlaybackEngine(private val context: Context) {
                 if (!window.__sonifyUserPaused) {
                   if (v.muted) v.muted = false;
                   if (v.volume === 0) v.volume = 1.0;
-                  if (v.paused && !v.ended && v.readyState >= 2 && (now - window.__sonifyLastPlayTry > 2500)) {
+                  if (v.paused && !v.ended && v.readyState >= 2 && (now - window.__sonifyLastPlayTry > 2000)) {
                     window.__sonifyLastPlayTry = now;
                     v.play().catch(function(){});
                   }
@@ -649,7 +781,7 @@ class WebPlaybackEngine(private val context: Context) {
                   SonifyBridge.onProgress(pos, dur, playing, buffering);
                 }
                 if (v.ended && !window.__sonifyEndedFired) { window.__sonifyEndedFired = true; SonifyBridge.onEnded(); }
-              }, 650);
+              }, 600);
 
               window.sonifyPlay = function() { window.__sonifyUserPaused = false; var v = document.querySelector('video'); if (v) { v.muted = false; v.play().catch(function(){}); } };
               window.sonifyPause = function() { window.__sonifyUserPaused = true; var v = document.querySelector('video'); if (v) v.pause(); };
@@ -662,7 +794,7 @@ class WebPlaybackEngine(private val context: Context) {
         mainHandler.post { webView?.evaluateJavascript(js, null) }
     }
 
-    fun play() = mainHandler.post { webView?.evaluateJavascript("if(window.sonifyPlay) window.sonifyPlay();", null) }
+    fun play() = mainHandler.post { webView?.onResume(); webView?.resumeTimers(); webView?.evaluateJavascript("if(window.sonifyPlay) window.sonifyPlay();", null) }
     fun pause() = mainHandler.post { webView?.evaluateJavascript("if(window.sonifyPause) window.sonifyPause();", null) }
     fun seekTo(ms: Long) = mainHandler.post { webView?.evaluateJavascript("if(window.sonifySeek) window.sonifySeek(${(ms / 1000.0).coerceAtLeast(0.0)});", null) }
     fun setVolume(fraction: Float) = mainHandler.post { webView?.evaluateJavascript("if(window.sonifyVolume) window.sonifyVolume(${(fraction * 100).toInt().coerceIn(0, 100)});", null) }
@@ -673,6 +805,8 @@ class WebPlaybackEngine(private val context: Context) {
 
     fun togglePlayPause() {
         mainHandler.post {
+            webView?.onResume()
+            webView?.resumeTimers()
             if (!hasStartedPlayingCurrent && !isMobileWatchFallback && currentVideoId.isNotBlank()) switchToMobileWatchFallback()
             else webView?.evaluateJavascript("if(window.sonifyToggle) window.sonifyToggle();", null)
         }
@@ -736,9 +870,9 @@ class AudioEngine(private val context: Context) {
     val webEngine = WebPlaybackEngine(context)
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(18, TimeUnit.SECONDS)
-        .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(16, TimeUnit.SECONDS)
+        .connectionPool(ConnectionPool(10, 5, TimeUnit.MINUTES))
         .retryOnConnectionFailure(true)
         .followRedirects(true)
         .build()
@@ -748,8 +882,10 @@ class AudioEngine(private val context: Context) {
     private var dynamicsProcessing: DynamicsProcessing? = null
     private var loudnessEnhancer: LoudnessEnhancer? = null
     private var lastSettings: AppSettings = AppSettings()
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var currentWebTitle: String = "Sonify"
+    private var currentWebArtist: String = ""
 
-    // Anti-stutter CPU + Wi-Fi power locks (held ONLY while audio is actively playing!)
     private val wakeLock: PowerManager.WakeLock? = runCatching {
         (context.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager)
             ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Sonify::AudioPlaybackLock")
@@ -800,7 +936,12 @@ class AudioEngine(private val context: Context) {
             }
         }
         webEngine.onEnded = {
-            if (sleepEndOfTrack) { sleepEndOfTrack = false; webEngine.pause(); updatePlaybackLocks(false) } else onTrackEnded?.invoke()
+            if (sleepEndOfTrack) {
+                sleepEndOfTrack = false
+                webEngine.pause()
+                updatePlaybackLocks(false)
+                PlaybackService.setWebBackgroundPlayback(context, false)
+            } else onTrackEnded?.invoke()
         }
 
         player.addListener(object : Player.Listener {
@@ -853,6 +994,35 @@ class AudioEngine(private val context: Context) {
         }
     }
 
+    private fun requestWebAudioFocus() {
+        runCatching {
+            val am = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            val attrs = PlatformAudioAttributes.Builder()
+                .setUsage(PlatformAudioAttributes.USAGE_MEDIA)
+                .setContentType(PlatformAudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attrs)
+                .setAcceptsDelayedFocusGain(true)
+                .setOnAudioFocusChangeListener { change ->
+                    if (change == AudioManager.AUDIOFOCUS_LOSS && webEngine.isActive) {
+                        webEngine.pause()
+                    }
+                }
+                .build()
+            audioFocusRequest = req
+            am.requestAudioFocus(req)
+        }
+    }
+
+    private fun abandonWebAudioFocus() {
+        runCatching {
+            val am = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            audioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
+            audioFocusRequest = null
+        }
+    }
+
     private fun updatePlaybackLocks(shouldHold: Boolean) {
         val allowed = shouldHold && lastSettings.keepWakeLockAudio
         runCatching {
@@ -866,7 +1036,11 @@ class AudioEngine(private val context: Context) {
         }
     }
 
-    fun releaseLocks() = updatePlaybackLocks(false)
+    fun releaseLocks() {
+        updatePlaybackLocks(false)
+        abandonWebAudioFocus()
+        PlaybackService.setWebBackgroundPlayback(context, false)
+    }
 
     private fun duckVolume(duck: Boolean) {
         scope.launch {
@@ -967,6 +1141,10 @@ class AudioEngine(private val context: Context) {
 
     fun playResolved(resolved: ResolvedStreams, track: Track, videoMode: Boolean, startPositionMs: Long = 0L, playImmediately: Boolean = true) {
         webEngine.stop()
+        abandonWebAudioFocus()
+        PlaybackService.setWebBackgroundPlayback(context, false)
+        runCatching { context.startService(Intent(context, PlaybackService::class.java)) }
+
         val metadata = MediaMetadata.Builder().setTitle(track.title).setArtist(track.artist).setAlbumTitle(track.album).build()
         val source: MediaSource = if (videoMode) {
             when {
@@ -986,10 +1164,14 @@ class AudioEngine(private val context: Context) {
         if (player.audioSessionId > 0 && dynamicsProcessing == null && equalizer == null) attachAudioEffects(player.audioSessionId)
     }
 
-    fun playViaWebEngine(videoId: String, startPositionMs: Long = 0L) {
+    fun playViaWebEngine(videoId: String, startPositionMs: Long = 0L, title: String = "Sonify", artist: String = "") {
+        currentWebTitle = title
+        currentWebArtist = artist
         player.stop()
         player.clearMediaItems()
+        requestWebAudioFocus()
         updatePlaybackLocks(true)
+        PlaybackService.setWebBackgroundPlayback(context, true, title, artist)
         webEngine.playVideo(videoId, startPositionMs)
     }
 
@@ -999,7 +1181,15 @@ class AudioEngine(private val context: Context) {
     }
 
     fun togglePlayPause(onNeedRetry: () -> Unit) {
-        if (webEngine.isActive) { webEngine.togglePlayPause(); return }
+        if (webEngine.isActive) {
+            val willPlay = !webEngine.isPlaying
+            if (willPlay) {
+                requestWebAudioFocus()
+                PlaybackService.setWebBackgroundPlayback(context, true, currentWebTitle, currentWebArtist)
+            }
+            webEngine.togglePlayPause()
+            return
+        }
         when {
             player.playbackState == Player.STATE_IDLE -> onNeedRetry()
             player.playbackState == Player.STATE_ENDED -> { player.seekTo(0L); player.play() }
@@ -1010,7 +1200,13 @@ class AudioEngine(private val context: Context) {
 
     fun setPlaying(play: Boolean) {
         if (webEngine.isActive) {
-            if (play) webEngine.play() else webEngine.pause()
+            if (play) {
+                requestWebAudioFocus()
+                PlaybackService.setWebBackgroundPlayback(context, true, currentWebTitle, currentWebArtist)
+                webEngine.play()
+            } else {
+                webEngine.pause()
+            }
         } else {
             if (play) player.play() else player.pause()
         }
@@ -1037,7 +1233,7 @@ class AudioEngine(private val context: Context) {
                 remainingSec--
             }
             if (webEngine.isActive) webEngine.pause() else player.pause()
-            updatePlaybackLocks(false)
+            releaseLocks()
             player.volume = 1f; webEngine.setVolume(1f)
             onRemainingChange(null)
         }
