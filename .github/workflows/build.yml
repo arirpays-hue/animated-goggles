@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -27,14 +29,40 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Decode Release Keystore (if configured in Secrets)
+      - name: Ensure Persistent Release Keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
+          PASS="${KEYSTORE_PASSWORD:-SonifyRelease2026!}"
+          ALIAS="${KEY_ALIAS:-sonify}"
+          KPASS="${KEY_PASSWORD:-$PASS}"
+
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | base64 --decode > app/release.keystore
+            echo "Loaded keystore from GitHub Secrets."
+          elif [ -f "app/release.keystore" ]; then
+            echo "Using existing persistent app/release.keystore from repository."
           else
-            echo "No release keystore secret set, using debug signing."
+            echo "Generating new persistent signing keystore..."
+            keytool -genkeypair -v \
+              -keystore app/release.keystore \
+              -storetype PKCS12 \
+              -alias "$ALIAS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$PASS" \
+              -keypass "$KPASS" \
+              -dname "CN=Sonify, OU=Mobile, O=Sonify, L=IL, ST=IL, C=IL"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -f app/release.keystore
+            git commit -m "Add persistent signing keystore [skip ci]"
+            git push || echo "Warning: could not push keystore back to repo."
           fi
 
       - name: Build Release APK
@@ -81,7 +109,7 @@ jobs:
           tag_name: v${{ steps.apk.outputs.version }}-b${{ github.run_number }}
           name: Sonify v${{ steps.apk.outputs.version }} (Build #${{ github.run_number }})
           body: |
-            Direct APK download (no ZIP extraction required).
+            Direct APK download (signed with persistent key for in-place updates).
             Commit: `${{ github.sha }}`
           files: release-out/*.apk
           make_latest: true
