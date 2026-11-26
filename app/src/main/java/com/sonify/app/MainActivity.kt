@@ -3,6 +3,7 @@ package com.sonify.app
 import android.Manifest
 import android.os.Build
 import android.os.Bundle
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -35,6 +36,7 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 
 class MainActivity : ComponentActivity() {
 
@@ -89,15 +91,29 @@ private fun SonifyAppRoot(vm: AppViewModel) {
     }
 
     val openedPlaylist = state.openedPlaylist
+    val webHostedInNowPlaying = state.isUsingWebEngine && state.showNowPlaying && state.isVideoMode
 
     Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
-        when {
-            state.showSettings -> SettingsScreen(state, vm)
-            openedPlaylist != null -> PlaylistDetailScreen(openedPlaylist, state, vm)
-            else -> when (state.selectedTab) {
-                MainTab.HOME -> HomeScreen(state, vm)
-                MainTab.SEARCH -> SearchScreen(state, vm)
-                MainTab.LIBRARY -> LibraryScreen(state, vm)
+        // Layer 0: Full 260dp x 260dp opaque WebView host (passes YouTube's >=200px viewport check)
+        // Drawn BEHIND the opaque app surface below so it is completely invisible in Audio mode.
+        if (state.isUsingWebEngine && !webHostedInNowPlaying) {
+            AndroidView(
+                factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
+                update = { container -> vm.audioEngine.attachWebView(container) },
+                modifier = Modifier.size(260.dp)
+            )
+        }
+
+        // Layer 1: Opaque main app content
+        Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
+            when {
+                state.showSettings -> SettingsScreen(state, vm)
+                openedPlaylist != null -> PlaylistDetailScreen(openedPlaylist, state, vm)
+                else -> when (state.selectedTab) {
+                    MainTab.HOME -> HomeScreen(state, vm)
+                    MainTab.SEARCH -> SearchScreen(state, vm)
+                    MainTab.LIBRARY -> LibraryScreen(state, vm)
+                }
             }
         }
 
@@ -106,44 +122,18 @@ private fun SonifyAppRoot(vm: AppViewModel) {
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .background(
-                        Brush.verticalGradient(listOf(Color.Transparent, SpotifyBlack.copy(alpha = 0.94f), SpotifyBlack))
-                    )
+                    .background(Brush.verticalGradient(listOf(Color.Transparent, SpotifyBlack.copy(alpha = 0.94f), SpotifyBlack)))
                     .navigationBarsPadding()
             ) {
                 if (state.currentTrack != null && !state.showNowPlaying) {
                     FloatingMiniPlayer(state, vm)
                 }
 
-                Row(
-                    modifier = Modifier.fillMaxWidth().height(60.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    BottomNavItem(
-                        label = "בית",
-                        icon = if (state.selectedTab == MainTab.HOME && openedPlaylist == null) Icons.Rounded.Home else Icons.Outlined.Home,
-                        selected = state.selectedTab == MainTab.HOME && openedPlaylist == null,
-                        onClick = { vm.selectTab(MainTab.HOME) }
-                    )
-                    BottomNavItem(
-                        label = "חיפוש",
-                        icon = if (state.selectedTab == MainTab.SEARCH && openedPlaylist == null) Icons.Rounded.Search else Icons.Outlined.Search,
-                        selected = state.selectedTab == MainTab.SEARCH && openedPlaylist == null,
-                        onClick = { vm.selectTab(MainTab.SEARCH) }
-                    )
-                    BottomNavItem(
-                        label = "הספרייה שלך",
-                        icon = if (state.selectedTab == MainTab.LIBRARY) Icons.Rounded.LibraryMusic else Icons.Outlined.LibraryMusic,
-                        selected = state.selectedTab == MainTab.LIBRARY,
-                        onClick = { vm.selectTab(MainTab.LIBRARY) }
-                    )
-                    BottomNavItem(
-                        label = "יצירה",
-                        icon = Icons.Rounded.Add,
-                        selected = false,
-                        onClick = { vm.setShowCreateSheet(true) }
-                    )
+                Row(modifier = Modifier.fillMaxWidth().height(60.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+                    BottomNavItem("בית", if (state.selectedTab == MainTab.HOME && openedPlaylist == null) Icons.Rounded.Home else Icons.Outlined.Home, state.selectedTab == MainTab.HOME && openedPlaylist == null) { vm.selectTab(MainTab.HOME) }
+                    BottomNavItem("חיפוש", if (state.selectedTab == MainTab.SEARCH && openedPlaylist == null) Icons.Rounded.Search else Icons.Outlined.Search, state.selectedTab == MainTab.SEARCH && openedPlaylist == null) { vm.selectTab(MainTab.SEARCH) }
+                    BottomNavItem("הספרייה שלך", if (state.selectedTab == MainTab.LIBRARY) Icons.Rounded.LibraryMusic else Icons.Outlined.LibraryMusic, state.selectedTab == MainTab.LIBRARY) { vm.selectTab(MainTab.LIBRARY) }
+                    BottomNavItem("יצירה", Icons.Rounded.Add, false) { vm.setShowCreateSheet(true) }
                 }
             }
         }
@@ -161,14 +151,9 @@ private fun SonifyAppRoot(vm: AppViewModel) {
         state.trackForOptions?.let { track -> TrackOptionsBottomSheet(track, state, vm) }
 
         if (state.isBuildingAiPlaylist) {
-            LinearProgressIndicator(
-                modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter).statusBarsPadding(),
-                color = SpotifyGreen,
-                trackColor = SpotifyCard
-            )
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter).statusBarsPadding(), color = SpotifyGreen, trackColor = SpotifyCard)
         }
 
-        // Sleek Spotify-style dark Snackbar positioned cleanly at the bottom (never covers top bar!)
         SnackbarHost(
             hostState = snackbarHostState,
             modifier = Modifier
@@ -176,22 +161,14 @@ private fun SonifyAppRoot(vm: AppViewModel) {
                 .navigationBarsPadding()
                 .padding(bottom = if (state.showNowPlaying || state.showSettings) 16.dp else 132.dp, start = 16.dp, end = 16.dp)
         ) { data ->
-            Snackbar(
-                snackbarData = data,
-                containerColor = SpotifyElevated,
-                contentColor = SpotifyWhite,
-                shape = RoundedCornerShape(10.dp)
-            )
+            Snackbar(snackbarData = data, containerColor = SpotifyElevated, contentColor = SpotifyWhite, shape = RoundedCornerShape(10.dp))
         }
     }
 }
 
 @Composable
 private fun BottomNavItem(label: String, icon: ImageVector, selected: Boolean, onClick: () -> Unit) {
-    Column(
-        modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 4.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
+    Column(modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(icon, contentDescription = label, tint = if (selected) SpotifyWhite else SpotifySubtle, modifier = Modifier.size(24.dp))
         Spacer(Modifier.height(2.dp))
         Text(label, color = if (selected) SpotifyWhite else SpotifySubtle, fontSize = 10.sp)
