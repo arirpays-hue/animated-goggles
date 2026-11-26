@@ -5,6 +5,7 @@ package com.sonify.app
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.audiofx.DynamicsProcessing
@@ -161,11 +162,13 @@ class WebPlaybackEngine(private val context: Context) {
 
     private fun recordCapturedUrl(videoId: String, rawUrl: String, isAudio: Boolean) {
         if (videoId.isBlank() || !rawUrl.startsWith("http")) return
+        if (rawUrl.contains("sabr=1", true)) return
         val list = capturedStreamsMap.getOrPut(videoId) { CopyOnWriteArrayList() }
-        if (list.any { it.url.substringBefore("&range=") == rawUrl.substringBefore("&range=") }) return
+        val key = rawUrl.substringBefore("&range=").substringBefore("&rn=")
+        if (list.any { it.url.substringBefore("&range=").substringBefore("&rn=") == key }) return
         val cookie = runCatching { CookieManager.getInstance().getCookie(rawUrl) }.getOrNull()
         list.add(0, CapturedMediaStream(videoId, rawUrl, mobileUa, cookie, isAudioOnly = isAudio))
-        while (list.size > 6) list.removeAt(list.lastIndex)
+        while (list.size > 4) list.removeAt(list.lastIndex)
     }
 
     fun getCapturedStreams(videoId: String): List<CapturedMediaStream> = capturedStreamsMap[videoId]?.toList() ?: emptyList()
@@ -175,6 +178,8 @@ class WebPlaybackEngine(private val context: Context) {
         webView?.let { return it }
         return WebView(context.applicationContext).apply {
             setBackgroundColor(android.graphics.Color.BLACK)
+            isVerticalScrollBarEnabled = false
+            isHorizontalScrollBarEnabled = false
             val cm = CookieManager.getInstance()
             cm.setAcceptCookie(true)
             cm.setAcceptThirdPartyCookies(this, true)
@@ -197,21 +202,28 @@ class WebPlaybackEngine(private val context: Context) {
                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                     val url = request?.url?.toString().orEmpty()
                     val vid = currentVideoId
-                    if (vid.isNotBlank() && url.contains("googlevideo.com/videoplayback")) {
+                    if (vid.isNotBlank() && url.contains("googlevideo.com/videoplayback") && !url.contains("sabr=1", true)) {
                         val decoded = runCatching { URLDecoder.decode(url, "UTF-8") }.getOrDefault(url)
                         val isAudio = decoded.contains("mime=audio", true) ||
                             decoded.contains("itag=140") || decoded.contains("itag=251") ||
                             decoded.contains("itag=250") || decoded.contains("itag=249")
                         val isMuxed = decoded.contains("itag=18") || decoded.contains("itag=22")
-                        if (isAudio || isMuxed) {
+                        if ((isAudio || isMuxed) && (decoded.contains("clen=") || decoded.contains("itag="))) {
                             recordCapturedUrl(vid, url, isAudio)
                         }
                     }
                     return super.shouldInterceptRequest(view, request)
                 }
 
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    if (isActive && isMobileWatchFallback) injectCleanVideoCssOnly()
+                }
+
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    if (isActive && isMobileWatchFallback) injectMobileWatchHook()
+                    if (isActive && isMobileWatchFallback) {
+                        injectCleanVideoCssOnly()
+                        injectMobileWatchHook()
+                    }
                 }
             }
             addJavascriptInterface(JsBridge(), "SonifyBridge")
@@ -229,6 +241,7 @@ class WebPlaybackEngine(private val context: Context) {
             }
             wv.onResume()
             wv.resumeTimers()
+            if (isActive && isMobileWatchFallback) injectCleanVideoCssOnly()
             val pending = pendingVideoId
             if (isActive && !pending.isNullOrBlank()) {
                 pendingVideoId = null
@@ -262,7 +275,7 @@ class WebPlaybackEngine(private val context: Context) {
             <!DOCTYPE html>
             <html>
             <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
             <style>html, body, #player { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }</style>
             </head>
             <body>
@@ -275,7 +288,7 @@ class WebPlaybackEngine(private val context: Context) {
                 player = new YT.Player('player', {
                   width: '100%', height: '100%', videoId: '$safeId',
                   host: 'https://www.youtube-nocookie.com',
-                  playerVars: { 'autoplay': 1, 'playsinline': 1, 'controls': 0, 'rel': 0, 'fs': 0, 'modestbranding': 1, 'enablejsapi': 1, 'origin': 'https://www.youtube-nocookie.com' },
+                  playerVars: { 'autoplay': 1, 'playsinline': 1, 'controls': 0, 'rel': 0, 'fs': 0, 'iv_load_policy': 3, 'modestbranding': 1, 'enablejsapi': 1, 'origin': 'https://www.youtube-nocookie.com' },
                   events: {
                     'onReady': function(e) {
                       try { e.target.unMute(); e.target.setVolume(100); e.target.setPlaybackRate($currentSpeed); e.target.playVideo(); } catch(err) {}
@@ -335,6 +348,66 @@ class WebPlaybackEngine(private val context: Context) {
         }
     }
 
+    // Strips ALL YouTube mobile UI (logo, Open App, white page, title, likes, red progress bar) -> Clean full-frame video!
+    private fun injectCleanVideoCssOnly() {
+        val css = """
+            html, body {
+              background: #000 !important;
+              margin: 0 !important;
+              padding: 0 !important;
+              width: 100vw !important;
+              height: 100vh !important;
+              overflow: hidden !important;
+            }
+            ytm-mobile-topbar-renderer, .mobile-topbar-header, #header-bar, header,
+            .watch-below-the-player, ytm-watch-metadata, ytm-slim-video-metadata-section-renderer,
+            ytm-item-section-renderer, ytm-engagement-panel-section-list-renderer,
+            ytm-single-column-watch-next-results-renderer, .ytm-autonav-bar,
+            #player-control-overlay, .player-controls-content, .player-controls-background,
+            .player-controls-background-container, .player-controls-top, .player-controls-middle,
+            .player-controls-bottom, .ytp-chrome-top, .ytp-chrome-bottom, .ytp-gradient-top,
+            .ytp-gradient-bottom, .ytp-pause-overlay, .ytp-watermark, .ytp-bezel-text-wrapper,
+            .ytp-doubletap-ui-legacy, .ytm-custom-control-host, .ytp-spinner,
+            .ytp-cued-thumbnail-overlay, .ytp-large-play-button, ytm-promoted-sparkles-web-renderer {
+              display: none !important;
+              opacity: 0 !important;
+              visibility: hidden !important;
+              pointer-events: none !important;
+            }
+            #player-container-id, .player-container, #player, #movie_player,
+            .html5-video-player, .html5-video-container {
+              position: fixed !important;
+              top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+              width: 100vw !important; height: 100vh !important;
+              max-width: 100vw !important; max-height: 100vh !important;
+              margin: 0 !important; padding: 0 !important;
+              background: #000 !important;
+              z-index: 99999 !important;
+            }
+            video, video.html5-main-video {
+              position: fixed !important;
+              top: 0 !important; left: 0 !important;
+              width: 100vw !important; height: 100vh !important;
+              object-fit: contain !important;
+              background: #000 !important;
+              transform: none !important;
+            }
+        """.trimIndent().replace("\n", " ")
+
+        val js = """
+            (function() {
+              var st = document.getElementById('sonify-clean-css');
+              if (!st) {
+                st = document.createElement('style');
+                st.id = 'sonify-clean-css';
+                (document.head || document.documentElement).appendChild(st);
+              }
+              st.textContent = "$css";
+            })();
+        """.trimIndent()
+        mainHandler.post { webView?.evaluateJavascript(js, null) }
+    }
+
     private fun injectMobileWatchHook() {
         val js = """
             (function() {
@@ -342,7 +415,6 @@ class WebPlaybackEngine(private val context: Context) {
               window.__sonifyEndedFired = false;
               if (window.__sonifyTimer) clearInterval(window.__sonifyTimer);
 
-              // Extract direct stream URLs from ytInitialPlayerResponse if present
               try {
                 var sd = window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.streamingData;
                 if (sd) {
@@ -369,11 +441,9 @@ class WebPlaybackEngine(private val context: Context) {
                 if (skip) { try { skip.click(); } catch(e){} }
                 var unmuteBtn = document.querySelector('.ytp-unmute');
                 if (unmuteBtn && unmuteBtn.offsetParent !== null) { try { unmuteBtn.click(); } catch(e){} }
+
                 var v = document.querySelector('video');
                 if (!v) return;
-                if (v.currentSrc && v.currentSrc.indexOf('http') === 0) {
-                  SonifyBridge.onCapturedUrl(v.currentSrc, false);
-                }
                 if (Math.abs(v.playbackRate - $currentSpeed) > 0.05) { try { v.playbackRate = $currentSpeed; } catch(e){} }
                 if (!window.__sonifyUserPaused) {
                   if (v.muted) v.muted = false;
