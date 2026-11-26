@@ -557,4 +557,110 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                     Spacer(Modifier.height(12.dp))
                     SectionCard(str.t("התראות", "Notifications")) {
                         ToggleSettingRow(str.t("שחרורים חדשים", "New Releases"), str.t("עדכונים מאמנים אהובים", "Updates from followed artists"), s.notifyNewReleases) { vm.updateSettings(s.copy(notifyNewReleases = it)) }
-                        ToggleSettingRow(str.t("הופעות קרובות", "Live Concerts"), str.t("התראות על הופעות ומכירה מוקדמת", "Concert alerts & presales"), s.notifyConcerts) { vm.updateSettings(s.
+                        ToggleSettingRow(str.t("הופעות קרובות", "Live Concerts"), str.t("התראות על הופעות ומכירה מוקדמת", "Concert alerts & presales"), s.notifyConcerts) { vm.updateSettings(s.copy(notifyConcerts = it)) }
+                        ToggleSettingRow(str.t("פרקי פודקאסטים חדשים", "New Podcast Episodes"), str.t("התראות על פרקים חדשים", "Alerts for new podcast drops"), s.notifyPodcasts) { vm.updateSettings(s.copy(notifyPodcasts = it)) }
+                    }
+                }
+
+                SettingsSection.PRIVACY_TASTE -> {
+                    var tasteArtistInput by remember { mutableStateOf("") }
+                    SectionCard(str.t("פרטיות ותוכן", "Privacy & Content")) {
+                        ToggleSettingRow(str.privateSession, str.t("לא שומר היסטוריה ולא משפיע על המלצות", "Pause listening history and taste updates"), s.privateSession) { vm.updateSettings(s.copy(privateSession = it)) }
+                        ToggleSettingRow(str.t("אפשר תוכן בוטה (Explicit)", "Allow Explicit Content"), str.t("השמעה או חסימה של שירים מסומנים E", "Play or filter tracks marked E"), s.allowExplicit) { vm.updateSettings(s.copy(allowExplicit = it)) }
+                        ToggleSettingRow(str.t("הצג פעילות האזנה לחברים", "Share Listening Activity"), str.t("שיתוף השיר המתנגן כעת", "Let friends see what you play"), s.shareListeningActivity) { vm.updateSettings(s.copy(shareListeningActivity = it)) }
+                        ToggleSettingRow(str.t("הצג אמנים אחרונים בפרופיל", "Recently Played Artists"), str.t("חשיפת אמנים מושמעים לאחרונה", "Show top recent artists on profile"), s.showRecentlyPlayedArtists) { vm.updateSettings(s.copy(showRecentlyPlayedArtists = it)) }
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+                    SectionCard(str.t("פרופיל טעם ושירים מוסתרים", "Taste Profile & Hidden Tracks")) {
+                        Text(str.t("החרגת אמן או ז'אנר מהמלצות:", "Exclude artist or genre from recommendations:"), color = SpotifySubtle, fontSize = 12.sp)
+                        Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(value = tasteArtistInput, onValueChange = { tasteArtistInput = it }, placeholder = { Text(str.t("שם אמן...", "Artist name...")) }, singleLine = true, modifier = Modifier.weight(1f))
+                            Button(
+                                onClick = { if (tasteArtistInput.isNotBlank()) { vm.toggleExcludeArtistFromTaste(tasteArtistInput.trim()); tasteArtistInput = "" } },
+                                colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black)
+                            ) { Text(str.t("החרג", "Exclude"), fontWeight = FontWeight.Bold) }
+                        }
+                        if (state.excludedArtistsFromTaste.isNotEmpty()) {
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+                                items(state.excludedArtistsFromTaste.toList()) { a ->
+                                    InputChip(selected = true, onClick = { vm.toggleExcludeArtistFromTaste(a) }, label = { Text("$a ✕") })
+                                }
+                            }
+                        }
+                        if (state.hiddenTrackIds.isNotEmpty()) {
+                            Spacer(Modifier.height(12.dp))
+                            OutlinedButton(onClick = { vm.clearAllHiddenTracks() }, modifier = Modifier.fillMaxWidth()) {
+                                Text(str.t("שחזר ${state.hiddenTrackIds.size} שירים מוסתרים", "Restore ${state.hiddenTrackIds.size} hidden tracks"), color = SpotifyWhite)
+                            }
+                        }
+                    }
+                }
+
+                SettingsSection.UI_LANGUAGE -> {
+                    SectionCard(str.t("שפת האפליקציה", "App Language")) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            AppLanguage.entries.forEach { lang ->
+                                val sel = s.language == lang
+                                Box(Modifier.clip(RoundedCornerShape(50)).background(if (sel) SpotifyGreen else SpotifyCard).clickable { vm.updateSettings(s.copy(language = lang)) }.padding(horizontal = 18.dp, vertical = 9.dp)) {
+                                    Text(lang.label, color = if (sel) Color.Black else SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    SectionCard(str.t("תצוגה וניווט", "Display & Navigation")) {
+                        ToggleSettingRow(str.t("הצג כפתור יצירה (+) בסרגל התחתון", "Show Create (+) Tab"), str.t("הסתרה או הצגה של לשונית היצירה", "Show or hide Create in bottom bar"), s.showCreateNavButton) { vm.updateSettings(s.copy(showCreateNavButton = it)) }
+                        ToggleSettingRow(str.t("הצג רצועות לא זמינות באפור", "Show Unplayable Songs"), str.t("הצגת שירים מוסתרים או לא זמינים באופליין", "Grey out hidden or offline-unavailable tracks"), s.showUnplayableSongs) { vm.updateSettings(s.copy(showUnplayableSongs = it)) }
+                        ToggleSettingRow(str.t("מצב רכב (כפתורי ניגון מוגדלים)", "Car Mode (Large Controls)"), str.t("כפתורי שליטה גדולים ונוחים לנסיעה", "Larger playback buttons while driving"), s.carModeOptimized) { vm.updateSettings(s.copy(carModeOptimized = it)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Card(colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Text(title, color = SpotifyGreen, fontWeight = FontWeight.Bold, fontSize = 14.sp, modifier = Modifier.padding(bottom = 10.dp))
+            content()
+        }
+    }
+}
+
+@Composable
+private fun QualitySelectorRow(
+    title: String,
+    selected: AudioQuality,
+    options: List<AudioQuality>,
+    source: StreamSource,
+    isEn: Boolean,
+    onSelect: (AudioQuality) -> Unit
+) {
+    Column {
+        Text(title, color = SpotifyWhite, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            items(options) { q ->
+                val isSel = q == selected
+                Box(Modifier.clip(RoundedCornerShape(50)).background(if (isSel) SpotifyGreen else SpotifyCard).clickable { onSelect(q) }.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                    Text(q.shortLabel(isEn, source), color = if (isSel) Color.Black else SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ToggleSettingRow(title: String, subtitle: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+            Text(title, color = SpotifyWhite, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(subtitle, color = SpotifySubtle, fontSize = 11.sp)
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange, colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = SpotifyGreen))
+    }
+}
