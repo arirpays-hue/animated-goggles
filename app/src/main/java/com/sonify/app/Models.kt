@@ -4,6 +4,12 @@ import java.util.UUID
 
 enum class MainTab { HOME, SEARCH, LIBRARY }
 enum class HomeFilter(val label: String) { ALL("הכל"), MUSIC("מוזיקה"), PODCASTS("פודקאסטים") }
+enum class SearchMode(val label: String) {
+    SONGS("שירים"),
+    PLAYLISTS("פלייליסטים"),
+    PODCASTS("פודקאסטים")
+}
+
 enum class LibraryFilter(val label: String) {
     ALL("הכל"),
     PLAYLISTS("פלייליסטים"),
@@ -12,6 +18,7 @@ enum class LibraryFilter(val label: String) {
     ALBUMS("אלבומים"),
     PODCASTS("פודקאסטים")
 }
+
 enum class LibrarySort(val label: String) {
     RECENT("אחרונים"),
     ALPHA("א'-ב'"),
@@ -19,7 +26,7 @@ enum class LibrarySort(val label: String) {
 }
 
 enum class StreamSource(val label: String, val subtitle: String) {
-    YOUTUBE("YouTube (ברירת מחדל)", "קטלוג מלא + תמיכה במעבר לקליפ שיר"),
+    YOUTUBE("YouTube Music (ברירת מחדל)", "שירים בודדים, פלייליסטים אמיתיים + מעבר לקליפ"),
     OPENSUBSONIC("שרת פרטי (OpenSubsonic / Navidrome)", "הזרמת Lossless FLAC ישירה מהשרת שלך"),
     LOCAL("קובצי המכשיר (FLAC / MP3)", "ניגון ישיר מהאחסון המקומי ללא אינטרנט")
 }
@@ -46,11 +53,18 @@ data class Track(
     val isSmartInjected: Boolean = false
 )
 
+data class RemotePlaylist(
+    val id: String,
+    val title: String,
+    val subtitle: String,
+    val artworkUrl: String
+)
+
 data class ResolvedStreams(
     val audioUrl: String,
-    val videoUrl: String? = null,       // Muxed video+audio or HLS
-    val videoOnlyUrl: String? = null,   // Adaptive video-only to merge with audioUrl
-    val userAgent: String = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
+    val videoUrl: String? = null,
+    val videoOnlyUrl: String? = null,
+    val userAgent: String = "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
     val isLossless: Boolean = false,
     val isOffline: Boolean = false,
     val codecLabel: String = "AAC"
@@ -69,9 +83,11 @@ data class Playlist(
     val name: String,
     val creator: String = "שלך",
     val description: String = "",
+    val coverUrl: String = "",
     val tracks: List<Track> = emptyList(),
     val isBlend: Boolean = false,
-    val blendMatchPercent: Int? = null
+    val blendMatchPercent: Int? = null,
+    val isRemote: Boolean = false
 )
 
 data class AppSettings(
