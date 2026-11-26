@@ -12,8 +12,8 @@ android {
         applicationId = "com.sonify.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "9.1.0"
+        versionCode = 11
+        versionName = "10.0.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -87,10 +87,8 @@ dependencies {
     implementation("androidx.media3:media3-session:1.4.1")
     implementation("androidx.media3:media3-common:1.4.1")
 
-    // Embedded yt-dlp engine for reliable offline downloads
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
 
-    // Real QR Code Generator & Offline Camera Scanner
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("com.google.zxing:core:3.5.3")
 
