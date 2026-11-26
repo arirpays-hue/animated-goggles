@@ -2,7 +2,6 @@ package com.sonify.app
 
 import java.util.UUID
 
-// Global HD Artwork Upgrader (fixes blurry 120px thumbnails everywhere!)
 fun upgradeArtworkUrlGlobal(url: String): String {
     if (url.isBlank()) return ""
     if (url.contains("googleusercontent.com") || url.contains("ggpht.com")) {
@@ -75,30 +74,36 @@ enum class LibrarySort(val labelHe: String, val labelEn: String) {
     fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
 }
 
-enum class StreamSource(val label: String, val subtitle: String) {
-    YOUTUBE("YouTube Music (ברירת מחדל)", "שירים, פלייליסטים, פודקאסטים + מעבר לקליפ"),
-    OPENSUBSONIC("שרת פרטי (OpenSubsonic / Navidrome)", "הזרמת Lossless FLAC ישירה מהשרת שלך"),
-    LOCAL("קובצי המכשיר (FLAC / MP3)", "ניגון ישיר מהאחסון המקומי ללא אינטרנט")
+enum class StreamSource(val labelHe: String, val labelEn: String, val subHe: String, val subEn: String) {
+    YOUTUBE("YouTube Music (ברירת מחדל)", "YouTube Music (Default)", "שירים, פלייליסטים, פודקאסטים + קליפים רשמיים", "Songs, playlists, podcasts + official music videos"),
+    OPENSUBSONIC("שרת פרטי (OpenSubsonic / Navidrome)", "Private Server (OpenSubsonic / Navidrome)", "הזרמת Lossless FLAC ישירה מהשרת שלך", "True Lossless FLAC streaming from your server"),
+    LOCAL("קובצי המכשיר (FLAC / MP3)", "Local Device Files (FLAC / MP3)", "ניגון ישיר מהאחסון המקומי ללא אינטרנט", "Direct offline playback from local storage");
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
+    fun sub(isEn: Boolean) = if (isEn) subEn else subHe
 }
 
-enum class YouTubeEngineMode(val label: String, val subtitle: String) {
-    AUTO("אוטומטי (ExoPlayer + גיבוי Web)", "מנסה אודיו ישיר עם אקולייזר ועובר לגיבוי מובנה בעת חסימה"),
-    WEB_DIRECT("נגן YouTube מובנה (מהיר וללא 403)", "ניגון מיידי ללא חסימות סלולר + מעבר מיידי לקליפ"),
-    EXOPLAYER_ONLY("ExoPlayer בלבד", "הזרמה ישירה בלבד (אקולייזר 10 ערוצים, מונו ואיזון)")
+enum class YouTubeEngineMode(val labelHe: String, val labelEn: String, val subHe: String, val subEn: String) {
+    AUTO("אוטומטי (ExoPlayer + גיבוי Web)", "Auto (ExoPlayer + Web Fallback)", "מנסה אודיו ישיר עם אקולייזר ועובר לגיבוי אוטומטי בעת חסימה", "Tries direct audio with EQ, falls back automatically if blocked"),
+    WEB_DIRECT("נגן YouTube מובנה (מהיר וללא 403)", "Built-in YouTube Engine (Fast, No 403)", "ניגון מיידי ללא חסימות סלולר + מעבר לקליפ רשמי", "Instant playback on cellular + official video switch"),
+    EXOPLAYER_ONLY("ExoPlayer בלבד", "ExoPlayer Only", "הזרמה ישירה בלבד (אקולייזר 10 ערוצים, מונו ואיזון)", "Direct stream only (10-band EQ, Mono & Balance)");
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
+    fun sub(isEn: Boolean) = if (isEn) subEn else subHe
 }
 
-enum class AudioQuality(val label: String, val shortLabel: String, val kbps: Int) {
-    LOW("נמוכה (24kbps)", "נמוכה", 24),
-    NORMAL("רגילה (96kbps)", "רגילה", 96),
-    HIGH("גבוהה (160kbps)", "גבוהה", 160),
-    VERY_HIGH("גבוהה מאוד (320kbps)", "גבוהה מאוד", 320),
-    LOSSLESS("Lossless (FLAC 24-bit/44.1kHz)", "Lossless", 1411)
+enum class AudioQuality(val labelHe: String, val labelEn: String, val shortHe: String, val shortEn: String, val kbps: Int) {
+    LOW("נמוכה (24kbps)", "Low (24kbps)", "נמוכה", "Low", 24),
+    NORMAL("רגילה (96kbps)", "Normal (96kbps)", "רגילה", "Normal", 96),
+    HIGH("גבוהה (160kbps)", "High (160kbps)", "גבוהה", "High", 160),
+    VERY_HIGH("גבוהה מאוד (320kbps)", "Very High (320kbps)", "גבוהה מאוד", "Very High", 320),
+    LOSSLESS("Lossless (FLAC 24-bit/44.1kHz)", "Lossless (FLAC 24-bit/44.1kHz)", "Lossless", "Lossless", 1411);
+    fun shortLabel(isEn: Boolean) = if (isEn) shortEn else shortHe
 }
 
-enum class NormalizationLevel(val label: String, val gainMb: Int) {
-    QUIET("שקט", 0),
-    NORMAL("רגיל", 250),
-    LOUD("חזק", 550)
+enum class NormalizationLevel(val labelHe: String, val labelEn: String, val gainMb: Int) {
+    QUIET("שקט", "Quiet", 0),
+    NORMAL("רגיל", "Normal", 250),
+    LOUD("חזק", "Loud", 550);
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
 }
 
 enum class RepeatMode { OFF, ALL, ONE }
@@ -131,6 +136,7 @@ data class CapturedMediaStream(
     val url: String,
     val userAgent: String,
     val cookie: String? = null,
+    val headers: Map<String, String> = emptyMap(),
     val isAudioOnly: Boolean = true,
     val capturedAt: Long = System.currentTimeMillis()
 )
@@ -174,6 +180,7 @@ data class Playlist(
     val excludeFromTaste: Boolean = false,
     val isMixedMode: Boolean = false,
     val folderId: String? = null,
+    val aiSeedPrompt: String = "",
     val createdAt: Long = System.currentTimeMillis()
 )
 
@@ -187,11 +194,20 @@ data class DeletedPlaylistRecord(
     val deletedAt: Long = System.currentTimeMillis()
 )
 
+data class FriendProfile(
+    val name: String,
+    val currentActivity: String = "",
+    val isOnline: Boolean = true
+)
+
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
+    val friendThread: String = "כללי",
     val sender: String,
     val text: String,
     val sharedTrack: Track? = null,
+    val sharedPlaylistName: String? = null,
+    val sharedJamCode: String? = null,
     val trackTimestampSec: Int? = null,
     val timestampMs: Long = System.currentTimeMillis()
 )
@@ -200,6 +216,21 @@ data class ListeningStats(
     val totalListeningMs: Long = 0L,
     val trackPlayCounts: Map<String, Int> = emptyMap(),
     val artistPlayCounts: Map<String, Int> = emptyMap()
+)
+
+data class ArtistPageState(
+    val artistName: String,
+    val artworkUrl: String = "",
+    val tracks: List<Track> = emptyList(),
+    val isLoading: Boolean = false
+)
+
+data class AiPlaylistConfig(
+    val prompt: String,
+    val targetCount: Int = 25,
+    val languagePref: String = "משולב",
+    val energyPref: String = "מאוזן",
+    val eraPref: String = "הכל"
 )
 
 data class AppSettings(
@@ -216,6 +247,7 @@ data class AppSettings(
     val subsonicUser: String = "",
     val subsonicPass: String = "",
     val geminiApiKey: String = "",
+    val djVoiceEnabled: Boolean = true,
     val normalizeVolume: Boolean = true,
     val normalizationLevel: NormalizationLevel = NormalizationLevel.NORMAL,
     val gaplessPlayback: Boolean = true,
@@ -247,13 +279,21 @@ data class AppSettings(
 data class AudioOutputItem(
     val id: Int,
     val name: String,
-    val typeLabel: String,
+    val typeLabelHe: String,
+    val typeLabelEn: String,
+    val isLosslessCapable: Boolean,
     val isActive: Boolean
-)
+) {
+    fun typeLabel(isEn: Boolean) = if (isEn) typeLabelEn else typeLabelHe
+}
 
 data class JamState(
     val active: Boolean = false,
     val code: String = "",
+    val joinUrl: String = "",
+    val isHost: Boolean = true,
+    val guestsCanControlQueue: Boolean = true,
+    val guestsCanControlVolume: Boolean = false,
     val participants: List<String> = emptyList()
 )
 
