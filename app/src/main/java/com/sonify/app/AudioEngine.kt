@@ -1,4 +1,4 @@
-@file:OptIn(UnstableApi::class)
+@file:androidx.annotation.OptIn(UnstableApi::class)
 
 package com.sonify.app
 
@@ -8,14 +8,21 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.audiofx.Equalizer
 import android.media.audiofx.LoudnessEnhancer
-import androidx.annotation.OptIn
+import android.provider.Settings
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import kotlinx.coroutines.CoroutineScope
@@ -79,7 +86,8 @@ class AudioEngine(private val context: Context) {
         private set
 
     var onTrackEnded: (() -> Unit)? = null
-    var onProgressUpdate: ((Long, Long, Boolean) -> Unit)? = null
+    var onPlaybackError: ((String) -> Unit)? = null
+    var onProgressUpdate: ((Long, Long, Boolean, Boolean) -> Unit)? = null
 
     init {
         player.addListener(object : Player.Listener {
@@ -97,19 +105,22 @@ class AudioEngine(private val context: Context) {
                     }
                 }
             }
+
+            override fun onPlayerError(error: PlaybackException) {
+                onPlaybackError?.invoke(error.errorCodeName)
+            }
         })
 
-        // Start foreground MediaSessionService for background playback
         runCatching {
             context.startService(Intent(context, PlaybackService::class.java))
         }
 
-        // Progress + Crossfade ticker
         scope.launch {
             while (isActive) {
                 val pos = player.currentPosition.coerceAtLeast(0L)
                 val dur = player.duration.coerceAtLeast(0L)
-                onProgressUpdate?.invoke(pos, dur, player.isPlaying)
+                val buffering = player.playbackState == Player.STATE_BUFFERING
+                onProgressUpdate?.invoke(pos, dur, player.isPlaying, buffering)
 
                 val cfMs = lastSettings.crossfadeSeconds * 1000L
                 if (cfMs > 0 && dur > cfMs && player.isPlaying) {
@@ -121,10 +132,10 @@ class AudioEngine(private val context: Context) {
                     } else {
                         player.volume = 1f
                     }
-                } else {
+                } else if (sleepJob == null || !sleepJob!!.isActive) {
                     player.volume = 1f
                 }
-                delay(350)
+                delay(300)
             }
         }
     }
@@ -158,7 +169,7 @@ class AudioEngine(private val context: Context) {
                 val minLvl = range[0].toInt()
                 val maxLvl = range[1].toInt()
                 for (i in 0 until bands.coerceAtMost(settings.eqBands.size)) {
-                    val norm = settings.eqBands[i] // -10..+10
+                    val norm = settings.eqBands[i]
                     val lvl = ((norm / 10f) * (maxLvl - minLvl) / 2f).toInt().coerceIn(minLvl, maxLvl)
                     eq.setBandLevel(i.toShort(), lvl.toShort())
                 }
@@ -166,17 +177,50 @@ class AudioEngine(private val context: Context) {
         }
     }
 
-    fun playMedia(url: String, track: Track, startPositionMs: Long = 0L, playImmediately: Boolean = true) {
+    private fun buildSingleSource(url: String, metadata: MediaMetadata, userAgent: String): MediaSource {
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(userAgent)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(12_000)
+            .setReadTimeoutMs(15_000)
+        val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
+        val item = MediaItem.Builder().setUri(url).setMediaMetadata(metadata).build()
+        return if (url.contains(".m3u8", ignoreCase = true) || url.contains("manifest/hls", ignoreCase = true)) {
+            HlsMediaSource.Factory(dataSourceFactory).createMediaSource(item)
+        } else {
+            ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(item)
+        }
+    }
+
+    fun playResolved(
+        resolved: ResolvedStreams,
+        track: Track,
+        videoMode: Boolean,
+        startPositionMs: Long = 0L,
+        playImmediately: Boolean = true
+    ) {
         val metadata = MediaMetadata.Builder()
             .setTitle(track.title)
             .setArtist(track.artist)
             .setAlbumTitle(track.album)
             .build()
-        val item = MediaItem.Builder()
-            .setUri(url)
-            .setMediaMetadata(metadata)
-            .build()
-        player.setMediaItem(item, startPositionMs)
+
+        val source: MediaSource = if (videoMode) {
+            when {
+                !resolved.videoUrl.isNullOrBlank() ->
+                    buildSingleSource(resolved.videoUrl, metadata, resolved.userAgent)
+                !resolved.videoOnlyUrl.isNullOrBlank() -> {
+                    val vSrc = buildSingleSource(resolved.videoOnlyUrl, metadata, resolved.userAgent)
+                    val aSrc = buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent)
+                    MergingMediaSource(vSrc, aSrc)
+                }
+                else -> buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent)
+            }
+        } else {
+            buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent)
+        }
+
+        player.setMediaSource(source, startPositionMs)
         player.prepare()
         player.playWhenReady = playImmediately
         if (player.audioSessionId > 0 && equalizer == null) {
@@ -184,14 +228,22 @@ class AudioEngine(private val context: Context) {
         }
     }
 
-    fun seamlessSwitchStream(newUrl: String, track: Track) {
+    fun seamlessSwitchVideoMode(resolved: ResolvedStreams, track: Track, toVideo: Boolean) {
         val currentPos = player.currentPosition.coerceAtLeast(0L)
-        val wasPlaying = player.isPlaying
-        playMedia(newUrl, track, startPositionMs = currentPos, playImmediately = wasPlaying)
+        val wasPlaying = player.isPlaying || player.playWhenReady
+        playResolved(resolved, track, videoMode = toVideo, startPositionMs = currentPos, playImmediately = wasPlaying)
     }
 
-    fun togglePlayPause() {
-        if (player.isPlaying) player.pause() else player.play()
+    fun togglePlayPause(onNeedRetry: () -> Unit) {
+        when {
+            player.playbackState == Player.STATE_IDLE -> onNeedRetry()
+            player.playbackState == Player.STATE_ENDED -> {
+                player.seekTo(0L)
+                player.play()
+            }
+            player.isPlaying -> player.pause()
+            else -> player.play()
+        }
     }
 
     fun seekTo(positionMs: Long) {
@@ -200,7 +252,9 @@ class AudioEngine(private val context: Context) {
 
     fun startSleepTimer(minutes: Int, onRemainingChange: (Int?) -> Unit) {
         sleepJob?.cancel()
+        sleepJob = null
         sleepEndOfTrack = false
+        player.volume = 1f
         if (minutes <= 0) {
             onRemainingChange(null)
             return
@@ -223,12 +277,32 @@ class AudioEngine(private val context: Context) {
 
     fun setSleepEndOfTrack(enabled: Boolean) {
         sleepJob?.cancel()
+        sleepJob = null
         sleepEndOfTrack = enabled
+    }
+
+    fun openSystemAudioSettings() {
+        runCatching {
+            val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        }.onFailure {
+            runCatching {
+                val intent = Intent(Settings.ACTION_SOUND_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+            }
+        }
     }
 
     fun getOutputDevices(): List<AudioOutputItem> {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return emptyList()
         val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        val hasExternal = devices.any {
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                it.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                it.type == AudioDeviceInfo.TYPE_USB_DEVICE
+        }
         return devices.mapNotNull { d ->
             val typeLabel = when (d.type) {
                 AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "רמקול הטלפון"
@@ -237,14 +311,12 @@ class AudioEngine(private val context: Context) {
                 AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> "USB-C DAC / אוזניות (Lossless)"
                 else -> return@mapNotNull null
             }
+            val active = if (hasExternal) d.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER else d.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
             AudioOutputItem(
                 id = d.id,
                 name = d.productName?.toString()?.takeIf { it.isNotBlank() } ?: typeLabel,
                 typeLabel = typeLabel,
-                isActive = d.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                    d.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-                    d.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
-                    d.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                isActive = active
             )
         }.distinctBy { it.typeLabel }
     }
