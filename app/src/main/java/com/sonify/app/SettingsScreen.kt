@@ -56,19 +56,14 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
             val selected = s.streamSource == src
             Row(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp)
+                    .fillMaxWidth().padding(vertical = 4.dp)
                     .clip(RoundedCornerShape(10.dp))
                     .background(if (selected) Color(0xFF1F3B33) else SpotifyDarkSurface)
                     .clickable { vm.updateSettings(s.copy(streamSource = src)) }
                     .padding(14.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                RadioButton(
-                    selected = selected,
-                    onClick = { vm.updateSettings(s.copy(streamSource = src)) },
-                    colors = RadioButtonDefaults.colors(selectedColor = SpotifyGreen)
-                )
+                RadioButton(selected = selected, onClick = { vm.updateSettings(s.copy(streamSource = src)) }, colors = RadioButtonDefaults.colors(selectedColor = SpotifyGreen))
                 Spacer(Modifier.width(8.dp))
                 Column {
                     Text(src.label, color = SpotifyWhite, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
@@ -82,33 +77,10 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
             Card(colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface), shape = RoundedCornerShape(10.dp)) {
                 Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("הגדרות שרת Navidrome / OpenSubsonic", color = SpotifyGreen, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                    OutlinedTextField(
-                        value = s.subsonicUrl,
-                        onValueChange = { vm.updateSettings(s.copy(subsonicUrl = it)) },
-                        label = { Text("כתובת שרת (https://...)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = s.subsonicUser,
-                        onValueChange = { vm.updateSettings(s.copy(subsonicUser = it)) },
-                        label = { Text("שם משתמש") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = s.subsonicPass,
-                        onValueChange = { vm.updateSettings(s.copy(subsonicPass = it)) },
-                        label = { Text("סיסמה") },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Button(
-                        onClick = { vm.testSubsonicServer() },
-                        colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
+                    OutlinedTextField(value = s.subsonicUrl, onValueChange = { vm.updateSettings(s.copy(subsonicUrl = it)) }, label = { Text("כתובת שרת (https://...)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = s.subsonicUser, onValueChange = { vm.updateSettings(s.copy(subsonicUser = it)) }, label = { Text("שם משתמש") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = s.subsonicPass, onValueChange = { vm.updateSettings(s.copy(subsonicPass = it)) }, label = { Text("סיסמה") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+                    Button(onClick = { vm.testSubsonicServer() }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Rounded.Wifi, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
                         Text("בדוק חיבור לשרת", fontWeight = FontWeight.Bold)
@@ -119,11 +91,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
 
         if (s.streamSource == StreamSource.LOCAL) {
             Spacer(Modifier.height(10.dp))
-            Button(
-                onClick = { vm.scanLocalFiles() },
-                colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
-                modifier = Modifier.fillMaxWidth()
-            ) {
+            Button(onClick = { vm.scanLocalFiles() }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), modifier = Modifier.fillMaxWidth()) {
                 Icon(Icons.Rounded.Folder, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
                 Text("סרוק קובצי FLAC/MP3 במכשיר", fontWeight = FontWeight.Bold)
@@ -133,62 +101,40 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
         Spacer(Modifier.height(18.dp))
         SectionTitle("איכות סטרימינג")
         AudioQuality.entries.forEach { q ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { vm.updateSettings(s.copy(quality = q)) }
-                    .padding(vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                RadioButton(
-                    selected = s.quality == q,
-                    onClick = { vm.updateSettings(s.copy(quality = q)) },
-                    colors = RadioButtonDefaults.colors(selectedColor = SpotifyGreen)
-                )
+            Row(modifier = Modifier.fillMaxWidth().clickable { vm.updateSettings(s.copy(quality = q)) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(selected = s.quality == q, onClick = { vm.updateSettings(s.copy(quality = q)) }, colors = RadioButtonDefaults.colors(selectedColor = SpotifyGreen))
                 Text(q.label, color = SpotifyWhite, fontSize = 14.sp)
             }
         }
 
         Spacer(Modifier.height(18.dp))
         SectionTitle("עיבוד שמע ווידאו")
-        ToggleSettingRow("נרמול עוצמת שמע (Volume Normalization)", "מונע קפיצות ווליום בין שירים", s.normalizeVolume) {
-            vm.updateSettings(s.copy(normalizeVolume = it))
-        }
-        ToggleSettingRow("Gapless Playback", "מעבר ללא הפסקה בין רצועות באלבום", s.gaplessPlayback) {
-            vm.updateSettings(s.copy(gaplessPlayback = it))
-        }
-        ToggleSettingRow("פתיחת קליפ אוטומטית ב-YouTube", "עובר ישירות לקליפ השיר כשזמין", s.autoVideoOnWifi) {
-            vm.updateSettings(s.copy(autoVideoOnWifi = it))
-        }
+        ToggleSettingRow("נרמול עוצמת שמע (Volume Normalization)", "מונע קפיצות ווליום בין שירים", s.normalizeVolume) { vm.updateSettings(s.copy(normalizeVolume = it)) }
+        ToggleSettingRow("Gapless Playback", "מעבר ללא הפסקה בין רצועות באלבום", s.gaplessPlayback) { vm.updateSettings(s.copy(gaplessPlayback = it)) }
+        ToggleSettingRow("פתיחת קליפ אוטומטית ב-YouTube", "עובר ישירות לקליפ השיר כשזמין", s.autoVideoOnWifi) { vm.updateSettings(s.copy(autoVideoOnWifi = it)) }
 
         Spacer(Modifier.height(10.dp))
         Text("Crossfade (עמעום בין שירים): ${s.crossfadeSeconds} שניות", color = SpotifyWhite, fontSize = 14.sp)
         Slider(
             value = s.crossfadeSeconds.toFloat(),
             onValueChange = { vm.updateSettings(s.copy(crossfadeSeconds = it.toInt())) },
-            valueRange = 0f..12f,
-            steps = 11,
+            valueRange = 0f..12f, steps = 11,
             colors = SliderDefaults.colors(thumbColor = SpotifyGreen, activeTrackColor = SpotifyGreen)
         )
 
         Spacer(Modifier.height(18.dp))
         SectionTitle("אקולייזר מובנה")
-        ToggleSettingRow("הפעל אקולייזר", "שליטה ב-5 תדרים בזמן אמת + פריסטים", s.eqEnabled) {
-            vm.updateSettings(s.copy(eqEnabled = it))
-        }
+        ToggleSettingRow("הפעל אקולייזר", "שליטה ב-5 תדרים בזמן אמת + פריסטים", s.eqEnabled) { vm.updateSettings(s.copy(eqEnabled = it)) }
         if (s.eqEnabled) {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 8.dp)) {
                 itemsIndexed(eqPresets) { idx, (name, bands) ->
                     val sel = s.eqPresetIndex == idx
                     Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
+                        modifier = Modifier.clip(RoundedCornerShape(50))
                             .background(if (sel) SpotifyGreen else SpotifyCard)
                             .clickable { vm.updateSettings(s.copy(eqPresetIndex = idx, eqBands = bands)) }
                             .padding(horizontal = 14.dp, vertical = 7.dp)
-                    ) {
-                        Text(name, color = if (sel) Color.Black else SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    }
+                    ) { Text(name, color = if (sel) Color.Black else SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
                 }
             }
             Card(colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface), shape = RoundedCornerShape(10.dp)) {
@@ -203,8 +149,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                                     updated[idx] = v.toInt()
                                     vm.updateSettings(s.copy(eqBands = updated, eqPresetIndex = -1))
                                 },
-                                valueRange = -10f..10f,
-                                modifier = Modifier.weight(1f),
+                                valueRange = -10f..10f, modifier = Modifier.weight(1f),
                                 colors = SliderDefaults.colors(thumbColor = SpotifyGreen, activeTrackColor = SpotifyGreen)
                             )
                             Text("${if (value > 0) "+" else ""}$value", color = SpotifyWhite, fontSize = 12.sp, modifier = Modifier.width(30.dp))
@@ -216,20 +161,22 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
 
         Spacer(Modifier.height(18.dp))
         SectionTitle("AI Playlist מתקדם (אופציונלי)")
-        Text(
-            "AI Playlist עובד אוטומטית גם בלי מפתח. אם תזין מפתח Gemini API, ה-AI ירכיב בחירות שירים מותאמות עוד יותר.",
-            color = SpotifySubtle,
-            fontSize = 12.sp
-        )
+        Text("עובד אוטומטית גם בלי מפתח. הזנת מפתח Gemini API משדרגת את בחירת השירים.", color = SpotifySubtle, fontSize = 12.sp)
         Spacer(Modifier.height(8.dp))
         OutlinedTextField(
             value = s.geminiApiKey,
             onValueChange = { vm.updateSettings(s.copy(geminiApiKey = it.trim())) },
             label = { Text("Gemini API Key (אופציונלי)") },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth()
+            singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth()
         )
+
+        Spacer(Modifier.height(22.dp))
+        SectionTitle("תחזוקה")
+        OutlinedButton(onClick = { vm.clearRecentHistory() }, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Rounded.CleaningServices, contentDescription = null, tint = SpotifyWhite, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("נקה היסטוריית ניגון ורענן דף הבית", color = SpotifyWhite)
+        }
     }
 }
 
@@ -240,18 +187,11 @@ private fun SectionTitle(title: String) {
 
 @Composable
 private fun ToggleSettingRow(title: String, subtitle: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(modifier = Modifier.weight(1f)) {
             Text(title, color = SpotifyWhite, fontSize = 14.sp, fontWeight = FontWeight.Medium)
             Text(subtitle, color = SpotifySubtle, fontSize = 12.sp)
         }
-        Switch(
-            checked = checked,
-            onCheckedChange = onCheckedChange,
-            colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = SpotifyGreen)
-        )
+        Switch(checked = checked, onCheckedChange = onCheckedChange, colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = SpotifyGreen))
     }
 }
