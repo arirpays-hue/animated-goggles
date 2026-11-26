@@ -1,4 +1,3 @@
-
 package com.sonify.app
 
 import androidx.compose.foundation.background
