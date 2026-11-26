@@ -48,12 +48,19 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
     val section = state.settingsSection
     var settingsSearch by remember { mutableStateOf("") }
 
+    val qualitySummary = when {
+        s.streamSource == StreamSource.LOCAL -> str.t("איכות קובץ מקורית (FLAC/MP3)", "Native File Quality (FLAC/MP3)")
+        s.streamSource == StreamSource.YOUTUBE && s.ytEngineMode == YouTubeEngineMode.WEB_DIRECT ->
+            str.t("הזרמה אוטומטית • הורדות: ${s.streamSource.clampQuality(s.downloadQuality).shortLabel(isEn, s.streamSource)}", "Auto Stream • DL: ${s.streamSource.clampQuality(s.downloadQuality).shortLabel(isEn, s.streamSource)}")
+        else -> "Wi-Fi: ${s.streamSource.clampQuality(s.wifiQuality).shortLabel(isEn, s.streamSource)}"
+    }
+
     val menuEntries = remember(s, state.offlineTrackIds, state.hiddenTrackIds, isEn) {
         listOf(
             SettingsMenuEntry(
                 SettingsSection.STREAM_QUALITY, Icons.Rounded.HighQuality,
                 str.t("מקור הזרמה ואיכות שמע", "Streaming Source & Quality"),
-                "${s.streamSource.label(isEn).substringBefore(" (")} • Wi-Fi: ${s.wifiQuality.shortLabel(isEn)}",
+                "${s.streamSource.label(isEn).substringBefore(" (")} • $qualitySummary",
                 "youtube lossless flac opensubsonic local wifi cellular quality מקור הזרמה איכות"
             ),
             SettingsMenuEntry(
@@ -186,20 +193,30 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                     }
 
                     Spacer(Modifier.height(16.dp))
-                    Text("Sonify v7.0.0 • Pro Audio & HD Engine", color = SpotifyMuted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+                    Text("Sonify v9.0.0 • yt-dlp Offline Engine", color = SpotifyMuted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
                 }
 
                 SettingsSection.STREAM_QUALITY -> {
                     SectionCard(str.t("מקור ההזרמה הראשי", "Primary Streaming Source")) {
                         StreamSource.entries.forEach { src ->
                             val selected = s.streamSource == src
+                            val selectSource = {
+                                vm.updateSettings(
+                                    s.copy(
+                                        streamSource = src,
+                                        wifiQuality = src.clampQuality(s.wifiQuality),
+                                        cellularQuality = src.clampQuality(s.cellularQuality),
+                                        downloadQuality = src.clampQuality(s.downloadQuality)
+                                    )
+                                )
+                            }
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clip(RoundedCornerShape(10.dp))
                                     .background(if (selected) Color(0xFF1F3B33) else SpotifyCard)
-                                    .clickable { vm.updateSettings(s.copy(streamSource = src)) }.padding(12.dp),
+                                    .clickable { selectSource() }.padding(12.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                RadioButton(selected = selected, onClick = { vm.updateSettings(s.copy(streamSource = src)) }, colors = RadioButtonDefaults.colors(selectedColor = SpotifyGreen))
+                                RadioButton(selected = selected, onClick = { selectSource() }, colors = RadioButtonDefaults.colors(selectedColor = SpotifyGreen))
                                 Spacer(Modifier.width(8.dp))
                                 Column {
                                     Text(src.label(isEn), color = SpotifyWhite, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
@@ -245,22 +262,69 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                         }
                     }
 
-                    if (s.streamSource == StreamSource.LOCAL) {
-                        Spacer(Modifier.height(12.dp))
-                        Button(onClick = { vm.scanLocalFiles() }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), modifier = Modifier.fillMaxWidth()) {
-                            Text(str.t("סרוק קובצי FLAC / MP3 במכשיר", "Scan Local FLAC / MP3 Files"), fontWeight = FontWeight.Bold)
+                    // Strict quality options matching ONLY what the active source + engine actually supports!
+                    when (s.streamSource) {
+                        StreamSource.LOCAL -> {
+                            Spacer(Modifier.height(12.dp))
+                            SectionCard(str.t("איכות שמע מקומית", "Local Audio Quality")) {
+                                Text(
+                                    str.t("קובצי המכשיר מתנגנים תמיד באיכות המקורית המלאה (FLAC / WAV / MP3) ללא דחיסה.", "Local files always play at full native bitrate (FLAC / WAV / MP3) with zero compression."),
+                                    color = SpotifySubtle, fontSize = 12.sp
+                                )
+                                Spacer(Modifier.height(10.dp))
+                                Button(onClick = { vm.scanLocalFiles() }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), modifier = Modifier.fillMaxWidth()) {
+                                    Text(str.t("סרוק קובצי FLAC / MP3 במכשיר", "Scan Local FLAC / MP3 Files"), fontWeight = FontWeight.Bold)
+                                }
+                            }
                         }
-                    }
-
-                    Spacer(Modifier.height(12.dp))
-                    SectionCard(str.t("איכות שמע לפי סוג חיבור (5 רמות)", "Audio Quality by Connection (5 Levels)")) {
-                        QualitySelectorRow(str.t("איכות ב-Wi-Fi", "Wi-Fi Streaming"), s.wifiQuality, isEn) { vm.updateSettings(s.copy(wifiQuality = it)) }
-                        Spacer(Modifier.height(8.dp))
-                        QualitySelectorRow(str.t("איכות בסלולר", "Cellular Streaming"), s.cellularQuality, isEn) { vm.updateSettings(s.copy(cellularQuality = it)) }
-                        Spacer(Modifier.height(8.dp))
-                        QualitySelectorRow(str.t("איכות הורדות אופליין", "Download Quality"), s.downloadQuality, isEn) { vm.updateSettings(s.copy(downloadQuality = it)) }
-                        HorizontalDivider(color = SpotifyCard, modifier = Modifier.padding(vertical = 8.dp))
-                        ToggleSettingRow(str.t("התאמת איכות אוטומטית", "Auto Adjust Quality"), str.t("מוריד איכות כשהרשת חלשה למניעת קטיעות", "Lowers quality on weak connections"), s.autoAdjustQuality) { vm.updateSettings(s.copy(autoAdjustQuality = it)) }
+                        StreamSource.YOUTUBE -> {
+                            val ytQualities = listOf(AudioQuality.LOW, AudioQuality.NORMAL, AudioQuality.HIGH, AudioQuality.VERY_HIGH)
+                            Spacer(Modifier.height(12.dp))
+                            SectionCard(str.t("איכות שמע (נתמכת ב-YouTube בלבד)", "Audio Quality (YouTube Supported Only)")) {
+                                if (s.ytEngineMode == YouTubeEngineMode.WEB_DIRECT) {
+                                    Text(
+                                        str.t("במצב \"נגן YouTube מובנה\", יוטיוב מתאים את איכות ההזרמה אוטומטית לפי הרשת. הבחירה כאן קובעת את איכות ההורדות לאופליין:", "In Built-in YouTube mode, streaming bitrate is managed automatically. Select offline download quality below:"),
+                                        color = SpotifySubtle, fontSize = 12.sp
+                                    )
+                                    Spacer(Modifier.height(10.dp))
+                                    QualitySelectorRow(str.t("איכות הורדות אופליין (yt-dlp)", "Offline Download Quality (yt-dlp)"), s.streamSource.clampQuality(s.downloadQuality), ytQualities, StreamSource.YOUTUBE, isEn) {
+                                        vm.updateSettings(s.copy(downloadQuality = it))
+                                    }
+                                } else {
+                                    QualitySelectorRow(str.t("איכות ב-Wi-Fi", "Wi-Fi Streaming"), s.streamSource.clampQuality(s.wifiQuality), ytQualities, StreamSource.YOUTUBE, isEn) {
+                                        vm.updateSettings(s.copy(wifiQuality = it))
+                                    }
+                                    Spacer(Modifier.height(8.dp))
+                                    QualitySelectorRow(str.t("איכות בסלולר", "Cellular Streaming"), s.streamSource.clampQuality(s.cellularQuality), ytQualities, StreamSource.YOUTUBE, isEn) {
+                                        vm.updateSettings(s.copy(cellularQuality = it))
+                                    }
+                                    Spacer(Modifier.height(8.dp))
+                                    QualitySelectorRow(str.t("איכות הורדות אופליין (yt-dlp)", "Offline Download Quality (yt-dlp)"), s.streamSource.clampQuality(s.downloadQuality), ytQualities, StreamSource.YOUTUBE, isEn) {
+                                        vm.updateSettings(s.copy(downloadQuality = it))
+                                    }
+                                    HorizontalDivider(color = SpotifyCard, modifier = Modifier.padding(vertical = 8.dp))
+                                    ToggleSettingRow(str.t("התאמת איכות אוטומטית", "Auto Adjust Quality"), str.t("מוריד איכות כשהרשת חלשה למניעת קטיעות", "Lowers quality on weak connections"), s.autoAdjustQuality) { vm.updateSettings(s.copy(autoAdjustQuality = it)) }
+                                }
+                                Spacer(Modifier.height(8.dp))
+                                Text(
+                                    str.t("YouTube תומך עד ~256kbps Opus/AAC (ללא Lossless). להזרמת FLAC Lossless בחר OpenSubsonic או קבצים מקומיים.", "YouTube supports up to ~256kbps Opus/AAC (no Lossless). Use OpenSubsonic or Local Files for FLAC Lossless."),
+                                    color = SpotifyMuted, fontSize = 11.sp
+                                )
+                            }
+                        }
+                        StreamSource.OPENSUBSONIC -> {
+                            val subQualities = AudioQuality.entries
+                            Spacer(Modifier.height(12.dp))
+                            SectionCard(str.t("איכות שמע (שרת OpenSubsonic + Lossless FLAC)", "Audio Quality (OpenSubsonic + Lossless FLAC)")) {
+                                QualitySelectorRow(str.t("איכות ב-Wi-Fi", "Wi-Fi Streaming"), s.wifiQuality, subQualities, StreamSource.OPENSUBSONIC, isEn) { vm.updateSettings(s.copy(wifiQuality = it)) }
+                                Spacer(Modifier.height(8.dp))
+                                QualitySelectorRow(str.t("איכות בסלולר", "Cellular Streaming"), s.cellularQuality, subQualities, StreamSource.OPENSUBSONIC, isEn) { vm.updateSettings(s.copy(cellularQuality = it)) }
+                                Spacer(Modifier.height(8.dp))
+                                QualitySelectorRow(str.t("איכות הורדות אופליין", "Offline Download Quality"), s.downloadQuality, subQualities, StreamSource.OPENSUBSONIC, isEn) { vm.updateSettings(s.copy(downloadQuality = it)) }
+                                HorizontalDivider(color = SpotifyCard, modifier = Modifier.padding(vertical = 8.dp))
+                                ToggleSettingRow(str.t("התאמת איכות אוטומטית", "Auto Adjust Quality"), str.t("מוריד איכות כשהרשת חלשה למניעת קטיעות", "Lowers quality on weak connections"), s.autoAdjustQuality) { vm.updateSettings(s.copy(autoAdjustQuality = it)) }
+                            }
+                        }
                     }
                 }
 
@@ -488,15 +552,22 @@ private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Un
 }
 
 @Composable
-private fun QualitySelectorRow(title: String, selected: AudioQuality, isEn: Boolean, onSelect: (AudioQuality) -> Unit) {
+private fun QualitySelectorRow(
+    title: String,
+    selected: AudioQuality,
+    options: List<AudioQuality>,
+    source: StreamSource,
+    isEn: Boolean,
+    onSelect: (AudioQuality) -> Unit
+) {
     Column {
         Text(title, color = SpotifyWhite, fontSize = 13.sp, fontWeight = FontWeight.Medium)
         Spacer(Modifier.height(6.dp))
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            items(AudioQuality.entries) { q ->
+            items(options) { q ->
                 val isSel = q == selected
                 Box(Modifier.clip(RoundedCornerShape(50)).background(if (isSel) SpotifyGreen else SpotifyCard).clickable { onSelect(q) }.padding(horizontal = 12.dp, vertical = 6.dp)) {
-                    Text(q.shortLabel(isEn), color = if (isSel) Color.Black else SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text(q.shortLabel(isEn, source), color = if (isSel) Color.Black else SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
