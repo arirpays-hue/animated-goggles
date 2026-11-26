@@ -13,6 +13,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -85,13 +86,17 @@ class PlaybackService : MediaSessionService() {
     }
 }
 
-// ---------- Built-In Bulletproof YouTube Web Engine (Immune to HTTP 403) ----------
+// ---------- Built-In YouTube Web Engine (Window-Aware + 3.5s Watchdog + Mobile Fallback) ----------
 class WebPlaybackEngine(private val context: Context) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var webView: WebView? = null
     private var isMobileWatchFallback = false
     private var currentVideoId: String = ""
+    private var pendingVideoId: String? = null
+    private var hasStartedPlayingCurrent = false
+    private var watchdogRunnable: Runnable? = null
+
     @Volatile var isActive: Boolean = false
         private set
     @Volatile var isPlaying: Boolean = false
@@ -105,16 +110,28 @@ class WebPlaybackEngine(private val context: Context) {
         webView?.let { return it }
         return WebView(context.applicationContext).apply {
             setBackgroundColor(android.graphics.Color.BLACK)
+            val cm = CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            cm.setAcceptThirdPartyCookies(this, true)
+
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
+            settings.databaseEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            settings.cacheMode = WebSettings.LOAD_DEFAULT
             settings.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+
             webChromeClient = WebChromeClient()
             webViewClient = object : WebViewClient() {
-                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val host = request?.url?.host.orEmpty()
+                    // Keep navigation inside YouTube only (block external app redirects)
+                    return !(host.contains("youtube.com") || host.contains("youtu.be") || host.contains("google.com"))
+                }
+
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    if (isMobileWatchFallback) {
+                    if (isActive && isMobileWatchFallback) {
                         injectMobileWatchHook()
                     }
                 }
@@ -140,124 +157,205 @@ class WebPlaybackEngine(private val context: Context) {
             }
             wv.onResume()
             wv.resumeTimers()
+
+            val pending = pendingVideoId
+            if (isActive && !pending.isNullOrBlank()) {
+                pendingVideoId = null
+                loadIframePlayer(wv, pending)
+            }
         }
     }
 
     fun playVideo(videoId: String) {
-        currentVideoId = videoId
+        val safeId = videoId.replace(Regex("[^a-zA-Z0-9_-]"), "")
+        currentVideoId = safeId
         isActive = true
+        isPlaying = false
         isMobileWatchFallback = false
+        hasStartedPlayingCurrent = false
+        cancelWatchdog()
+
         mainHandler.post {
             val wv = getOrCreateWebView()
-            wv.onResume()
-            wv.resumeTimers()
-            val html = """
-                <!DOCTYPE html>
-                <html>
-                <head>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-                <style>
-                  html, body, #player { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
-                </style>
-                </head>
-                <body>
-                <div id="player"></div>
-                <script src="https://www.youtube.com/iframe_api"></script>
-                <script>
-                  var player;
-                  function onYouTubeIframeAPIReady() {
-                    player = new YT.Player('player', {
-                      width: '100%',
-                      height: '100%',
-                      videoId: '$videoId',
-                      playerVars: {
-                        'autoplay': 1,
-                        'playsinline': 1,
-                        'controls': 0,
-                        'rel': 0,
-                        'modestbranding': 1,
-                        'enablejsapi': 1,
-                        'origin': 'https://www.youtube.com'
-                      },
-                      events: {
-                        'onReady': function(e) {
-                          e.target.playVideo();
-                        },
-                        'onStateChange': function(e) {
-                          if (e.data === YT.PlayerState.ENDED) {
-                            SonifyBridge.onEnded();
-                          }
-                        },
-                        'onError': function(e) {
-                          SonifyBridge.onEmbedError(e.data);
-                        }
-                      }
-                    });
-                  }
-                  setInterval(function() {
-                    if (player && typeof player.getCurrentTime === 'function') {
-                      var pos = Math.floor((player.getCurrentTime() || 0) * 1000);
-                      var dur = Math.floor((player.getDuration() || 0) * 1000);
-                      var st = player.getPlayerState ? player.getPlayerState() : -1;
-                      var playing = (st === 1);
-                      var buffering = (st === 3 || st === -1);
-                      SonifyBridge.onProgress(pos, dur, playing, buffering);
-                    }
-                  }, 350);
-                  window.sonifyToggle = function() {
-                    if (!player) return;
-                    if (player.getPlayerState() === 1) player.pauseVideo(); else player.playVideo();
-                  };
-                  window.sonifyPause = function() { if (player && player.pauseVideo) player.pauseVideo(); };
-                  window.sonifySeek = function(sec) { if (player && player.seekTo) player.seekTo(sec, true); };
-                  window.sonifyVolume = function(pct) { if (player && player.setVolume) player.setVolume(pct); };
-                </script>
-                </body>
-                </html>
-            """.trimIndent()
-            wv.loadDataWithBaseURL("https://www.youtube.com", html, "text/html", "UTF-8", null)
+            if (wv.parent == null) {
+                // Wait until MainActivity / NowPlayingScreen attaches the WebView to a live Window
+                pendingVideoId = safeId
+            } else {
+                pendingVideoId = null
+                loadIframePlayer(wv, safeId)
+            }
         }
+    }
+
+    private fun loadIframePlayer(wv: WebView, safeId: String) {
+        wv.onResume()
+        wv.resumeTimers()
+        scheduleWatchdog(safeId)
+
+        val html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+            <style>
+              html, body, #player { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+            </style>
+            </head>
+            <body>
+            <div id="player"></div>
+            <script src="https://www.youtube.com/iframe_api"></script>
+            <script>
+              var player = null;
+              var userPaused = false;
+              function onYouTubeIframeAPIReady() {
+                player = new YT.Player('player', {
+                  width: '100%',
+                  height: '100%',
+                  videoId: '$safeId',
+                  host: 'https://www.youtube-nocookie.com',
+                  playerVars: {
+                    'autoplay': 1,
+                    'playsinline': 1,
+                    'controls': 0,
+                    'rel': 0,
+                    'fs': 0,
+                    'modestbranding': 1,
+                    'enablejsapi': 1,
+                    'origin': 'https://www.youtube-nocookie.com'
+                  },
+                  events: {
+                    'onReady': function(e) {
+                      try { e.target.unMute(); e.target.setVolume(100); e.target.playVideo(); } catch(err) {}
+                    },
+                    'onStateChange': function(e) {
+                      if (e.data === 0) {
+                        SonifyBridge.onEnded();
+                      }
+                    },
+                    'onError': function(e) {
+                      SonifyBridge.onEmbedError(e.data);
+                    }
+                  }
+                });
+              }
+              setInterval(function() {
+                if (player && typeof player.getCurrentTime === 'function') {
+                  var pos = Math.floor((player.getCurrentTime() || 0) * 1000);
+                  var dur = Math.floor((player.getDuration() || 0) * 1000);
+                  var st = player.getPlayerState ? player.getPlayerState() : -1;
+                  if (st === -1 && !userPaused) {
+                    try { player.playVideo(); } catch(err) {}
+                  }
+                  var playing = (st === 1);
+                  var buffering = (st === 3);
+                  SonifyBridge.onProgress(pos, dur, playing, buffering);
+                }
+              }, 350);
+              window.sonifyPlay = function() {
+                userPaused = false;
+                if (player && player.playVideo) player.playVideo();
+              };
+              window.sonifyPause = function() {
+                userPaused = true;
+                if (player && player.pauseVideo) player.pauseVideo();
+              };
+              window.sonifyToggle = function() {
+                if (!player) return;
+                if (player.getPlayerState && player.getPlayerState() === 1) {
+                  window.sonifyPause();
+                } else {
+                  window.sonifyPlay();
+                }
+              };
+              window.sonifySeek = function(sec) { if (player && player.seekTo) player.seekTo(sec, true); };
+              window.sonifyVolume = function(pct) { if (player && player.setVolume) player.setVolume(pct); };
+            </script>
+            </body>
+            </html>
+        """.trimIndent()
+        wv.loadDataWithBaseURL("https://www.youtube-nocookie.com", html, "text/html", "UTF-8", null)
+    }
+
+    private fun scheduleWatchdog(expectedVideoId: String) {
+        cancelWatchdog()
+        val r = Runnable {
+            if (isActive && currentVideoId == expectedVideoId && !hasStartedPlayingCurrent && !isMobileWatchFallback) {
+                switchToMobileWatchFallback()
+            }
+        }
+        watchdogRunnable = r
+        mainHandler.postDelayed(r, 3500L)
+    }
+
+    private fun cancelWatchdog() {
+        watchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        watchdogRunnable = null
     }
 
     private fun switchToMobileWatchFallback() {
         if (currentVideoId.isBlank() || isMobileWatchFallback) return
         isMobileWatchFallback = true
+        cancelWatchdog()
         mainHandler.post {
-            getOrCreateWebView().loadUrl("https://m.youtube.com/watch?v=$currentVideoId")
+            val wv = getOrCreateWebView()
+            wv.onResume()
+            wv.resumeTimers()
+            wv.loadUrl("https://m.youtube.com/watch?v=$currentVideoId")
         }
     }
 
     private fun injectMobileWatchHook() {
         val js = """
             (function() {
-              if (window.__sonifyHooked) return;
-              window.__sonifyHooked = true;
-              setInterval(function() {
+              window.__sonifyUserPaused = false;
+              window.__sonifyEndedFired = false;
+              if (window.__sonifyTimer) clearInterval(window.__sonifyTimer);
+
+              window.__sonifyTimer = setInterval(function() {
+                // Auto-skip ads or dismiss unmute/play overlays if shown
+                var skip = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern');
+                if (skip) { try { skip.click(); } catch(e){} }
+
+                var unmuteBtn = document.querySelector('.ytp-unmute');
+                if (unmuteBtn && unmuteBtn.offsetParent !== null) { try { unmuteBtn.click(); } catch(e){} }
+
                 var v = document.querySelector('video');
                 if (!v) return;
-                if (!window.__sonifyAutoPlayed) {
-                  v.muted = false;
-                  v.play().catch(function(){});
-                  window.__sonifyAutoPlayed = true;
+
+                if (!window.__sonifyUserPaused) {
+                  if (v.muted) v.muted = false;
+                  if (v.volume === 0) v.volume = 1.0;
+                  if (v.paused && !v.ended) {
+                    v.play().catch(function(){});
+                  }
                 }
+
                 var pos = Math.floor((v.currentTime || 0) * 1000);
-                var dur = Math.floor((isFinite(v.duration) ? v.duration : 0) * 1000);
-                var playing = !v.paused && !v.ended && v.readyState > 2;
-                var buffering = !v.paused && v.readyState <= 2;
+                var dur = Math.floor((isFinite(v.duration) && v.duration > 0 ? v.duration : 0) * 1000);
+                var playing = !v.paused && !v.ended && v.readyState >= 2;
+                var buffering = !window.__sonifyUserPaused && !playing && v.readyState < 3;
                 SonifyBridge.onProgress(pos, dur, playing, buffering);
+
                 if (v.ended && !window.__sonifyEndedFired) {
                   window.__sonifyEndedFired = true;
                   SonifyBridge.onEnded();
                 }
               }, 350);
+
+              window.sonifyPlay = function() {
+                window.__sonifyUserPaused = false;
+                var v = document.querySelector('video');
+                if (v) { v.muted = false; v.play().catch(function(){}); }
+              };
+              window.sonifyPause = function() {
+                window.__sonifyUserPaused = true;
+                var v = document.querySelector('video');
+                if (v) v.pause();
+              };
               window.sonifyToggle = function() {
                 var v = document.querySelector('video');
                 if (!v) return;
-                if (v.paused) v.play(); else v.pause();
-              };
-              window.sonifyPause = function() {
-                var v = document.querySelector('video');
-                if (v) v.pause();
+                if (v.paused) window.sonifyPlay(); else window.sonifyPause();
               };
               window.sonifySeek = function(sec) {
                 var v = document.querySelector('video');
@@ -272,8 +370,18 @@ class WebPlaybackEngine(private val context: Context) {
         mainHandler.post { webView?.evaluateJavascript(js, null) }
     }
 
+    fun play() {
+        mainHandler.post { webView?.evaluateJavascript("if(window.sonifyPlay) window.sonifyPlay();", null) }
+    }
+
     fun togglePlayPause() {
-        mainHandler.post { webView?.evaluateJavascript("if(window.sonifyToggle) window.sonifyToggle();", null) }
+        mainHandler.post {
+            if (!hasStartedPlayingCurrent && !isMobileWatchFallback && currentVideoId.isNotBlank()) {
+                switchToMobileWatchFallback()
+            } else {
+                webView?.evaluateJavascript("if(window.sonifyToggle) window.sonifyToggle();", null)
+            }
+        }
     }
 
     fun pause() {
@@ -293,6 +401,9 @@ class WebPlaybackEngine(private val context: Context) {
     fun stop() {
         isActive = false
         isPlaying = false
+        pendingVideoId = null
+        hasStartedPlayingCurrent = false
+        cancelWatchdog()
         mainHandler.post {
             webView?.evaluateJavascript("if(window.sonifyPause) window.sonifyPause();", null)
             webView?.loadUrl("about:blank")
@@ -303,6 +414,10 @@ class WebPlaybackEngine(private val context: Context) {
         @JavascriptInterface
         fun onProgress(posMs: Long, durMs: Long, playing: Boolean, buffering: Boolean) {
             if (!isActive) return
+            if (playing && posMs > 200L) {
+                hasStartedPlayingCurrent = true
+                cancelWatchdog()
+            }
             isPlaying = playing
             mainHandler.post { onProgress?.invoke(posMs, durMs, playing, buffering) }
         }
@@ -316,10 +431,7 @@ class WebPlaybackEngine(private val context: Context) {
         @JavascriptInterface
         fun onEmbedError(code: Int) {
             if (!isActive) return
-            // Error 101 / 150 = label disabled embed -> switch seamlessly to m.youtube.com HTML5 video
-            if (code == 101 || code == 150 || code == 153 || code == 5) {
-                switchToMobileWatchFallback()
-            }
+            switchToMobileWatchFallback()
         }
     }
 }
