@@ -1,107 +1,78 @@
 package com.sonify.app
 
 import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.view.KeyEvent
 import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Home
-import androidx.compose.material.icons.outlined.LibraryMusic
-import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.Home
-import androidx.compose.material.icons.rounded.LibraryMusic
-import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewmodel.compose.viewModel
 
 class MainActivity : ComponentActivity() {
 
-    private val vm: AppViewModel by viewModels()
-
-    private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { }
+    private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-
-        val perms = buildList {
-            if (Build.VERSION.SDK_INT >= 33) {
-                add(Manifest.permission.POST_NOTIFICATIONS)
-                add(Manifest.permission.READ_MEDIA_AUDIO)
-            } else {
-                add(Manifest.permission.READ_EXTERNAL_STORAGE)
-            }
-        }
-        permissionLauncher.launch(perms.toTypedArray())
+        requestStartupPermissions()
 
         setContent {
+            val vm: AppViewModel = viewModel()
             val state by vm.uiState.collectAsState()
-            val dir = if (state.settings.language == AppLanguage.HEBREW) LayoutDirection.Rtl else LayoutDirection.Ltr
-            CompositionLocalProvider(LocalLayoutDirection provides dir) {
-                SonifyTheme {
-                    SonifyAppRoot(vm, state)
-                }
-            }
+            SonifyRootApp(state = state, vm = vm)
         }
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        val ctrl = event?.isCtrlPressed == true
-        when {
-            keyCode == KeyEvent.KEYCODE_SPACE && vm.uiState.value.currentTrack != null && !vm.uiState.value.showSettings -> {
-                vm.togglePlayPause(); return true
+    private fun requestStartupPermissions() {
+        val perms = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                perms.add(Manifest.permission.POST_NOTIFICATIONS)
             }
-            ctrl && keyCode == KeyEvent.KEYCODE_DPAD_RIGHT -> { vm.skipNext(); return true }
-            ctrl && keyCode == KeyEvent.KEYCODE_DPAD_LEFT -> { vm.skipPrevious(); return true }
-            ctrl && keyCode == KeyEvent.KEYCODE_DPAD_UP -> { vm.audioEngine.adjustVolumeStep(true); return true }
-            ctrl && keyCode == KeyEvent.KEYCODE_DPAD_DOWN -> { vm.audioEngine.adjustVolumeStep(false); return true }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                perms.add(Manifest.permission.READ_MEDIA_AUDIO)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
         }
-        return super.onKeyDown(keyCode, event)
+        if (perms.isNotEmpty()) permLauncher.launch(perms.toTypedArray())
     }
 }
 
 @Composable
-private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
-    val snackbarHostState = remember { SnackbarHostState() }
+fun SonifyRootApp(state: UiState, vm: AppViewModel) {
     val str = state.strings
-
-    BackHandler(enabled = state.showNowPlaying || state.showSettings || state.openedArtist != null || state.openedPlaylist != null || state.selectedTab != MainTab.HOME) {
-        when {
-            state.showNowPlaying -> vm.setShowNowPlaying(false)
-            state.showSettings && state.settingsSection != SettingsSection.ROOT -> vm.setSettingsSection(SettingsSection.ROOT)
-            state.showSettings -> vm.setShowSettings(false)
-            state.openedArtist != null -> vm.closeArtistPage()
-            state.openedPlaylist != null -> vm.openPlaylist(null)
-            state.selectedTab != MainTab.HOME -> vm.selectTab(MainTab.HOME)
-        }
-    }
+    val isEn = str.isEn
+    val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(state.statusMessage) {
         val msg = state.statusMessage ?: return@LaunchedEffect
@@ -109,94 +80,179 @@ private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
         vm.clearStatus()
     }
 
-    val openedPlaylist = state.openedPlaylist
-    val openedArtist = state.openedArtist
-    val webHostedInNowPlaying = state.isUsingWebEngine && state.showNowPlaying && state.isVideoMode
-
-    Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
-        if (state.isUsingWebEngine && !webHostedInNowPlaying) {
-            AndroidView(
-                factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
-                update = { container -> vm.audioEngine.attachWebView(container) },
-                modifier = Modifier.size(260.dp)
-            )
-        }
-
-        Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
-            when {
-                state.showSettings -> SettingsScreen(state, vm)
-                openedArtist != null -> ArtistPageScreen(openedArtist, state, vm)
-                openedPlaylist != null -> PlaylistDetailScreen(openedPlaylist, state, vm)
-                else -> when (state.selectedTab) {
-                    MainTab.HOME -> HomeScreen(state, vm)
-                    MainTab.SEARCH -> SearchScreen(state, vm)
-                    MainTab.LIBRARY -> LibraryScreen(state, vm)
-                }
+    // Hardware Back navigation priority stack
+    BackHandler(
+        enabled = state.showNowPlaying || state.showSettings || state.openedArtist != null || state.openedPlaylist != null || state.selectedTab != MainTab.HOME
+    ) {
+        when {
+            state.showNowPlaying -> vm.setShowNowPlaying(false)
+            state.showSettings -> {
+                if (state.settingsSection != SettingsSection.ROOT) vm.setSettingsSection(SettingsSection.ROOT)
+                else vm.setShowSettings(false)
             }
+            state.openedArtist != null -> vm.closeArtistPage()
+            state.openedPlaylist != null -> vm.openPlaylist(null)
+            state.selectedTab != MainTab.HOME -> vm.selectTab(MainTab.HOME)
         }
+    }
 
-        if (!state.showSettings) {
-            Column(
-                modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth()
-                    .background(Brush.verticalGradient(listOf(Color.Transparent, SpotifyBlack.copy(alpha = 0.94f), SpotifyBlack)))
-                    .navigationBarsPadding()
-            ) {
-                if (state.currentTrack != null && !state.showNowPlaying) {
-                    FloatingMiniPlayer(state, vm)
+    val darkColors = darkColorScheme(
+        primary = SpotifyGreen,
+        onPrimary = Color.Black,
+        background = SpotifyBlack,
+        surface = SpotifyDarkSurface,
+        onBackground = SpotifyWhite,
+        onSurface = SpotifyWhite
+    )
+
+    CompositionLocalProvider(LocalLayoutDirection provides if (isEn) LayoutDirection.Ltr else LayoutDirection.Rtl) {
+        MaterialTheme(colorScheme = darkColors) {
+            Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
+
+                // Keeps WebPlaybackEngine permanently attached for seamless audio & screen-off playback whenever video viewport is hidden
+                if (!(state.showNowPlaying && state.isVideoMode)) {
+                    AndroidView(
+                        factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
+                        update = { vm.audioEngine.attachWebView(it) },
+                        modifier = Modifier.size(1.dp).alpha(0.01f)
+                    )
                 }
 
-                Row(modifier = Modifier.fillMaxWidth().height(60.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                    val onHome = state.selectedTab == MainTab.HOME && openedPlaylist == null && openedArtist == null
-                    val onSearch = state.selectedTab == MainTab.SEARCH && openedPlaylist == null && openedArtist == null
-                    BottomNavItem(str.home, if (onHome) Icons.Rounded.Home else Icons.Outlined.Home, onHome) { vm.selectTab(MainTab.HOME) }
-                    BottomNavItem(str.search, if (onSearch) Icons.Rounded.Search else Icons.Outlined.Search, onSearch) { vm.selectTab(MainTab.SEARCH) }
-                    BottomNavItem(str.yourLibrary, if (state.selectedTab == MainTab.LIBRARY) Icons.Rounded.LibraryMusic else Icons.Outlined.LibraryMusic, state.selectedTab == MainTab.LIBRARY) { vm.selectTab(MainTab.LIBRARY) }
-                    if (state.settings.showCreateNavButton) {
-                        BottomNavItem(str.create, Icons.Rounded.Add, false) { vm.setShowCreateSheet(true) }
+                // Main Content Layer
+                when {
+                    state.showSettings -> SettingsScreen(state, vm)
+                    state.openedArtist != null -> ArtistPageScreen(state.openedArtist, state, vm)
+                    state.openedPlaylist != null -> PlaylistDetailScreen(state.openedPlaylist, state, vm)
+                    else -> when (state.selectedTab) {
+                        MainTab.HOME -> HomeScreen(state, vm)
+                        MainTab.SEARCH -> SearchScreen(state, vm)
+                        MainTab.LIBRARY -> LibraryScreen(state, vm)
                     }
                 }
+
+                // Bottom Overlay: Floating Mini-Player + Spotify Custom Navigation Bar
+                if (!state.showSettings && !state.showNowPlaying) {
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .background(
+                                Brush.verticalGradient(
+                                    0f to Color.Transparent,
+                                    0.35f to SpotifyBlack.copy(alpha = 0.92f),
+                                    1f to SpotifyBlack
+                                )
+                            )
+                            .navigationBarsPadding()
+                    ) {
+                        if (state.currentTrack != null) {
+                            FloatingMiniPlayer(state = state, vm = vm)
+                        }
+                        SpotifyBottomNavBar(state = state, vm = vm)
+                    }
+                }
+
+                // Smooth Spotify Slide-Up Now Playing Screen
+                AnimatedVisibility(
+                    visible = state.showNowPlaying && state.currentTrack != null,
+                    enter = slideInVertically(initialOffsetY = { it / 2 }) + fadeIn(),
+                    exit = slideOutVertically(targetOffsetY = { it / 2 }) + fadeOut()
+                ) {
+                    NowPlayingScreen(state = state, vm = vm)
+                }
+
+                // Global Modals & Sheets
+                if (state.showDevicesSheet) DevicesBottomSheet(state, vm)
+                if (state.showCreateSheet) CreateHubSheet(state, vm)
+                if (state.showStatsSheet) StatsWrappedSheet(state, vm)
+                if (state.showHistorySheet) ListeningHistorySheet(state, vm)
+                if (state.showMessagesSheet) MessagesAndFriendsSheet(state, vm)
+                if (state.showImportSheet) ImportPlaylistSheet(vm, str)
+                if (state.showRecoverSheet) RecoverPlaylistsSheet(state, vm)
+                state.trackForOptions?.let { trk -> TrackOptionsBottomSheet(trk, state, vm) }
+                state.showCodeSheetFor?.let { (title, code) ->
+                    VisualCodeSheet(title = title, codeData = code, vm = vm, str = str, onDismiss = { vm.setShowCodeFor(null) })
+                }
+                state.editingCoverPlaylistId?.let { plId ->
+                    state.playlists.firstOrNull { it.id == plId }?.let { pl -> CoverArtCreatorSheet(pl, vm, str) }
+                }
+
+                // AI Playlist Generation Progress Pill
+                if (state.isBuildingAiPlaylist) {
+                    Card(
+                        modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp),
+                        shape = RoundedCornerShape(50),
+                        colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface)
+                    ) {
+                        Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(color = SpotifyGreen, strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Text(str.t("ה-AI בונה את הפלייליסט שלך...", "AI is building your playlist..."), color = SpotifyWhite, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+
+                SnackbarHost(
+                    hostState = snackbarHostState,
+                    modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 132.dp)
+                )
             }
-        }
-
-        AnimatedVisibility(
-            visible = state.showNowPlaying && state.currentTrack != null,
-            enter = slideInVertically { it }, exit = slideOutVertically { it }
-        ) {
-            NowPlayingScreen(state, vm)
-        }
-
-        if (state.showCreateSheet) CreateBottomSheet(state, vm)
-        if (state.showDevicesSheet) DevicesBottomSheet(state, vm)
-        if (state.showStatsSheet) StatsWrappedSheet(state, vm)
-        if (state.showHistorySheet) ListeningHistorySheet(state, vm)
-        if (state.showMessagesSheet) MessagesAndFriendsSheet(state, vm)
-        if (state.showImportSheet) ImportPlaylistSheet(vm, str)
-        if (state.showRecoverSheet) RecoverPlaylistsSheet(state, vm)
-        state.showCodeSheetFor?.let { (t, c) -> VisualCodeSheet(t, c, vm, str) { vm.setShowCodeFor(null) } }
-        state.editingCoverPlaylistId?.let { id ->
-            state.playlists.firstOrNull { it.id == id }?.let { pl -> CoverArtCreatorSheet(pl, vm, str) }
-        }
-        state.trackForOptions?.let { track -> TrackOptionsBottomSheet(track, state, vm) }
-
-        if (state.isBuildingAiPlaylist) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter).statusBarsPadding(), color = SpotifyGreen, trackColor = SpotifyCard)
-        }
-
-        SnackbarHost(
-            hostState = snackbarHostState,
-            modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding()
-                .padding(bottom = if (state.showNowPlaying || state.showSettings) 16.dp else 132.dp, start = 16.dp, end = 16.dp)
-        ) { data ->
-            Snackbar(snackbarData = data, containerColor = SpotifyElevated, contentColor = SpotifyWhite, shape = RoundedCornerShape(10.dp))
         }
     }
 }
 
 @Composable
-private fun BottomNavItem(label: String, icon: ImageVector, selected: Boolean, onClick: () -> Unit) {
-    Column(modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Icon(icon, contentDescription = label, tint = if (selected) SpotifyWhite else SpotifySubtle, modifier = Modifier.size(24.dp))
-        Spacer(Modifier.height(2.dp))
-        Text(label, color = if (selected) SpotifyWhite else SpotifySubtle, fontSize = 10.sp)
+private fun SpotifyBottomNavBar(state: UiState, vm: AppViewModel) {
+    val str = state.strings
+    val isTopLevel = state.openedPlaylist == null && state.openedArtist == null
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceAround,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        NavItemBox(
+            label = str.home,
+            selected = isTopLevel && state.selectedTab == MainTab.HOME,
+            onClick = { vm.selectTab(MainTab.HOME) }
+        ) { sel, tint -> SpotifyNavHomeIcon(sel, tint, size = 23.dp) }
+
+        NavItemBox(
+            label = str.search,
+            selected = isTopLevel && state.selectedTab == MainTab.SEARCH,
+            onClick = { vm.selectTab(MainTab.SEARCH) }
+        ) { sel, tint -> SpotifyNavSearchIcon(sel, tint, size = 23.dp) }
+
+        NavItemBox(
+            label = str.yourLibrary,
+            selected = isTopLevel && state.selectedTab == MainTab.LIBRARY,
+            onClick = { vm.selectTab(MainTab.LIBRARY) }
+        ) { sel, tint -> SpotifyNavLibraryIcon(sel, tint, size = 23.dp) }
+
+        if (state.settings.showCreateNavButton) {
+            NavItemBox(
+                label = str.create,
+                selected = state.showCreateSheet,
+                onClick = { vm.setShowCreateSheet(true) }
+            ) { _, tint -> SpotifyNavCreateIcon(tint, size = 23.dp) }
+        }
+    }
+}
+
+@Composable
+private fun NavItemBox(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    icon: @Composable (Boolean, Color) -> Unit
+) {
+    val tint = if (selected) SpotifyWhite else SpotifySubtle
+    Column(
+        modifier = Modifier.spotifyPressClickable(pressedScale = 0.90f, onClick = onClick).padding(horizontal = 12.dp, vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        icon(selected, tint)
+        Spacer(Modifier.height(4.dp))
+        Text(label, color = tint, fontSize = 10.5.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium)
     }
 }
