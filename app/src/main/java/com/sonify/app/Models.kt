@@ -2,42 +2,77 @@ package com.sonify.app
 
 import java.util.UUID
 
+// Global HD Artwork Upgrader (fixes blurry 120px thumbnails everywhere!)
+fun upgradeArtworkUrlGlobal(url: String): String {
+    if (url.isBlank()) return ""
+    if (url.contains("googleusercontent.com") || url.contains("ggpht.com")) {
+        return when {
+            Regex("=w\\d+-h\\d+").containsMatchIn(url) ->
+                url.replace(Regex("=w\\d+-h\\d+.*"), "=w1080-h1080-l95-rj")
+            Regex("=s\\d+").containsMatchIn(url) ->
+                url.replace(Regex("=s\\d+.*"), "=s1080-c-k-c0x00ffffff-no-rj")
+            else -> url
+        }
+    }
+    if (url.contains("i.ytimg.com/vi/")) {
+        val clean = url.substringBefore("?")
+        val vid = clean.substringAfter("i.ytimg.com/vi/").substringBefore("/")
+        if (vid.length == 11) return "https://i.ytimg.com/vi/$vid/maxresdefault.jpg"
+    }
+    return url
+}
+
 enum class MainTab { HOME, SEARCH, LIBRARY }
 enum class AppLanguage(val label: String, val code: String) {
     HEBREW("עברית", "he"),
     ENGLISH("English", "en")
 }
 
-enum class HomeFilter(val label: String) {
-    ALL("הכל"),
-    MUSIC("מוזיקה"),
-    PODCASTS("פודקאסטים"),
-    AUDIOBOOKS("ספרי שמע")
+enum class SettingsSection {
+    ROOT,
+    UI_LANGUAGE,
+    STREAM_QUALITY,
+    PLAYBACK_AUDIO,
+    EQUALIZER,
+    PRIVACY_TASTE,
+    STORAGE_OFFLINE,
+    AI_NOTIFICATIONS
 }
 
-enum class SearchMode(val label: String) {
-    SONGS("שירים"),
-    PLAYLISTS("פלייליסטים"),
-    PODCASTS("פודקאסטים"),
-    AUDIOBOOKS("ספרי שמע")
+enum class HomeFilter(val labelHe: String, val labelEn: String) {
+    ALL("הכל", "All"),
+    MUSIC("מוזיקה", "Music"),
+    PODCASTS("פודקאסטים", "Podcasts"),
+    AUDIOBOOKS("ספרי שמע", "Audiobooks");
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
 }
 
-enum class LibraryFilter(val label: String) {
-    ALL("הכל"),
-    PLAYLISTS("פלייליסטים"),
-    FOLDERS("תיקיות"),
-    OFFLINE("הורדות אופליין"),
-    ARTISTS("אמנים"),
-    ALBUMS("אלבומים"),
-    PODCASTS("פודקאסטים")
+enum class SearchMode(val labelHe: String, val labelEn: String) {
+    SONGS("שירים", "Songs"),
+    PLAYLISTS("פלייליסטים", "Playlists"),
+    PODCASTS("פודקאסטים", "Podcasts"),
+    AUDIOBOOKS("ספרי שמע", "Audiobooks");
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
 }
 
-enum class LibrarySort(val label: String) {
-    RECENT("אחרונים"),
-    DATE_ADDED("תאריך הוספה"),
-    ALPHA("א'-ב'"),
-    CREATOR("יוצר"),
-    CUSTOM("סדר מותאם")
+enum class LibraryFilter(val labelHe: String, val labelEn: String) {
+    ALL("הכל", "All"),
+    PLAYLISTS("פלייליסטים", "Playlists"),
+    FOLDERS("תיקיות", "Folders"),
+    OFFLINE("הורדות אופליין", "Downloaded"),
+    ARTISTS("אמנים", "Artists"),
+    ALBUMS("אלבומים", "Albums"),
+    PODCASTS("פודקאסטים", "Podcasts");
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
+}
+
+enum class LibrarySort(val labelHe: String, val labelEn: String) {
+    RECENT("אחרונים", "Recents"),
+    DATE_ADDED("תאריך הוספה", "Recently Added"),
+    ALPHA("א'-ב'", "Alphabetical"),
+    CREATOR("יוצר", "Creator"),
+    CUSTOM("סדר מותאם", "Custom");
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
 }
 
 enum class StreamSource(val label: String, val subtitle: String) {
@@ -52,12 +87,12 @@ enum class YouTubeEngineMode(val label: String, val subtitle: String) {
     EXOPLAYER_ONLY("ExoPlayer בלבד", "הזרמה ישירה בלבד (אקולייזר 10 ערוצים, מונו ואיזון)")
 }
 
-enum class AudioQuality(val label: String, val kbps: Int) {
-    LOW("נמוכה (24kbps)", 24),
-    NORMAL("רגילה (96kbps)", 96),
-    HIGH("גבוהה (160kbps)", 160),
-    VERY_HIGH("גבוהה מאוד (320kbps)", 320),
-    LOSSLESS("Lossless (FLAC 24-bit/44.1kHz)", 1411)
+enum class AudioQuality(val label: String, val shortLabel: String, val kbps: Int) {
+    LOW("נמוכה (24kbps)", "נמוכה", 24),
+    NORMAL("רגילה (96kbps)", "רגילה", 96),
+    HIGH("גבוהה (160kbps)", "גבוהה", 160),
+    VERY_HIGH("גבוהה מאוד (320kbps)", "גבוהה מאוד", 320),
+    LOSSLESS("Lossless (FLAC 24-bit/44.1kHz)", "Lossless", 1411)
 }
 
 enum class NormalizationLevel(val label: String, val gainMb: Int) {
@@ -96,6 +131,7 @@ data class CapturedMediaStream(
     val url: String,
     val userAgent: String,
     val cookie: String? = null,
+    val isAudioOnly: Boolean = true,
     val capturedAt: Long = System.currentTimeMillis()
 )
 
@@ -103,7 +139,7 @@ data class ResolvedStreams(
     val audioUrl: String,
     val videoUrl: String? = null,
     val videoOnlyUrl: String? = null,
-    val userAgent: String = "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+    val userAgent: String = "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
     val cookie: String? = null,
     val isLossless: Boolean = false,
     val isOffline: Boolean = false,
@@ -167,12 +203,9 @@ data class ListeningStats(
 )
 
 data class AppSettings(
-    // UI & Micro-interactions
     val language: AppLanguage = AppLanguage.HEBREW,
     val showCreateNavButton: Boolean = true,
     val showUnplayableSongs: Boolean = true,
-
-    // Playback & Audio
     val streamSource: StreamSource = StreamSource.YOUTUBE,
     val ytEngineMode: YouTubeEngineMode = YouTubeEngineMode.AUTO,
     val wifiQuality: AudioQuality = AudioQuality.VERY_HIGH,
@@ -189,17 +222,15 @@ data class AppSettings(
     val automixEnabled: Boolean = false,
     val crossfadeSeconds: Int = 0,
     val monoAudio: Boolean = false,
-    val audioBalance: Float = 0f, // -1f Left .. 0f Center .. +1f Right
+    val audioBalance: Float = 0f,
     val autoplayEnabled: Boolean = true,
-    val playbackSpeed: Float = 1.0f, // 0.5x .. 3.5x
+    val playbackSpeed: Float = 1.0f,
     val audioOnlyPodcasts: Boolean = true,
     val eqEnabled: Boolean = false,
     val eqPresetIndex: Int = 0,
     val eqBands: List<Int> = listOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     val canvasEnabled: Boolean = true,
     val autoVideoOnWifi: Boolean = false,
-
-    // Privacy, Data & Storage
     val dataSaver: Boolean = false,
     val downloadUsingCellular: Boolean = true,
     val offlineMode: Boolean = false,
@@ -228,8 +259,13 @@ data class JamState(
 
 data class BrowseCategory(
     val title: String,
+    val titleEn: String,
     val query: String,
     val colorHex: Long,
     val group: String,
+    val groupEn: String,
     val searchMode: SearchMode = SearchMode.SONGS
-)
+) {
+    fun displayTitle(isEn: Boolean) = if (isEn) titleEn else title
+    fun displayGroup(isEn: Boolean) = if (isEn) groupEn else group
+}
