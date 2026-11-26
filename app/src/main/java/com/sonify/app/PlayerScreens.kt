@@ -1,9 +1,10 @@
-@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class, UnstableApi::class)
+@file:kotlin.OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@file:androidx.annotation.OptIn(UnstableApi::class)
 
 package com.sonify.app
 
 import android.content.Intent
-import androidx.annotation.OptIn
+
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
