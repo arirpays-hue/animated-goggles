@@ -12,8 +12,8 @@ android {
         applicationId = "com.sonify.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "5.0.0"
+        versionCode = 6
+        versionName = "6.0.0"
     }
 
     signingConfigs {
@@ -67,7 +67,6 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 
-    // Media3 (ExoPlayer + HLS + OkHttp HTTP/2 + Session for Lock Screen / Auto / Wear)
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
     implementation("androidx.media3:media3-datasource-okhttp:1.4.1")
@@ -75,7 +74,6 @@ dependencies {
     implementation("androidx.media3:media3-session:1.4.1")
     implementation("androidx.media3:media3-common:1.4.1")
 
-    // Networking, Images & Dynamic Colors
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("androidx.palette:palette-ktx:1.0.0")
