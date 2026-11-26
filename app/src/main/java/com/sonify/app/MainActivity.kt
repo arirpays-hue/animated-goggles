@@ -3,6 +3,7 @@ package com.sonify.app
 import android.Manifest
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -61,19 +62,36 @@ class MainActivity : ComponentActivity() {
         permissionLauncher.launch(perms.toTypedArray())
 
         setContent {
-            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+            val state by vm.uiState.collectAsState()
+            val dir = if (state.settings.language == AppLanguage.HEBREW) LayoutDirection.Rtl else LayoutDirection.Ltr
+            CompositionLocalProvider(LocalLayoutDirection provides dir) {
                 SonifyTheme {
-                    SonifyAppRoot(vm)
+                    SonifyAppRoot(vm, state)
                 }
             }
         }
     }
+
+    // Hardware Keyboard Shortcuts (Space = Play/Pause, Ctrl+Arrows = Next/Prev/Volume)
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val ctrl = event?.isCtrlPressed == true
+        when {
+            keyCode == KeyEvent.KEYCODE_SPACE && vm.uiState.value.currentTrack != null && !vm.uiState.value.showSettings -> {
+                vm.togglePlayPause(); return true
+            }
+            ctrl && keyCode == KeyEvent.KEYCODE_DPAD_RIGHT -> { vm.skipNext(); return true }
+            ctrl && keyCode == KeyEvent.KEYCODE_DPAD_LEFT -> { vm.skipPrevious(); return true }
+            ctrl && keyCode == KeyEvent.KEYCODE_DPAD_UP -> { vm.audioEngine.adjustVolumeStep(true); return true }
+            ctrl && keyCode == KeyEvent.KEYCODE_DPAD_DOWN -> { vm.audioEngine.adjustVolumeStep(false); return true }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
 }
 
 @Composable
-private fun SonifyAppRoot(vm: AppViewModel) {
-    val state by vm.uiState.collectAsState()
+private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
     val snackbarHostState = remember { SnackbarHostState() }
+    val isEn = state.settings.language == AppLanguage.ENGLISH
 
     BackHandler(enabled = state.showNowPlaying || state.showSettings || state.openedPlaylist != null || state.selectedTab != MainTab.HOME) {
         when {
@@ -94,8 +112,7 @@ private fun SonifyAppRoot(vm: AppViewModel) {
     val webHostedInNowPlaying = state.isUsingWebEngine && state.showNowPlaying && state.isVideoMode
 
     Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
-        // Layer 0: Full 260dp x 260dp opaque WebView host (passes YouTube's >=200px viewport check)
-        // Drawn BEHIND the opaque app surface below so it is completely invisible in Audio mode.
+        // Layer 0: 260dp opaque WebView host behind app surface (passes YouTube viewport check)
         if (state.isUsingWebEngine && !webHostedInNowPlaying) {
             AndroidView(
                 factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
@@ -104,7 +121,7 @@ private fun SonifyAppRoot(vm: AppViewModel) {
             )
         }
 
-        // Layer 1: Opaque main app content
+        // Layer 1: Main Opaque Surface
         Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
             when {
                 state.showSettings -> SettingsScreen(state, vm)
@@ -119,9 +136,7 @@ private fun SonifyAppRoot(vm: AppViewModel) {
 
         if (!state.showSettings) {
             Column(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
+                modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth()
                     .background(Brush.verticalGradient(listOf(Color.Transparent, SpotifyBlack.copy(alpha = 0.94f), SpotifyBlack)))
                     .navigationBarsPadding()
             ) {
@@ -130,24 +145,35 @@ private fun SonifyAppRoot(vm: AppViewModel) {
                 }
 
                 Row(modifier = Modifier.fillMaxWidth().height(60.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                    BottomNavItem("בית", if (state.selectedTab == MainTab.HOME && openedPlaylist == null) Icons.Rounded.Home else Icons.Outlined.Home, state.selectedTab == MainTab.HOME && openedPlaylist == null) { vm.selectTab(MainTab.HOME) }
-                    BottomNavItem("חיפוש", if (state.selectedTab == MainTab.SEARCH && openedPlaylist == null) Icons.Rounded.Search else Icons.Outlined.Search, state.selectedTab == MainTab.SEARCH && openedPlaylist == null) { vm.selectTab(MainTab.SEARCH) }
-                    BottomNavItem("הספרייה שלך", if (state.selectedTab == MainTab.LIBRARY) Icons.Rounded.LibraryMusic else Icons.Outlined.LibraryMusic, state.selectedTab == MainTab.LIBRARY) { vm.selectTab(MainTab.LIBRARY) }
-                    BottomNavItem("יצירה", Icons.Rounded.Add, false) { vm.setShowCreateSheet(true) }
+                    BottomNavItem(if (isEn) "Home" else "בית", if (state.selectedTab == MainTab.HOME && openedPlaylist == null) Icons.Rounded.Home else Icons.Outlined.Home, state.selectedTab == MainTab.HOME && openedPlaylist == null) { vm.selectTab(MainTab.HOME) }
+                    BottomNavItem(if (isEn) "Search" else "חיפוש", if (state.selectedTab == MainTab.SEARCH && openedPlaylist == null) Icons.Rounded.Search else Icons.Outlined.Search, state.selectedTab == MainTab.SEARCH && openedPlaylist == null) { vm.selectTab(MainTab.SEARCH) }
+                    BottomNavItem(if (isEn) "Your Library" else "הספרייה שלך", if (state.selectedTab == MainTab.LIBRARY) Icons.Rounded.LibraryMusic else Icons.Outlined.LibraryMusic, state.selectedTab == MainTab.LIBRARY) { vm.selectTab(MainTab.LIBRARY) }
+                    if (state.settings.showCreateNavButton) {
+                        BottomNavItem(if (isEn) "Create" else "יצירה", Icons.Rounded.Add, false) { vm.setShowCreateSheet(true) }
+                    }
                 }
             }
         }
 
         AnimatedVisibility(
             visible = state.showNowPlaying && state.currentTrack != null,
-            enter = slideInVertically { it },
-            exit = slideOutVertically { it }
+            enter = slideInVertically { it }, exit = slideOutVertically { it }
         ) {
             NowPlayingScreen(state, vm)
         }
 
+        // All Modals & Sheets
         if (state.showCreateSheet) CreateBottomSheet(state, vm)
         if (state.showDevicesSheet) DevicesBottomSheet(state, vm)
+        if (state.showStatsSheet) StatsWrappedSheet(state, vm)
+        if (state.showHistorySheet) ListeningHistorySheet(state, vm)
+        if (state.showMessagesSheet) MessagesAndFriendsSheet(state, vm)
+        if (state.showImportSheet) ImportPlaylistSheet(vm)
+        if (state.showRecoverSheet) RecoverPlaylistsSheet(state, vm)
+        state.showCodeSheetFor?.let { (t, c) -> VisualCodeSheet(t, c) { vm.setShowCodeFor(null) } }
+        state.editingCoverPlaylistId?.let { id ->
+            state.playlists.firstOrNull { it.id == id }?.let { pl -> CoverArtCreatorSheet(pl, vm) }
+        }
         state.trackForOptions?.let { track -> TrackOptionsBottomSheet(track, state, vm) }
 
         if (state.isBuildingAiPlaylist) {
@@ -156,9 +182,7 @@ private fun SonifyAppRoot(vm: AppViewModel) {
 
         SnackbarHost(
             hostState = snackbarHostState,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
+            modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding()
                 .padding(bottom = if (state.showNowPlaying || state.showSettings) 16.dp else 132.dp, start = 16.dp, end = 16.dp)
         ) { data ->
             Snackbar(snackbarData = data, containerColor = SpotifyElevated, contentColor = SpotifyWhite, shape = RoundedCornerShape(10.dp))
