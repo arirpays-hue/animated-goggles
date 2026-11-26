@@ -90,13 +90,14 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
     val snackbarHostState = remember { SnackbarHostState() }
-    val isEn = state.settings.language == AppLanguage.ENGLISH
+    val str = state.strings
 
-    BackHandler(enabled = state.showNowPlaying || state.showSettings || state.openedPlaylist != null || state.selectedTab != MainTab.HOME) {
+    BackHandler(enabled = state.showNowPlaying || state.showSettings || state.openedArtist != null || state.openedPlaylist != null || state.selectedTab != MainTab.HOME) {
         when {
             state.showNowPlaying -> vm.setShowNowPlaying(false)
             state.showSettings && state.settingsSection != SettingsSection.ROOT -> vm.setSettingsSection(SettingsSection.ROOT)
             state.showSettings -> vm.setShowSettings(false)
+            state.openedArtist != null -> vm.closeArtistPage()
             state.openedPlaylist != null -> vm.openPlaylist(null)
             state.selectedTab != MainTab.HOME -> vm.selectTab(MainTab.HOME)
         }
@@ -109,6 +110,7 @@ private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
     }
 
     val openedPlaylist = state.openedPlaylist
+    val openedArtist = state.openedArtist
     val webHostedInNowPlaying = state.isUsingWebEngine && state.showNowPlaying && state.isVideoMode
 
     Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
@@ -123,6 +125,7 @@ private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
         Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
             when {
                 state.showSettings -> SettingsScreen(state, vm)
+                openedArtist != null -> ArtistPageScreen(openedArtist, state, vm)
                 openedPlaylist != null -> PlaylistDetailScreen(openedPlaylist, state, vm)
                 else -> when (state.selectedTab) {
                     MainTab.HOME -> HomeScreen(state, vm)
@@ -143,11 +146,13 @@ private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
                 }
 
                 Row(modifier = Modifier.fillMaxWidth().height(60.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                    BottomNavItem(if (isEn) "Home" else "בית", if (state.selectedTab == MainTab.HOME && openedPlaylist == null) Icons.Rounded.Home else Icons.Outlined.Home, state.selectedTab == MainTab.HOME && openedPlaylist == null) { vm.selectTab(MainTab.HOME) }
-                    BottomNavItem(if (isEn) "Search" else "חיפוש", if (state.selectedTab == MainTab.SEARCH && openedPlaylist == null) Icons.Rounded.Search else Icons.Outlined.Search, state.selectedTab == MainTab.SEARCH && openedPlaylist == null) { vm.selectTab(MainTab.SEARCH) }
-                    BottomNavItem(if (isEn) "Your Library" else "הספרייה שלך", if (state.selectedTab == MainTab.LIBRARY) Icons.Rounded.LibraryMusic else Icons.Outlined.LibraryMusic, state.selectedTab == MainTab.LIBRARY) { vm.selectTab(MainTab.LIBRARY) }
+                    val onHome = state.selectedTab == MainTab.HOME && openedPlaylist == null && openedArtist == null
+                    val onSearch = state.selectedTab == MainTab.SEARCH && openedPlaylist == null && openedArtist == null
+                    BottomNavItem(str.home, if (onHome) Icons.Rounded.Home else Icons.Outlined.Home, onHome) { vm.selectTab(MainTab.HOME) }
+                    BottomNavItem(str.search, if (onSearch) Icons.Rounded.Search else Icons.Outlined.Search, onSearch) { vm.selectTab(MainTab.SEARCH) }
+                    BottomNavItem(str.yourLibrary, if (state.selectedTab == MainTab.LIBRARY) Icons.Rounded.LibraryMusic else Icons.Outlined.LibraryMusic, state.selectedTab == MainTab.LIBRARY) { vm.selectTab(MainTab.LIBRARY) }
                     if (state.settings.showCreateNavButton) {
-                        BottomNavItem(if (isEn) "Create" else "יצירה", Icons.Rounded.Add, false) { vm.setShowCreateSheet(true) }
+                        BottomNavItem(str.create, Icons.Rounded.Add, false) { vm.setShowCreateSheet(true) }
                     }
                 }
             }
@@ -165,11 +170,11 @@ private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
         if (state.showStatsSheet) StatsWrappedSheet(state, vm)
         if (state.showHistorySheet) ListeningHistorySheet(state, vm)
         if (state.showMessagesSheet) MessagesAndFriendsSheet(state, vm)
-        if (state.showImportSheet) ImportPlaylistSheet(vm)
+        if (state.showImportSheet) ImportPlaylistSheet(vm, str)
         if (state.showRecoverSheet) RecoverPlaylistsSheet(state, vm)
-        state.showCodeSheetFor?.let { (t, c) -> VisualCodeSheet(t, c) { vm.setShowCodeFor(null) } }
+        state.showCodeSheetFor?.let { (t, c) -> VisualCodeSheet(t, c, vm, str) { vm.setShowCodeFor(null) } }
         state.editingCoverPlaylistId?.let { id ->
-            state.playlists.firstOrNull { it.id == id }?.let { pl -> CoverArtCreatorSheet(pl, vm) }
+            state.playlists.firstOrNull { it.id == id }?.let { pl -> CoverArtCreatorSheet(pl, vm, str) }
         }
         state.trackForOptions?.let { track -> TrackOptionsBottomSheet(track, state, vm) }
 
