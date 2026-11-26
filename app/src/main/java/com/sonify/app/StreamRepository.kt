@@ -25,10 +25,13 @@ class StreamRepository(private val context: Context) {
         .build()
 
     private val probeClient = OkHttpClient.Builder()
-        .connectTimeout(4, TimeUnit.SECONDS)
-        .readTimeout(4, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
+
+    @Volatile
+    private var cachedVisitorData: String? = null
 
     private val pipedInstances = listOf(
         "https://pipedapi.kavin.rocks",
@@ -59,6 +62,33 @@ class StreamRepository(private val context: Context) {
             ?: emptySet()
     }
 
+    private fun getOrFetchVisitorData(): String {
+        cachedVisitorData?.let { return it }
+        val fetched = runCatching {
+            val body = JSONObject().apply {
+                put("context", JSONObject().apply {
+                    put("client", JSONObject().apply {
+                        put("clientName", "WEB")
+                        put("clientVersion", "2.20250219.01.00")
+                        put("hl", "he")
+                        put("gl", "IL")
+                    })
+                })
+            }
+            val req = Request.Builder()
+                .url("https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")
+                .post(body.toString().toRequestBody("application/json".toMediaType()))
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use ""
+                JSONObject(resp.body?.string() ?: "").optJSONObject("responseContext")?.optString("visitorData").orEmpty()
+            }
+        }.getOrDefault("")
+        if (fetched.isNotBlank()) cachedVisitorData = fetched
+        return fetched
+    }
+
     // ---------- 1. Search Songs (YouTube Music Songs-Only First!) ----------
     suspend fun searchTracks(
         query: String,
@@ -78,7 +108,6 @@ class StreamRepository(private val context: Context) {
 
     private fun searchYouTubeSongsStrict(query: String, isPodcast: Boolean): List<Track> {
         val raw = if (!isPodcast) {
-            // Priority 1: YouTube Music "Songs" filter -> real 2-6 min tracks & crisp square covers
             runCatching { searchYouTubeMusicSongs(query) }.getOrDefault(emptyList())
                 .ifEmpty { runCatching { searchYouTubeWeb(query, false) }.getOrDefault(emptyList()) }
                 .ifEmpty { searchPiped(query, false) }
@@ -89,15 +118,10 @@ class StreamRepository(private val context: Context) {
         }
 
         if (isPodcast) return raw.distinctBy { it.id }.take(20)
-
-        // STRICT song filter: NEVER allow 1-2 hour mixes/compilations as a single song!
-        return raw.filter { isLikelySingleSong(it) }
-            .distinctBy { it.id }
-            .take(20)
+        return raw.filter { isLikelySingleSong(it) }.distinctBy { it.id }.take(20)
     }
 
     private fun isLikelySingleSong(t: Track): Boolean {
-        // Reject anything longer than 9.5 minutes or shorter than 35 seconds (if duration known)
         if (t.durationMs > 570_000L || (t.durationMs in 1L..35_000L)) return false
         val lower = t.title.lowercase()
         val bannedKeywords = listOf(
@@ -112,7 +136,6 @@ class StreamRepository(private val context: Context) {
     private fun searchYouTubeMusicSongs(query: String): List<Track> {
         val bodyJson = JSONObject().apply {
             put("query", query)
-            // YouTube Music official filter protobuf for "Songs" only
             put("params", "EgWKAQIIAWoKEAkQBRAKEAMQBA==")
             put("context", ytMusicContext())
         }
@@ -133,11 +156,10 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 2. Search REAL Playlists & Browse Their Individual Songs ----------
+    // ---------- 2. Search REAL Playlists & Browse Individual Songs ----------
     suspend fun searchPlaylists(query: String): List<RemotePlaylist> = withContext(Dispatchers.IO) {
         val bodyJson = JSONObject().apply {
             put("query", query)
-            // YouTube Music filter for Community Playlists
             put("params", "EgeKAQQoAEABagoQAxAEEAkQChAF")
             put("context", ytMusicContext())
         }
@@ -161,7 +183,6 @@ class StreamRepository(private val context: Context) {
 
         if (ytMusicRes.isNotEmpty()) return@withContext ytMusicRes
 
-        // Fallback: Piped playlist search
         val encoded = URLEncoder.encode(query, "UTF-8")
         for (base in pipedInstances) {
             val res = runCatching {
@@ -195,7 +216,6 @@ class StreamRepository(private val context: Context) {
         val browseId = if (playlistId.startsWith("VL") || playlistId.startsWith("MPRE")) playlistId else "VL$playlistId"
         val rawId = playlistId.removePrefix("VL")
 
-        // 1) YouTube Music browse API
         val bodyJson = JSONObject().apply {
             put("browseId", browseId)
             put("context", ytMusicContext())
@@ -220,7 +240,6 @@ class StreamRepository(private val context: Context) {
 
         if (ytMusicTracks.isNotEmpty()) return@withContext ytMusicTracks
 
-        // 2) Piped playlist tracks fallback
         for (base in pipedInstances) {
             val res = runCatching {
                 val pReq = Request.Builder().url("$base/playlists/$rawId").build()
@@ -299,8 +318,7 @@ class StreamRepository(private val context: Context) {
                         }
 
                         var durationMs = 0L
-                        val fixedCols = item.optJSONArray("fixedColumns")
-                        val fixedDur = fixedCols?.optJSONObject(0)
+                        val fixedDur = item.optJSONArray("fixedColumns")?.optJSONObject(0)
                             ?.optJSONObject("musicResponsiveListItemFixedColumnRenderer")
                             ?.optJSONObject("text")
                             ?.let { extractRunsText(it) }.orEmpty()
@@ -313,8 +331,7 @@ class StreamRepository(private val context: Context) {
                             }
                         }
 
-                        val artist = parts.firstOrNull { !it.contains("צפיות") && !it.contains("plays", true) && !it.contains("views", true) }
-                            ?: "אמן"
+                        val artist = parts.firstOrNull { !it.contains("צפיות") && !it.contains("plays", true) && !it.contains("views", true) } ?: "אמן"
                         val album = parts.getOrNull(1)?.takeIf { !it.contains("צפיות") && !it.contains("plays", true) } ?: ""
 
                         val thumbs = item.optJSONObject("thumbnail")
@@ -327,17 +344,7 @@ class StreamRepository(private val context: Context) {
                         val art = upgradeArtworkUrl(rawThumb.ifBlank { "https://i.ytimg.com/vi/$videoId/sddefault.jpg" })
 
                         if (title.isNotBlank()) {
-                            out.add(
-                                Track(
-                                    id = videoId,
-                                    title = title,
-                                    artist = artist,
-                                    album = album,
-                                    artworkUrl = art,
-                                    durationMs = durationMs,
-                                    source = StreamSource.YOUTUBE
-                                )
-                            )
+                            out.add(Track(id = videoId, title = title, artist = artist, album = album, artworkUrl = art, durationMs = durationMs, source = StreamSource.YOUTUBE))
                         }
                     }
                 } else {
@@ -357,35 +364,15 @@ class StreamRepository(private val context: Context) {
             is JSONObject -> {
                 if (node.has("musicResponsiveListItemRenderer")) {
                     val item = node.optJSONObject("musicResponsiveListItemRenderer") ?: return
-                    val browseId = item.optJSONObject("navigationEndpoint")
-                        ?.optJSONObject("browseEndpoint")
-                        ?.optString("browseId").orEmpty()
+                    val browseId = item.optJSONObject("navigationEndpoint")?.optJSONObject("browseEndpoint")?.optString("browseId").orEmpty()
                     if (browseId.startsWith("VL") || browseId.startsWith("PL") || browseId.startsWith("RDCLAK")) {
                         val flexCols = item.optJSONArray("flexColumns")
-                        val title = flexCols?.optJSONObject(0)
-                            ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
-                            ?.optJSONObject("text")
-                            ?.let { extractRunsText(it) }.orEmpty()
-                        val subtitle = flexCols?.optJSONObject(1)
-                            ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
-                            ?.optJSONObject("text")
-                            ?.let { extractRunsText(it) }.orEmpty()
-                        val thumbs = item.optJSONObject("thumbnail")
-                            ?.optJSONObject("musicThumbnailRenderer")
-                            ?.optJSONObject("thumbnail")
-                            ?.optJSONArray("thumbnails")
-                        val rawThumb = if (thumbs != null && thumbs.length() > 0) {
-                            thumbs.optJSONObject(thumbs.length() - 1)?.optString("url").orEmpty()
-                        } else ""
+                        val title = flexCols?.optJSONObject(0)?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")?.let { extractRunsText(it) }.orEmpty()
+                        val subtitle = flexCols?.optJSONObject(1)?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")?.let { extractRunsText(it) }.orEmpty()
+                        val thumbs = item.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer")?.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+                        val rawThumb = if (thumbs != null && thumbs.length() > 0) thumbs.optJSONObject(thumbs.length() - 1)?.optString("url").orEmpty() else ""
                         if (title.isNotBlank()) {
-                            out.add(
-                                RemotePlaylist(
-                                    id = browseId,
-                                    title = title,
-                                    subtitle = subtitle.ifBlank { "פלייליסט" },
-                                    artworkUrl = upgradeArtworkUrl(rawThumb)
-                                )
-                            )
+                            out.add(RemotePlaylist(id = browseId, title = title, subtitle = subtitle.ifBlank { "פלייליסט" }, artworkUrl = upgradeArtworkUrl(rawThumb)))
                         }
                     }
                 } else {
@@ -401,22 +388,16 @@ class StreamRepository(private val context: Context) {
 
     private fun upgradeArtworkUrl(url: String): String {
         if (url.isBlank()) return ""
-        if (url.contains("lh3.googleusercontent.com")) {
-            return url.replace(Regex("=w\\d+-h\\d+.*"), "=w544-h544-l90-rj")
-        }
+        if (url.contains("lh3.googleusercontent.com")) return url.replace(Regex("=w\\d+-h\\d+.*"), "=w544-h544-l90-rj")
         return url
     }
 
-    // Fallback Web Search
     private fun searchYouTubeWeb(query: String, isPodcast: Boolean): List<Track> {
         val bodyJson = JSONObject().apply {
             put("query", query)
             put("context", JSONObject().apply {
                 put("client", JSONObject().apply {
-                    put("clientName", "WEB")
-                    put("clientVersion", "2.20250201.00.00")
-                    put("hl", "he")
-                    put("gl", "IL")
+                    put("clientName", "WEB"); put("clientVersion", "2.20250201.00.00"); put("hl", "he"); put("gl", "IL")
                 })
             })
         }
@@ -425,12 +406,10 @@ class StreamRepository(private val context: Context) {
             .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             .build()
-
         return client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return emptyList()
-            val root = JSONObject(resp.body?.string() ?: return emptyList())
             val out = mutableListOf<Track>()
-            extractVideoRenderers(root, out, isPodcast)
+            extractVideoRenderers(JSONObject(resp.body?.string() ?: return emptyList()), out, isPodcast)
             out.distinctBy { it.id }
         }
     }
@@ -450,13 +429,9 @@ class StreamRepository(private val context: Context) {
                             if (id.length != 11) continue
                             add(
                                 Track(
-                                    id = id,
-                                    title = o.optString("title", "ללא שם"),
-                                    artist = o.optString("uploaderName", "אמן לא ידוע"),
+                                    id = id, title = o.optString("title", "ללא שם"), artist = o.optString("uploaderName", "אמן"),
                                     artworkUrl = upgradeArtworkUrl(o.optString("thumbnail").ifBlank { "https://i.ytimg.com/vi/$id/sddefault.jpg" }),
-                                    durationMs = o.optLong("duration", 0L) * 1000L,
-                                    source = StreamSource.YOUTUBE,
-                                    isPodcast = isPodcast
+                                    durationMs = o.optLong("duration", 0L) * 1000L, source = StreamSource.YOUTUBE, isPodcast = isPodcast
                                 )
                             )
                         }
@@ -483,13 +458,9 @@ class StreamRepository(private val context: Context) {
                             if (id.length != 11) continue
                             add(
                                 Track(
-                                    id = id,
-                                    title = o.optString("title", "ללא שם"),
-                                    artist = o.optString("author", "YouTube"),
+                                    id = id, title = o.optString("title", "ללא שם"), artist = o.optString("author", "YouTube"),
                                     artworkUrl = "https://i.ytimg.com/vi/$id/sddefault.jpg",
-                                    durationMs = o.optLong("lengthSeconds", 0L) * 1000L,
-                                    source = StreamSource.YOUTUBE,
-                                    isPodcast = isPodcast
+                                    durationMs = o.optLong("lengthSeconds", 0L) * 1000L, source = StreamSource.YOUTUBE, isPodcast = isPodcast
                                 )
                             )
                         }
@@ -510,22 +481,10 @@ class StreamRepository(private val context: Context) {
                     val id = v?.optString("videoId").orEmpty()
                     if (id.length == 11) {
                         val title = extractRunsText(v?.optJSONObject("title"))
-                        val artist = extractRunsText(v?.optJSONObject("ownerText"))
-                            .ifBlank { extractRunsText(v?.optJSONObject("shortBylineText")) }
-                            .ifBlank { "YouTube" }
+                        val artist = extractRunsText(v?.optJSONObject("ownerText")).ifBlank { extractRunsText(v?.optJSONObject("shortBylineText")) }.ifBlank { "YouTube" }
                         val durationText = v?.optJSONObject("lengthText")?.optString("simpleText").orEmpty()
                         if (title.isNotBlank()) {
-                            out.add(
-                                Track(
-                                    id = id,
-                                    title = title,
-                                    artist = artist,
-                                    artworkUrl = "https://i.ytimg.com/vi/$id/sddefault.jpg",
-                                    durationMs = parseDurationText(durationText),
-                                    source = StreamSource.YOUTUBE,
-                                    isPodcast = isPodcast
-                                )
-                            )
+                            out.add(Track(id = id, title = title, artist = artist, artworkUrl = "https://i.ytimg.com/vi/$id/sddefault.jpg", durationMs = parseDurationText(durationText), source = StreamSource.YOUTUBE, isPodcast = isPodcast))
                         }
                     }
                 } else {
@@ -544,9 +503,7 @@ class StreamRepository(private val context: Context) {
         val simple = obj.optString("simpleText")
         if (simple.isNotBlank()) return simple
         val runs = obj.optJSONArray("runs") ?: return ""
-        return buildString {
-            for (i in 0 until runs.length()) append(runs.optJSONObject(i)?.optString("text").orEmpty())
-        }
+        return buildString { for (i in 0 until runs.length()) append(runs.optJSONObject(i)?.optString("text").orEmpty()) }
     }
 
     private fun parseDurationText(text: String): Long {
@@ -558,25 +515,16 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 3. Verified Stream Resolution (No More 403 / Stuck on 0:00!) ----------
+    // ---------- 3. Strict Non-Wrapping Verified Stream Resolution ----------
     suspend fun resolveStreams(track: Track, settings: AppSettings, attemptIndex: Int = 0): ResolvedStreams? = withContext(Dispatchers.IO) {
         val offlineFile = getOfflineFile(track.id)
         if (offlineFile.exists() && offlineFile.length() > 1024) {
-            return@withContext ResolvedStreams(
-                audioUrl = offlineFile.toURI().toString(),
-                isLossless = track.source != StreamSource.YOUTUBE,
-                isOffline = true,
-                codecLabel = "OFFLINE"
-            )
+            return@withContext ResolvedStreams(audioUrl = offlineFile.toURI().toString(), isLossless = track.source != StreamSource.YOUTUBE, isOffline = true, codecLabel = "OFFLINE")
         }
 
         if (track.source == StreamSource.LOCAL && !track.localUri.isNullOrBlank()) {
             val isFlac = track.title.endsWith(".flac", true) || track.album.contains("FLAC", true)
-            return@withContext ResolvedStreams(
-                audioUrl = track.localUri,
-                isLossless = isFlac,
-                codecLabel = if (isFlac) "FLAC Lossless" else "LOCAL"
-            )
+            return@withContext ResolvedStreams(audioUrl = track.localUri, isLossless = isFlac, codecLabel = if (isFlac) "FLAC Lossless" else "LOCAL")
         }
 
         if (track.source == StreamSource.OPENSUBSONIC && settings.subsonicUrl.isNotBlank()) {
@@ -584,212 +532,121 @@ class StreamRepository(private val context: Context) {
             val formatParam = if (settings.quality == AudioQuality.LOSSLESS) "format=raw" else "maxBitRate=${settings.quality.kbps}"
             val base = settings.subsonicUrl.trimEnd('/')
             val url = "$base/rest/stream.view?id=${URLEncoder.encode(track.id, "UTF-8")}&$formatParam&$auth"
-            return@withContext ResolvedStreams(
-                audioUrl = url,
-                isLossless = settings.quality == AudioQuality.LOSSLESS,
-                codecLabel = if (settings.quality == AudioQuality.LOSSLESS) "FLAC Lossless" else "${settings.quality.kbps}kbps"
-            )
+            return@withContext ResolvedStreams(audioUrl = url, isLossless = settings.quality == AudioQuality.LOSSLESS, codecLabel = if (settings.quality == AudioQuality.LOSSLESS) "FLAC Lossless" else "${settings.quality.kbps}kbps")
         }
 
-        resolveYouTubeStreamsVerified(track.id, settings.quality, attemptIndex)
+        resolveYouTubeNonWrapping(track.id, settings.quality, attemptIndex)
     }
 
-    private fun verifyStreamReachable(url: String, userAgent: String): Boolean {
+    private fun verifyMediaStreamDeep(url: String, userAgent: String): Boolean {
         return runCatching {
+            if (url.contains(".m3u8", true) || url.contains("manifest/hls", true)) {
+                // Verify HLS manifest AND at least one inner media segment!
+                val req = Request.Builder().url(url).header("User-Agent", userAgent).build()
+                val text = probeClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return false
+                    resp.body?.string().orEmpty()
+                }
+                val firstSubUrl = text.lines().firstOrNull { it.startsWith("http") } ?: return false
+                return verifyMediaStreamDeep(firstSubUrl, userAgent)
+            }
+
+            // Direct media stream check: request 64KB chunk and verify non-HTML binary bytes
             val req = Request.Builder()
                 .url(url)
                 .header("User-Agent", userAgent)
-                .header("Range", "bytes=0-1023")
+                .header("Range", "bytes=0-65535")
                 .build()
             probeClient.newCall(req).execute().use { resp ->
-                resp.code in 200..299 || resp.code == 206
+                if (resp.code !in listOf(200, 206)) return false
+                val ct = resp.header("Content-Type").orEmpty().lowercase()
+                if (ct.contains("text/html") || ct.contains("application/json")) return false
+                val buf = ByteArray(2048)
+                val read = resp.body?.byteStream()?.read(buf) ?: 0
+                read > 256
             }
         }.getOrDefault(false)
     }
 
-    private fun resolveYouTubeStreamsVerified(videoId: String, quality: AudioQuality, startIndex: Int): ResolvedStreams? {
-        val clients = listOf("ANDROID_VR", "IOS", "TV_EMBEDDED")
-        val ordered = clients.drop(startIndex) + clients.take(startIndex.coerceAtMost(clients.size))
+    private fun resolveYouTubeNonWrapping(videoId: String, quality: AudioQuality, startAttempt: Int): ResolvedStreams? {
+        val visitorData = getOrFetchVisitorData()
+        val strategies: List<() -> ResolvedStreams?> = listOf(
+            { fetchInnerTubeClient(videoId, "ANDROID_VR", quality, visitorData, preferMuxed = false) },
+            { fetchInnerTubeClient(videoId, "ANDROID_VR", quality, visitorData, preferMuxed = true) },
+            { fetchInnerTubeClient(videoId, "IOS", quality, visitorData, preferMuxed = false) },
+            { fetchInnerTubeClient(videoId, "TV_EMBEDDED", quality, visitorData, preferMuxed = false) },
+            { fetchPipedStream(videoId, quality) },
+            { fetchInvidiousProxiedStream(videoId) }
+        )
 
-        for (clientType in ordered) {
-            val resolved = runCatching { fetchVerifiedClient(videoId, clientType, quality) }.getOrNull()
-            if (resolved != null) return resolved
-        }
-
-        // Fallback 1: Piped
-        for (base in pipedInstances) {
-            val resolved = runCatching {
-                val req = Request.Builder().url("$base/streams/$videoId").header("User-Agent", "Mozilla/5.0").build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use null
-                    val json = JSONObject(resp.body?.string() ?: return@use null)
-                    val audioArr = json.optJSONArray("audioStreams")
-                    val videoArr = json.optJSONArray("videoStreams")
-                    val hls = json.optString("hls").takeIf { it.startsWith("http") }
-
-                    val audioStreams = mutableListOf<Pair<Int, String>>()
-                    if (audioArr != null) {
-                        for (i in 0 until audioArr.length()) {
-                            val a = audioArr.optJSONObject(i) ?: continue
-                            val u = a.optString("url")
-                            val br = a.optInt("bitrate", 128000) / 1000
-                            if (u.startsWith("http")) audioStreams.add(br to u)
-                        }
-                    }
-                    val ua = "Mozilla/5.0"
-                    val pickedAudio = pickAudioByQuality(audioStreams, quality)
-                    val validAudio = when {
-                        pickedAudio != null && verifyStreamReachable(pickedAudio, ua) -> pickedAudio
-                        hls != null && verifyStreamReachable(hls, ua) -> hls
-                        else -> return@use null
-                    }
-
-                    var muxedVideo: String? = hls
-                    var videoOnly: String? = null
-                    if (videoArr != null) {
-                        for (i in 0 until videoArr.length()) {
-                            val v = videoArr.optJSONObject(i) ?: continue
-                            val vo = v.optBoolean("videoOnly", true)
-                            val u = v.optString("url")
-                            if (!u.startsWith("http")) continue
-                            if (!vo) { muxedVideo = u; break }
-                            else if (videoOnly == null) videoOnly = u
-                        }
-                    }
-                    ResolvedStreams(
-                        audioUrl = validAudio,
-                        videoUrl = muxedVideo,
-                        videoOnlyUrl = videoOnly,
-                        userAgent = ua,
-                        codecLabel = "${quality.kbps.coerceAtMost(256)}kbps"
-                    )
-                }
-            }.getOrNull()
-            if (resolved != null) return resolved
-        }
-
-        // Fallback 2: Invidious
-        for (base in invidiousInstances) {
-            val resolved = runCatching {
-                val req = Request.Builder().url("$base/api/v1/videos/$videoId").header("User-Agent", "Mozilla/5.0").build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use null
-                    val json = JSONObject(resp.body?.string() ?: return@use null)
-                    val formats = json.optJSONArray("formatStreams")
-                    val adaptive = json.optJSONArray("adaptiveFormats")
-                    var muxed: String? = null
-                    val audios = mutableListOf<Pair<Int, String>>()
-                    var videoOnly: String? = null
-
-                    if (formats != null) {
-                        for (i in 0 until formats.length()) {
-                            val f = formats.optJSONObject(i) ?: continue
-                            val u = f.optString("url")
-                            if (u.startsWith("http")) { muxed = u; audios.add(128 to u) }
-                        }
-                    }
-                    if (adaptive != null) {
-                        for (i in 0 until adaptive.length()) {
-                            val f = adaptive.optJSONObject(i) ?: continue
-                            val type = f.optString("type")
-                            val u = f.optString("url")
-                            if (!u.startsWith("http")) continue
-                            if (type.startsWith("audio/")) {
-                                val br = f.optString("bitrate").toIntOrNull()?.div(1000) ?: 128
-                                audios.add(br to u)
-                            } else if (type.startsWith("video/mp4") && videoOnly == null) {
-                                videoOnly = u
-                            }
-                        }
-                    }
-                    val ua = "Mozilla/5.0"
-                    val candidate = pickAudioByQuality(audios, quality) ?: muxed ?: return@use null
-                    if (!verifyStreamReachable(candidate, ua)) return@use null
-                    ResolvedStreams(
-                        audioUrl = candidate,
-                        videoUrl = muxed,
-                        videoOnlyUrl = videoOnly,
-                        userAgent = ua,
-                        codecLabel = "256kbps"
-                    )
-                }
-            }.getOrNull()
-            if (resolved != null) return resolved
+        // NEVER wrap around to already-failed strategies!
+        for (i in startAttempt until strategies.size) {
+            val res = runCatching { strategies[i]() }.getOrNull()
+            if (res != null) return res
         }
         return null
     }
 
-    private fun fetchVerifiedClient(videoId: String, clientType: String, quality: AudioQuality): ResolvedStreams? {
+    private fun fetchInnerTubeClient(
+        videoId: String,
+        clientType: String,
+        quality: AudioQuality,
+        visitorData: String,
+        preferMuxed: Boolean
+    ): ResolvedStreams? {
         val (clientObj, ua, idHeader, verHeader) = when (clientType) {
             "ANDROID_VR" -> Quad(
                 JSONObject().apply {
-                    put("clientName", "ANDROID_VR")
-                    put("clientVersion", "1.61.48")
-                    put("androidSdkVersion", 32)
-                    put("osName", "Android")
-                    put("osVersion", "12L")
-                    put("deviceMake", "Oculus")
-                    put("deviceModel", "Quest 3")
-                    put("hl", "he")
-                    put("gl", "IL")
+                    put("clientName", "ANDROID_VR"); put("clientVersion", "1.60.19")
+                    put("androidSdkVersion", 32); put("osName", "Android"); put("osVersion", "12L")
+                    put("deviceMake", "Oculus"); put("deviceModel", "Quest 3")
+                    put("hl", "he"); put("gl", "IL")
+                    if (visitorData.isNotBlank()) put("visitorData", visitorData)
                 },
-                "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-                "28",
-                "1.61.48"
+                "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                "28", "1.60.19"
             )
             "IOS" -> Quad(
                 JSONObject().apply {
-                    put("clientName", "IOS")
-                    put("clientVersion", "20.10.4")
-                    put("deviceMake", "Apple")
-                    put("deviceModel", "iPhone16,2")
-                    put("osName", "iPhone")
-                    put("osVersion", "18.3.2.22D82")
-                    put("hl", "he")
-                    put("gl", "IL")
+                    put("clientName", "IOS"); put("clientVersion", "20.10.4")
+                    put("deviceMake", "Apple"); put("deviceModel", "iPhone16,2")
+                    put("osName", "iPhone"); put("osVersion", "18.3.2.22D82")
+                    put("hl", "he"); put("gl", "IL")
+                    if (visitorData.isNotBlank()) put("visitorData", visitorData)
                 },
                 "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)",
-                "5",
-                "20.10.4"
+                "5", "20.10.4"
             )
             else -> Quad(
                 JSONObject().apply {
-                    put("clientName", "TVHTML5_SIMPLY_EMBEDDED_PLAYER")
-                    put("clientVersion", "2.0")
-                    put("hl", "he")
-                    put("gl", "IL")
+                    put("clientName", "TVHTML5_SIMPLY_EMBEDDED_PLAYER"); put("clientVersion", "2.0")
+                    put("hl", "he"); put("gl", "IL")
+                    if (visitorData.isNotBlank()) put("visitorData", visitorData)
                 },
                 "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
-                "85",
-                "2.0"
+                "85", "2.0"
             )
         }
 
         val contextObj = JSONObject().apply {
             put("client", clientObj)
-            if (clientType == "TV_EMBEDDED") {
-                put("thirdParty", JSONObject().apply { put("embedUrl", "https://www.youtube.com") })
-            }
+            if (clientType == "TV_EMBEDDED") put("thirdParty", JSONObject().apply { put("embedUrl", "https://www.youtube.com") })
         }
         val bodyJson = JSONObject().apply {
-            put("videoId", videoId)
-            put("contentCheckOk", true)
-            put("racyCheckOk", true)
-            put("context", contextObj)
+            put("videoId", videoId); put("contentCheckOk", true); put("racyCheckOk", true); put("context", contextObj)
         }
-        val req = Request.Builder()
+        val reqBuilder = Request.Builder()
             .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
             .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
             .header("User-Agent", ua)
             .header("X-YouTube-Client-Name", idHeader)
             .header("X-YouTube-Client-Version", verHeader)
-            .build()
+        if (visitorData.isNotBlank()) reqBuilder.header("X-Goog-Visitor-Id", visitorData)
 
-        return client.newCall(req).execute().use { resp ->
+        return client.newCall(reqBuilder.build()).execute().use { resp ->
             if (!resp.isSuccessful) return null
             val root = JSONObject(resp.body?.string() ?: return null)
-            val status = root.optJSONObject("playabilityStatus")?.optString("status")
-            if (status != null && status != "OK") return null
+            if (root.optJSONObject("playabilityStatus")?.optString("status") != "OK") return null
             val sd = root.optJSONObject("streamingData") ?: return null
             val hls = sd.optString("hlsManifestUrl").takeIf { it.startsWith("http") }
 
@@ -826,13 +683,13 @@ class StreamRepository(private val context: Context) {
             }
 
             val preferredAudio = pickAudioByQuality(audioCandidates, quality)
-            val verifiedAudio = when {
-                preferredAudio != null && verifyStreamReachable(preferredAudio, ua) -> preferredAudio
-                muxedVideoUrl != null && verifyStreamReachable(muxedVideoUrl, ua) -> muxedVideoUrl
-                hls != null && verifyStreamReachable(hls, ua) -> hls
-                else -> return null
-            }
+            val candidateList = if (preferMuxed) {
+                listOfNotNull(muxedVideoUrl, preferredAudio, hls)
+            } else {
+                listOfNotNull(preferredAudio, muxedVideoUrl, hls)
+            }.distinct()
 
+            val verifiedAudio = candidateList.firstOrNull { verifyMediaStreamDeep(it, ua) } ?: return null
             val bestVideoOnly = videoCandidates.sortedBy { it.first }.lastOrNull { it.first <= 720 }?.second
             val bestVideoOrHls = muxedVideoUrl ?: hls
 
@@ -841,7 +698,6 @@ class StreamRepository(private val context: Context) {
                 videoUrl = bestVideoOrHls,
                 videoOnlyUrl = bestVideoOnly,
                 userAgent = ua,
-                isLossless = false,
                 codecLabel = when (quality) {
                     AudioQuality.LOW -> "64kbps"
                     AudioQuality.NORMAL -> "128kbps"
@@ -849,6 +705,63 @@ class StreamRepository(private val context: Context) {
                 }
             )
         }
+    }
+
+    private fun fetchPipedStream(videoId: String, quality: AudioQuality): ResolvedStreams? {
+        val ua = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
+        for (base in pipedInstances) {
+            val res = runCatching {
+                val req = Request.Builder().url("$base/streams/$videoId").header("User-Agent", ua).build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    val json = JSONObject(resp.body?.string() ?: return@use null)
+                    val audioArr = json.optJSONArray("audioStreams")
+                    val videoArr = json.optJSONArray("videoStreams")
+                    val hls = json.optString("hls").takeIf { it.startsWith("http") }
+
+                    val audioStreams = mutableListOf<Pair<Int, String>>()
+                    if (audioArr != null) {
+                        for (i in 0 until audioArr.length()) {
+                            val a = audioArr.optJSONObject(i) ?: continue
+                            val u = a.optString("url")
+                            if (u.startsWith("http")) audioStreams.add((a.optInt("bitrate", 128000) / 1000) to u)
+                        }
+                    }
+                    val picked = pickAudioByQuality(audioStreams, quality)
+                    val validAudio = listOfNotNull(picked, hls).firstOrNull { verifyMediaStreamDeep(it, ua) } ?: return@use null
+                    var muxedVideo: String? = hls
+                    var videoOnly: String? = null
+                    if (videoArr != null) {
+                        for (i in 0 until videoArr.length()) {
+                            val v = videoArr.optJSONObject(i) ?: continue
+                            val u = v.optString("url")
+                            if (!u.startsWith("http")) continue
+                            if (!v.optBoolean("videoOnly", true)) { muxedVideo = u; break }
+                            else if (videoOnly == null) videoOnly = u
+                        }
+                    }
+                    ResolvedStreams(audioUrl = validAudio, videoUrl = muxedVideo, videoOnlyUrl = videoOnly, userAgent = ua, codecLabel = "Piped Proxy 256kbps")
+                }
+            }.getOrNull()
+            if (res != null) return res
+        }
+        return null
+    }
+
+    private fun fetchInvidiousProxiedStream(videoId: String): ResolvedStreams? {
+        val ua = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
+        for (base in invidiousInstances) {
+            // &local=true proxies the audio through Invidious server, bypassing cellular CGNAT 403!
+            val audioProxy = "$base/latest_version?id=$videoId&itag=140&local=true"
+            val videoProxy = "$base/latest_version?id=$videoId&itag=18&local=true"
+            if (verifyMediaStreamDeep(audioProxy, ua)) {
+                return ResolvedStreams(audioUrl = audioProxy, videoUrl = videoProxy, userAgent = ua, codecLabel = "Proxy AAC")
+            }
+            if (verifyMediaStreamDeep(videoProxy, ua)) {
+                return ResolvedStreams(audioUrl = videoProxy, videoUrl = videoProxy, userAgent = ua, codecLabel = "Proxy MP4")
+            }
+        }
+        return null
     }
 
     private data class Quad<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
@@ -863,7 +776,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 4. Smart AI Playlist Builder (Always Real Individual Songs!) ----------
+    // ---------- 4. Smart AI Playlist Builder ----------
     suspend fun buildAiPlaylist(prompt: String, settings: AppSettings): Pair<String, List<Track>> = withContext(Dispatchers.IO) {
         val cleanPrompt = prompt.trim()
 
@@ -882,7 +795,6 @@ class StreamRepository(private val context: Context) {
         val (playlistTitle, queries) = expandPromptIntoSmartQueries(cleanPrompt)
         val curated = mutableListOf<Track>()
         val seenTitles = mutableSetOf<String>()
-
         for (q in queries) {
             val results = searchTracks(q, settings, podcastsOnly = false)
             for (t in results) {
@@ -894,7 +806,6 @@ class StreamRepository(private val context: Context) {
             }
             if (curated.size >= 15) break
         }
-
         playlistTitle to curated.shuffled()
     }
 
@@ -933,9 +844,7 @@ class StreamRepository(private val context: Context) {
             lower.contains("מזרחית") || lower.contains("ים תיכוני") -> {
                 queries += listOf("עומר אדם", "עדן חסון", "פאר טסי", "אושר כהן", "אייל גולן")
             }
-            else -> {
-                queries += listOf(prompt, "$prompt hits", "$prompt top songs")
-            }
+            else -> queries += listOf(prompt, "$prompt hits", "$prompt top songs")
         }
         return "AI • ${prompt.take(26)}" to queries.distinct()
     }
@@ -946,9 +855,7 @@ class StreamRepository(private val context: Context) {
             Reply ONLY with valid JSON: {"title": "Short catchy playlist title in the user's language", "songs": ["Artist - Song Title", ...]}
         """.trimIndent()
         val payload = JSONObject().apply {
-            put("contents", JSONArray().put(
-                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sysPrompt)))
-            ))
+            put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sysPrompt)))))
         }
         val req = Request.Builder()
             .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
@@ -956,20 +863,13 @@ class StreamRepository(private val context: Context) {
             .build()
         return client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return null
-            val root = JSONObject(resp.body?.string() ?: return null)
-            val text = root.optJSONArray("candidates")
-                ?.optJSONObject(0)
-                ?.optJSONObject("content")
-                ?.optJSONArray("parts")
-                ?.optJSONObject(0)
-                ?.optString("text") ?: return null
-            val jsonSlice = text.substringAfter("{").substringBeforeLast("}")
-            val parsed = JSONObject("{$jsonSlice}")
+            val text = JSONObject(resp.body?.string() ?: return null)
+                .optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")
+                ?.optJSONArray("parts")?.optJSONObject(0)?.optString("text") ?: return null
+            val parsed = JSONObject("{${text.substringAfter("{").substringBeforeLast("}")}}")
             val title = parsed.optString("title", "AI • ${prompt.take(24)}")
             val songsArr = parsed.optJSONArray("songs") ?: return null
-            val songs = buildList {
-                for (i in 0 until songsArr.length()) songsArr.optString(i).takeIf { it.isNotBlank() }?.let { add(it) }
-            }
+            val songs = buildList { for (i in 0 until songsArr.length()) songsArr.optString(i).takeIf { it.isNotBlank() }?.let { add(it) } }
             title to songs
         }
     }
@@ -980,8 +880,7 @@ class StreamRepository(private val context: Context) {
         runCatching {
             val base = settings.subsonicUrl.trimEnd('/')
             val auth = buildSubsonicAuth(settings.subsonicUser, settings.subsonicPass)
-            val req = Request.Builder().url("$base/rest/ping.view?$auth").build()
-            client.newCall(req).execute().use { resp ->
+            client.newCall(Request.Builder().url("$base/rest/ping.view?$auth").build()).execute().use { resp ->
                 if (!resp.isSuccessful) return@use false to "שגיאת HTTP ${resp.code}"
                 val ok = JSONObject(resp.body?.string() ?: "").optJSONObject("subsonic-response")?.optString("status") == "ok"
                 if (ok) true to "חיבור לשרת Lossless הצליח!" else false to "שם משתמש או סיסמה שגויים"
@@ -995,24 +894,18 @@ class StreamRepository(private val context: Context) {
             val base = settings.subsonicUrl.trimEnd('/')
             val auth = buildSubsonicAuth(settings.subsonicUser, settings.subsonicPass)
             val q = URLEncoder.encode(query.ifBlank { "" }, "UTF-8")
-            val req = Request.Builder().url("$base/rest/search3.view?query=$q&songCount=30&$auth").build()
-            client.newCall(req).execute().use { resp ->
+            client.newCall(Request.Builder().url("$base/rest/search3.view?query=$q&songCount=30&$auth").build()).execute().use { resp ->
                 if (!resp.isSuccessful) return emptyList()
-                val songs = JSONObject(resp.body?.string() ?: return emptyList())
-                    .optJSONObject("subsonic-response")?.optJSONObject("searchResult3")?.optJSONArray("song") ?: return emptyList()
+                val songs = JSONObject(resp.body?.string() ?: return emptyList()).optJSONObject("subsonic-response")?.optJSONObject("searchResult3")?.optJSONArray("song") ?: return emptyList()
                 buildList {
                     for (i in 0 until songs.length()) {
                         val s = songs.optJSONObject(i) ?: continue
                         val coverId = s.optString("coverArt")
                         add(
                             Track(
-                                id = s.optString("id"),
-                                title = s.optString("title", "ללא שם"),
-                                artist = s.optString("artist", "אמן"),
-                                album = s.optString("album", ""),
-                                artworkUrl = if (coverId.isNotBlank()) "$base/rest/getCoverArt.view?id=$coverId&$auth" else "",
-                                durationMs = s.optLong("duration", 0L) * 1000L,
-                                source = StreamSource.OPENSUBSONIC
+                                id = s.optString("id"), title = s.optString("title", "ללא שם"), artist = s.optString("artist", "אמן"),
+                                album = s.optString("album", ""), artworkUrl = if (coverId.isNotBlank()) "$base/rest/getCoverArt.view?id=$coverId&$auth" else "",
+                                durationMs = s.optLong("duration", 0L) * 1000L, source = StreamSource.OPENSUBSONIC
                             )
                         )
                     }
@@ -1031,9 +924,8 @@ class StreamRepository(private val context: Context) {
         val list = mutableListOf<Track>()
         runCatching {
             val projection = arrayOf(
-                MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE,
-                MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM,
-                MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.ALBUM_ID
+                MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST,
+                MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION, MediaStore.Audio.Media.ALBUM_ID
             )
             context.contentResolver.query(
                 MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection,
@@ -1055,8 +947,7 @@ class StreamRepository(private val context: Context) {
                         Track(
                             id = "local_$id", title = title, artist = artist, album = album,
                             artworkUrl = ContentUris.withAppendedId(android.net.Uri.parse("content://media/external/audio/albumart"), c.getLong(albIdCol)).toString(),
-                            durationMs = c.getLong(durCol),
-                            source = StreamSource.LOCAL,
+                            durationMs = c.getLong(durCol), source = StreamSource.LOCAL,
                             localUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id).toString()
                         )
                     )
@@ -1067,14 +958,12 @@ class StreamRepository(private val context: Context) {
     }
 
     suspend fun fetchSyncedLyrics(artist: String, title: String): List<LyricLine> = withContext(Dispatchers.IO) {
-        val cleanTitle = title.replace(Regex("\\(.*?\\)|\\[.*?]"), "")
-            .replace("Official Video", "", true).replace("Official Audio", "", true).trim()
+        val cleanTitle = title.replace(Regex("\\(.*?\\)|\\[.*?]"), "").replace("Official Video", "", true).replace("Official Audio", "", true).trim()
         val cleanArtist = artist.replace("- Topic", "", true).replace("VEVO", "", true).trim()
 
         val exact = runCatching {
             val url = "https://lrclib.net/api/get?artist_name=${URLEncoder.encode(cleanArtist, "UTF-8")}&track_name=${URLEncoder.encode(cleanTitle, "UTF-8")}"
-            val req = Request.Builder().url(url).header("User-Agent", "Sonify/3.0").build()
-            client.newCall(req).execute().use { resp ->
+            client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/4.0").build()).execute().use { resp ->
                 if (!resp.isSuccessful) return@use emptyList()
                 parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
             }
@@ -1083,8 +972,7 @@ class StreamRepository(private val context: Context) {
 
         runCatching {
             val q = URLEncoder.encode("$cleanArtist $cleanTitle".trim(), "UTF-8")
-            val req = Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/3.0").build()
-            client.newCall(req).execute().use { resp ->
+            client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/4.0").build()).execute().use { resp ->
                 if (!resp.isSuccessful) return@use emptyList()
                 val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
                 for (i in 0 until arr.length().coerceAtMost(5)) {
@@ -1100,9 +988,7 @@ class StreamRepository(private val context: Context) {
         val synced = json.optString("syncedLyrics")
         if (synced.isNotBlank()) return parseLrc(synced)
         val plain = json.optString("plainLyrics")
-        if (plain.isNotBlank()) {
-            return plain.lines().filter { it.isNotBlank() }.mapIndexed { idx, line -> LyricLine(idx * 3500L, line.trim()) }
-        }
+        if (plain.isNotBlank()) return plain.lines().filter { it.isNotBlank() }.mapIndexed { idx, line -> LyricLine(idx * 3500L, line.trim()) }
         return emptyList()
     }
 
@@ -1137,4 +1023,3 @@ class StreamRepository(private val context: Context) {
         if (f.exists()) f.delete()
     }
 }
-
