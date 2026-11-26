@@ -8,10 +8,10 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.net.Uri
 import android.widget.FrameLayout
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode as AnimRepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -36,6 +36,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -55,6 +56,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import kotlinx.coroutines.delay
 
 @Composable
 fun FloatingMiniPlayer(state: UiState, vm: AppViewModel, modifier: Modifier = Modifier) {
@@ -159,6 +161,22 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
     )
     val useCanvasMotion = state.settings.canvasEnabled && !state.settings.dataSaver && state.isPlaying && !state.isVideoMode
 
+    // Smooth curtain hides YouTube's loading/buffering/pause overlays completely!
+    var revealWebVideo by remember(track.id, state.activeVideoClipId, state.isVideoMode) { mutableStateOf(false) }
+    LaunchedEffect(state.isVideoMode, state.isUsingWebEngine, state.isPlaying, state.isBusyLoading, state.isFindingVideoClip) {
+        if (state.isVideoMode && state.isUsingWebEngine && state.isPlaying && !state.isBusyLoading && !state.isFindingVideoClip) {
+            delay(450)
+            revealWebVideo = true
+        } else {
+            revealWebVideo = false
+        }
+    }
+    val curtainAlpha by animateFloatAsState(
+        targetValue = if (state.isVideoMode && (!state.isUsingWebEngine || revealWebVideo)) 0f else 1f,
+        animationSpec = tween(280),
+        label = "video_curtain"
+    )
+
     var isFullscreenVideo by remember { mutableStateOf(false) }
     var showQueueSheet by remember { mutableStateOf(false) }
     var showSleepSheet by remember { mutableStateOf(false) }
@@ -182,10 +200,28 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
     val canSwitchVideo = track.source == StreamSource.YOUTUBE
 
     if (isFullscreenVideo && state.isVideoMode) {
-        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
             if (state.isUsingWebEngine) {
-                AndroidView(factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } }, update = { vm.audioEngine.attachWebView(it) }, modifier = Modifier.fillMaxSize())
-                Box(modifier = Modifier.fillMaxSize().clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { vm.togglePlayPause() })
+                // Keep exact 16:9 viewport in landscape so 150vh overscan hides YouTube chrome with zero video zoom
+                Box(modifier = Modifier.fillMaxHeight().aspectRatio(16f / 9f).clip(RoundedCornerShape(0.dp))) {
+                    AndroidView(
+                        factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
+                        update = { vm.audioEngine.attachWebView(it) },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                    if (curtainAlpha > 0.01f) {
+                        Box(modifier = Modifier.fillMaxSize().alpha(curtainAlpha).background(Color.Black), contentAlignment = Alignment.Center) {
+                            ArtworkImage(track.artworkUrl, track.title, Modifier.fillMaxSize())
+                            Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+                            if (state.isBusyLoading || state.isFindingVideoClip) {
+                                CircularProgressIndicator(color = SpotifyGreen)
+                            } else if (!state.isPlaying) {
+                                Icon(Icons.Rounded.PlayArrow, null, tint = SpotifyWhite, modifier = Modifier.size(64.dp))
+                            }
+                        }
+                    }
+                    Box(modifier = Modifier.fillMaxSize().clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { vm.togglePlayPause() })
+                }
             } else {
                 AndroidView(
                     factory = { ctx -> PlayerView(ctx).apply { player = vm.audioEngine.player; useController = false; resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT } },
@@ -225,27 +261,45 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(10.dp))
 
-            // 16:9 Official Music Video OR 1:1 HD Album Art
+            // 16:9 Official Music Video (with HD curtain hiding all YT loading/pause chrome) OR 1:1 HD Album Art
             Box(
                 modifier = Modifier.fillMaxWidth().aspectRatio(if (state.isVideoMode) 16f / 9f else 1f)
                     .clip(RoundedCornerShape(14.dp)).background(Color.Black),
                 contentAlignment = Alignment.Center
             ) {
-                AnimatedContent(targetState = Pair(state.isVideoMode, state.isUsingWebEngine), label = "av_switch") { (videoActive, webActive) ->
-                    if (videoActive) {
-                        if (webActive) {
-                            AndroidView(factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } }, update = { vm.audioEngine.attachWebView(it) }, modifier = Modifier.fillMaxSize())
-                        } else {
-                            AndroidView(
-                                factory = { ctx -> PlayerView(ctx).apply { player = vm.audioEngine.player; useController = false; resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT } },
-                                update = { it.player = vm.audioEngine.player }, onRelease = { it.player = null }, modifier = Modifier.fillMaxSize()
-                            )
-                        }
+                if (state.isVideoMode) {
+                    if (state.isUsingWebEngine) {
+                        AndroidView(
+                            factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
+                            update = { vm.audioEngine.attachWebView(it) },
+                            modifier = Modifier.fillMaxSize()
+                        )
                     } else {
+                        AndroidView(
+                            factory = { ctx -> PlayerView(ctx).apply { player = vm.audioEngine.player; useController = false; resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT } },
+                            update = { it.player = vm.audioEngine.player }, onRelease = { it.player = null }, modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                }
+
+                // Album Art Layer (always visible in Audio Mode, and acts as smooth curtain over WebView while buffering/paused!)
+                if (!state.isVideoMode || curtainAlpha > 0.01f) {
+                    Box(modifier = Modifier.fillMaxSize().alpha(if (state.isVideoMode) curtainAlpha else 1f)) {
                         ArtworkImage(
                             track.artworkUrl, track.title,
                             Modifier.fillMaxSize().graphicsLayer { if (useCanvasMotion) { scaleX = canvasPulse; scaleY = canvasPulse } }
                         )
+                        if (state.isVideoMode) {
+                            Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.42f)), contentAlignment = Alignment.Center) {
+                                if (state.isBusyLoading || state.isFindingVideoClip) {
+                                    CircularProgressIndicator(color = SpotifyGreen, strokeWidth = 3.dp)
+                                } else if (!state.isPlaying) {
+                                    Box(modifier = Modifier.size(56.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.7f)), contentAlignment = Alignment.Center) {
+                                        Icon(Icons.Rounded.PlayArrow, null, tint = SpotifyWhite, modifier = Modifier.size(34.dp))
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -522,7 +576,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
         }
     }
 
-    // Fullscreen Auto-Scrolling Lyrics with Font Size Controls & Manual Search
     if (showFullLyrics) {
         var manualQuery by remember(track.id) { mutableStateOf("${track.artist} ${track.title}") }
         val activeIdx = state.lyrics.indexOfLast { it.timeMs <= state.positionMs }.coerceAtLeast(0)
@@ -569,7 +622,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
     }
 }
 
-// Upgraded Devices, Live Volume Slider & Complete Jam Manager Sheet!
 @Composable
 fun DevicesBottomSheet(state: UiState, vm: AppViewModel) {
     val str = state.strings
@@ -603,7 +655,6 @@ fun DevicesBottomSheet(state: UiState, vm: AppViewModel) {
                 Spacer(Modifier.height(6.dp))
             }
 
-            // Live Volume Slider
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Rounded.VolumeDown, null, tint = SpotifySubtle, modifier = Modifier.size(20.dp))
@@ -624,7 +675,6 @@ fun DevicesBottomSheet(state: UiState, vm: AppViewModel) {
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 14.dp), color = SpotifyCard)
 
-            // Full Jam Session Section
             Text("Jam • ${str.t("האזנה משותפת", "Shared Listening")}", color = SpotifyGreen, fontWeight = FontWeight.Bold, fontSize = 16.sp)
             Spacer(Modifier.height(8.dp))
 
