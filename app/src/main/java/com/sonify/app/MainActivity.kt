@@ -72,7 +72,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Hardware Keyboard Shortcuts (Space = Play/Pause, Ctrl+Arrows = Next/Prev/Volume)
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         val ctrl = event?.isCtrlPressed == true
         when {
@@ -96,6 +95,7 @@ private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
     BackHandler(enabled = state.showNowPlaying || state.showSettings || state.openedPlaylist != null || state.selectedTab != MainTab.HOME) {
         when {
             state.showNowPlaying -> vm.setShowNowPlaying(false)
+            state.showSettings && state.settingsSection != SettingsSection.ROOT -> vm.setSettingsSection(SettingsSection.ROOT)
             state.showSettings -> vm.setShowSettings(false)
             state.openedPlaylist != null -> vm.openPlaylist(null)
             state.selectedTab != MainTab.HOME -> vm.selectTab(MainTab.HOME)
@@ -112,7 +112,6 @@ private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
     val webHostedInNowPlaying = state.isUsingWebEngine && state.showNowPlaying && state.isVideoMode
 
     Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
-        // Layer 0: 260dp opaque WebView host behind app surface (passes YouTube viewport check)
         if (state.isUsingWebEngine && !webHostedInNowPlaying) {
             AndroidView(
                 factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
@@ -121,7 +120,6 @@ private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
             )
         }
 
-        // Layer 1: Main Opaque Surface
         Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
             when {
                 state.showSettings -> SettingsScreen(state, vm)
@@ -162,7 +160,6 @@ private fun SonifyAppRoot(vm: AppViewModel, state: UiState) {
             NowPlayingScreen(state, vm)
         }
 
-        // All Modals & Sheets
         if (state.showCreateSheet) CreateBottomSheet(state, vm)
         if (state.showDevicesSheet) DevicesBottomSheet(state, vm)
         if (state.showStatsSheet) StatsWrappedSheet(state, vm)
