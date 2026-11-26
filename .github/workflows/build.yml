@@ -28,11 +28,14 @@ jobs:
           gradle-version: '8.7'
 
       - name: Decode Release Keystore (if configured in Secrets)
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          echo "$KEYSTORE_BASE64" | base64 --decode > app/release.keystore
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > app/release.keystore
+          else
+            echo "No release keystore secret set, using debug signing."
+          fi
 
       - name: Build Release APK
         env:
@@ -50,7 +53,7 @@ jobs:
       - name: Prepare Clean APK File
         id: apk
         run: |
-          VER=$(grep -m1 'versionName' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          VER=$(grep -m1 'versionName' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/' | tr -d '[:space:]' || true)
           VER="${VER:-dev}"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
