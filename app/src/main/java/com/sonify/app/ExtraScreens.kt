@@ -29,7 +29,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
 
-// 1. Listening Stats & Wrapped Sheet
 @Composable
 fun StatsWrappedSheet(state: UiState, vm: AppViewModel) {
     val minutes = (state.stats.totalListeningMs / 60_000L).coerceAtLeast(0L)
@@ -80,7 +79,6 @@ fun StatsWrappedSheet(state: UiState, vm: AppViewModel) {
     }
 }
 
-// 2. Listening History (Recents) Sheet
 @Composable
 fun ListeningHistorySheet(state: UiState, vm: AppViewModel) {
     ModalBottomSheet(onDismissRequest = { vm.setShowHistorySheet(false) }, containerColor = SpotifyDarkSurface, contentColor = SpotifyWhite) {
@@ -94,6 +92,7 @@ fun ListeningHistorySheet(state: UiState, vm: AppViewModel) {
                 items(state.recentTracks, key = { it.id }) { track ->
                     TrackRowItem(
                         track = track, isOffline = track.id in state.offlineTrackIds, isDownloading = track.id in state.downloadingIds,
+                        downloadPct = state.downloadProgress[track.id], containerColor = Color.Transparent,
                         onClick = { vm.playTrack(track, state.recentTracks); vm.setShowHistorySheet(false) },
                         onDownloadClick = { vm.downloadOffline(track) }, onMoreClick = { vm.openTrackOptions(track) }
                     )
@@ -103,7 +102,6 @@ fun ListeningHistorySheet(state: UiState, vm: AppViewModel) {
     }
 }
 
-// 3. Messages & Friends Social Sheet
 @Composable
 fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
     var msgText by remember { mutableStateOf("") }
@@ -116,16 +114,12 @@ fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
             Text("חברים שאתה עוקב אחריהם:", color = SpotifySubtle, fontSize = 12.sp)
             LazyRow(modifier = Modifier.padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(state.followedFriends) { f ->
-                    Box(Modifier.clip(RoundedCornerShape(50)).background(SpotifyCard).padding(horizontal = 12.dp, vertical = 6.dp)) {
-                        Text(f, color = SpotifyWhite, fontSize = 12.sp)
-                    }
+                    Box(Modifier.clip(RoundedCornerShape(50)).background(SpotifyCard).padding(horizontal = 12.dp, vertical = 6.dp)) { Text(f, color = SpotifyWhite, fontSize = 12.sp) }
                 }
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(value = friendInput, onValueChange = { friendInput = it }, placeholder = { Text("הוסף חבר למעקב...") }, singleLine = true, modifier = Modifier.weight(1f))
-                IconButton(onClick = { vm.addFriend(friendInput); friendInput = "" }, modifier = Modifier.clip(CircleShape).background(SpotifyGreen)) {
-                    Icon(Icons.Rounded.PersonAdd, contentDescription = "הוסף", tint = Color.Black)
-                }
+                IconButton(onClick = { vm.addFriend(friendInput); friendInput = "" }, modifier = Modifier.clip(CircleShape).background(SpotifyGreen)) { Icon(Icons.Rounded.PersonAdd, "Add", tint = Color.Black) }
             }
             HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = SpotifyCard)
             LazyColumn(modifier = Modifier.heightIn(min = 140.dp, max = 260.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -138,8 +132,7 @@ fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
                             Spacer(Modifier.height(6.dp))
                             Row(
                                 modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(SpotifyDarkSurface)
-                                    .clickable { vm.playTrack(trk, startAtMs = (m.trackTimestampSec ?: 0) * 1000L); vm.setShowMessagesSheet(false) }
-                                    .padding(8.dp),
+                                    .clickable { vm.playTrack(trk, startAtMs = (m.trackTimestampSec ?: 0) * 1000L); vm.setShowMessagesSheet(false) }.padding(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 ArtworkImage(trk.artworkUrl, null, Modifier.size(38.dp))
@@ -157,9 +150,7 @@ fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
             Spacer(Modifier.height(10.dp))
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(value = msgText, onValueChange = { msgText = it }, placeholder = { Text("כתוב הודעה...") }, singleLine = true, modifier = Modifier.weight(1f))
-                IconButton(onClick = { vm.sendMessage(msgText); msgText = "" }, modifier = Modifier.clip(CircleShape).background(SpotifyGreen)) {
-                    Icon(Icons.Rounded.Send, contentDescription = "שלח", tint = Color.Black)
-                }
+                IconButton(onClick = { vm.sendMessage(msgText); msgText = "" }, modifier = Modifier.clip(CircleShape).background(SpotifyGreen)) { Icon(Icons.Rounded.Send, "Send", tint = Color.Black) }
             }
             if (state.currentTrack != null) {
                 TextButton(onClick = { vm.sendMessage("תקשיב לזה!", state.currentTrack, (state.positionMs / 1000).toInt()) }) {
@@ -171,15 +162,11 @@ fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
     }
 }
 
-// 4. Visual Sonify Code (Spotify-Style Soundwave Barcode)
 @Composable
 fun VisualCodeSheet(title: String, codeData: String, onDismiss: () -> Unit) {
     val bars = remember(codeData) {
         val hash = codeData.hashCode()
-        List(23) { i ->
-            val v = abs((hash * (i + 7) * 31 + i * 17) % 100)
-            0.22f + (v / 100f) * 0.78f
-        }
+        List(23) { i -> 0.22f + (abs((hash * (i + 7) * 31 + i * 17) % 100) / 100f) * 0.78f }
     }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = SpotifyDarkSurface, contentColor = SpotifyWhite) {
         Column(modifier = Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -187,18 +174,14 @@ fun VisualCodeSheet(title: String, codeData: String, onDismiss: () -> Unit) {
             Spacer(Modifier.height(6.dp))
             Text(title, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 18.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Spacer(Modifier.height(16.dp))
-            Box(
-                modifier = Modifier.fillMaxWidth().height(92.dp).clip(RoundedCornerShape(14.dp)).background(SpotifyWhite).padding(horizontal = 20.dp, vertical = 14.dp),
-                contentAlignment = Alignment.Center
-            ) {
+            Box(modifier = Modifier.fillMaxWidth().height(92.dp).clip(RoundedCornerShape(14.dp)).background(SpotifyWhite).padding(horizontal = 20.dp, vertical = 14.dp), contentAlignment = Alignment.Center) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
                     val gap = size.width / (bars.size * 1.65f)
                     val barW = gap * 0.8f
                     var x = gap
                     bars.forEach { frac ->
                         val h = size.height * frac
-                        val top = (size.height - h) / 2f
-                        drawRoundRect(Color.Black, Offset(x, top), Size(barW, h), CornerRadius(barW / 2f, barW / 2f))
+                        drawRoundRect(Color.Black, Offset(x, (size.height - h) / 2f), Size(barW, h), CornerRadius(barW / 2f, barW / 2f))
                         x += gap * 1.6f
                     }
                 }
@@ -210,7 +193,6 @@ fun VisualCodeSheet(title: String, codeData: String, onDismiss: () -> Unit) {
     }
 }
 
-// 5. Playlist Cover Art Creator
 @Composable
 fun CoverArtCreatorSheet(playlist: Playlist, vm: AppViewModel) {
     val colors = listOf(0xFF1DB954, 0xFFE8115B, 0xFF1E3264, 0xFFBC5900, 0xFF9C27B0, 0xFF0D73EC, 0xFFE91429, 0xFF006450)
@@ -223,10 +205,7 @@ fun CoverArtCreatorSheet(playlist: Playlist, vm: AppViewModel) {
         Column(modifier = Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Text("מעצב עטיפת פלייליסט", fontSize = 18.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(12.dp))
-            PlaylistCoverBox(
-                playlist.copy(customCoverBgHex = selectedColor, customCoverText = coverText, customCoverSticker = selectedSticker),
-                Modifier.size(160.dp)
-            )
+            PlaylistCoverBox(playlist.copy(customCoverBgHex = selectedColor, customCoverText = coverText, customCoverSticker = selectedSticker), Modifier.size(160.dp))
             Spacer(Modifier.height(14.dp))
             OutlinedTextField(value = coverText, onValueChange = { coverText = it }, label = { Text("טקסט על העטיפה") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Spacer(Modifier.height(10.dp))
@@ -240,24 +219,20 @@ fun CoverArtCreatorSheet(playlist: Playlist, vm: AppViewModel) {
             Spacer(Modifier.height(10.dp))
             LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 items(stickers) { s ->
-                    Box(
-                        Modifier.clip(RoundedCornerShape(8.dp)).background(if (selectedSticker == s) SpotifyGreen else SpotifyCard)
-                            .clickable { selectedSticker = s }.padding(horizontal = 12.dp, vertical = 6.dp)
-                    ) { Text(if (s.isEmpty()) "ללא" else s, color = if (selectedSticker == s) Color.Black else SpotifyWhite) }
+                    Box(Modifier.clip(RoundedCornerShape(8.dp)).background(if (selectedSticker == s) SpotifyGreen else SpotifyCard).clickable { selectedSticker = s }.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                        Text(if (s.isEmpty()) "ללא" else s, color = if (selectedSticker == s) Color.Black else SpotifyWhite)
+                    }
                 }
             }
             Spacer(Modifier.height(16.dp))
-            Button(
-                onClick = { vm.updatePlaylistCover(playlist.id, selectedColor, coverText, selectedSticker) },
-                colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("שמור עטיפה", fontWeight = FontWeight.Bold) }
+            Button(onClick = { vm.updatePlaylistCover(playlist.id, selectedColor, coverText, selectedSticker) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), modifier = Modifier.fillMaxWidth()) {
+                Text("שמור עטיפה", fontWeight = FontWeight.Bold)
+            }
             Spacer(Modifier.height(18.dp))
         }
     }
 }
 
-// 6. Import Playlist Sheet (URL or Track List)
 @Composable
 fun ImportPlaylistSheet(vm: AppViewModel) {
     var name by remember { mutableStateOf("") }
@@ -272,17 +247,14 @@ fun ImportPlaylistSheet(vm: AppViewModel) {
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(value = raw, onValueChange = { raw = it }, label = { Text("קישור או רשימת שירים") }, minLines = 4, maxLines = 6, modifier = Modifier.fillMaxWidth())
             Spacer(Modifier.height(14.dp))
-            Button(
-                onClick = { vm.importPlaylist(name, raw) },
-                colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("ייבא עכשיו", fontWeight = FontWeight.Bold) }
+            Button(onClick = { vm.importPlaylist(name, raw) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), modifier = Modifier.fillMaxWidth()) {
+                Text("ייבא עכשיו", fontWeight = FontWeight.Bold)
+            }
             Spacer(Modifier.height(20.dp))
         }
     }
 }
 
-// 7. Recover Deleted Playlists Sheet
 @Composable
 fun RecoverPlaylistsSheet(state: UiState, vm: AppViewModel) {
     ModalBottomSheet(onDismissRequest = { vm.setShowRecoverSheet(false) }, containerColor = SpotifyDarkSurface, contentColor = SpotifyWhite) {
