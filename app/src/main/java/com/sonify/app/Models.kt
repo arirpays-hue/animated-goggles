@@ -75,11 +75,23 @@ enum class LibrarySort(val labelHe: String, val labelEn: String) {
 }
 
 enum class StreamSource(val labelHe: String, val labelEn: String, val subHe: String, val subEn: String) {
-    YOUTUBE("YouTube Music (ברירת מחדל)", "YouTube Music (Default)", "שירים, פלייליסטים, פודקאסטים + קליפים רשמיים", "Songs, playlists, podcasts + official music videos"),
+    YOUTUBE("YouTube Music (ברירת מחדל)", "YouTube Music (Default)", "שירים, פלייליסטים, פודקאסטים + קליפים רשמיים (עד 256kbps)", "Songs, playlists, podcasts + official videos (up to 256kbps)"),
     OPENSUBSONIC("שרת פרטי (OpenSubsonic / Navidrome)", "Private Server (OpenSubsonic / Navidrome)", "הזרמת Lossless FLAC ישירה מהשרת שלך", "True Lossless FLAC streaming from your server"),
-    LOCAL("קובצי המכשיר (FLAC / MP3)", "Local Device Files (FLAC / MP3)", "ניגון ישיר מהאחסון המקומי ללא אינטרנט", "Direct offline playback from local storage");
+    LOCAL("קובצי המכשיר (FLAC / MP3)", "Local Device Files (FLAC / MP3)", "ניגון ישיר באיכות מקורית ללא אינטרנט", "Direct native-quality playback from local storage");
+
     fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
     fun sub(isEn: Boolean) = if (isEn) subEn else subHe
+
+    fun supportedQualities(): List<AudioQuality> = when (this) {
+        YOUTUBE -> listOf(AudioQuality.LOW, AudioQuality.NORMAL, AudioQuality.HIGH, AudioQuality.VERY_HIGH)
+        OPENSUBSONIC -> AudioQuality.entries
+        LOCAL -> emptyList()
+    }
+
+    fun clampQuality(q: AudioQuality): AudioQuality {
+        val list = supportedQualities()
+        return if (list.isEmpty() || q in list) q else list.last()
+    }
 }
 
 enum class YouTubeEngineMode(val labelHe: String, val labelEn: String, val subHe: String, val subEn: String) {
@@ -96,7 +108,18 @@ enum class AudioQuality(val labelHe: String, val labelEn: String, val shortHe: S
     HIGH("גבוהה (160kbps)", "High (160kbps)", "גבוהה", "High", 160),
     VERY_HIGH("גבוהה מאוד (320kbps)", "Very High (320kbps)", "גבוהה מאוד", "Very High", 320),
     LOSSLESS("Lossless (FLAC 24-bit/44.1kHz)", "Lossless (FLAC 24-bit/44.1kHz)", "Lossless", "Lossless", 1411);
-    fun shortLabel(isEn: Boolean) = if (isEn) shortEn else shortHe
+
+    fun shortLabel(isEn: Boolean, source: StreamSource = StreamSource.OPENSUBSONIC): String {
+        if (source == StreamSource.YOUTUBE) {
+            return when (this) {
+                LOW -> if (isEn) "Low (48k)" else "נמוכה (48k)"
+                NORMAL -> if (isEn) "Normal (96k)" else "רגילה (96k)"
+                HIGH -> if (isEn) "High (128k)" else "גבוהה (128k)"
+                VERY_HIGH, LOSSLESS -> if (isEn) "Max (~256k)" else "מקסימלית (~256k)"
+            }
+        }
+        return if (isEn) shortEn else shortHe
+    }
 }
 
 enum class NormalizationLevel(val labelHe: String, val labelEn: String, val gainMb: Int) {
