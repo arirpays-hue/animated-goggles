@@ -134,7 +134,7 @@ class StreamRepository(private val context: Context) {
         (s1 + s2).distinctBy { it.id }.take(35)
     }
 
-    // ---------- NEW: Official Music Video Finder (Fixes Frozen Album-Art Video!) ----------
+    // ---------- Official Music Video Finder ----------
     suspend fun findOfficialMusicVideoId(track: Track): String? = withContext(Dispatchers.IO) {
         val cleanTitle = cleanSongTitle(track.title)
         val cleanArtist = cleanArtistName(track.artist)
@@ -229,7 +229,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 2. Playlists Search, Browse (Up to 100+ Songs!) & Import ----------
+    // ---------- 2. Playlists Search, Browse (Up to 100+ Songs) & Import ----------
     suspend fun searchPlaylists(query: String): List<RemotePlaylist> = withContext(Dispatchers.IO) {
         val bodyJson = JSONObject().apply {
             put("query", query)
@@ -770,7 +770,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 4. Upgraded Offline Downloader (WebView JS Fetch FIRST -> OkHttp Captured -> 6 Strategies) ----------
+    // ---------- 4. Upgraded Offline Downloader (WebView JS Fetch -> OkHttp -> 6 Strategies) ----------
     suspend fun downloadTrackOffline(
         track: Track,
         settings: AppSettings,
@@ -796,7 +796,7 @@ class StreamRepository(private val context: Context) {
                 return@withTimeoutOrNull false to "שגיאה בהורדה מהמקור שנבחר"
             }
 
-            // Priority 1: Direct in-WebView JS fetch() (uses live browser TLS & session -> immune to 403!)
+            // Priority 1: Direct in-WebView JS fetch()
             if (webViewDownloadFn != null && capturedStreams.isNotEmpty()) {
                 val wvOk = runCatching { webViewDownloadFn(target, onProgress) }.getOrDefault(false)
                 if (wvOk) return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
@@ -811,7 +811,7 @@ class StreamRepository(private val context: Context) {
                 }
             }
 
-            // Priority 3: Single-pass YouTube strategies (ANDROID_VR, IOS HLS, Cobalt, Piped, Invidious)
+            // Priority 3: Single-pass YouTube strategies
             val quality = effectiveQuality(settings, forDownload = true)
             for (strategy in youtubeStrategies(track.id, quality)) {
                 onProgress(8)
@@ -964,9 +964,8 @@ class StreamRepository(private val context: Context) {
         }.getOrDefault(false)
     }
 
-    // ---------- 5. Advanced AI Playlist Studio (15 / 25 / 40 / 50 Songs!) ----------
+    // ---------- 5. Advanced AI Playlist Studio (15 / 25 / 40 / 50 Songs) ----------
     suspend fun buildAiPlaylist(config: AiPlaylistConfig, settings: AppSettings): Pair<String, List<Track>> = withContext(Dispatchers.IO) {
-        val cleanPrompt = config.prompt.trim()
         val targetCount = config.targetCount.coerceIn(10, 50)
 
         if (settings.geminiApiKey.isNotBlank()) {
@@ -1085,7 +1084,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 6. 4-Layer Synced Lyrics Engine (LRCLIB Exact -> LRCLIB Search -> YouTube Captions -> Lyrics.ovh) ----------
+    // ---------- 6. 4-Layer Synced Lyrics Engine ----------
     private fun cleanSongTitle(title: String): String {
         return title
             .replace(Regex("\\([^)]*(official|video|audio|lyric|prod|remaster|feat|ft\\.|קליפ|מילים|רשמי)[^)]*\\)", RegexOption.IGNORE_CASE), "")
@@ -1126,7 +1125,7 @@ class StreamRepository(private val context: Context) {
             if (exact.isNotEmpty()) return@withContext exact
         }
 
-        // Layer 2: LRCLIB Broad Search (Artist+Title, then Title-only for Hebrew/translated titles)
+        // Layer 2: LRCLIB Broad Search
         val searchQueries = listOfNotNull(
             "$cleanArtist $cleanTitle".trim().takeIf { it.isNotBlank() },
             cleanTitle.takeIf { it.isNotBlank() && cleanArtist.isNotBlank() }
@@ -1138,7 +1137,6 @@ class StreamRepository(private val context: Context) {
                 client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/7.0").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
-                    // Prefer synced lyrics first
                     for (i in 0 until arr.length().coerceAtMost(8)) {
                         val obj = arr.optJSONObject(i) ?: continue
                         if (obj.optString("syncedLyrics").isNotBlank()) {
@@ -1156,13 +1154,13 @@ class StreamRepository(private val context: Context) {
             if (found.isNotEmpty()) return@withContext found
         }
 
-        // Layer 3: YouTube Caption Tracks (Synced timedtext directly from YouTube - huge win for Hebrew!)
+        // Layer 3: YouTube Caption Tracks
         if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
             val ytCaptions = runCatching { fetchYouTubeCaptions(track.id) }.getOrDefault(emptyList())
             if (ytCaptions.isNotEmpty()) return@withContext ytCaptions
         }
 
-        // Layer 4: Lyrics.ovh fallback (plain lyrics)
+        // Layer 4: Lyrics.ovh fallback
         if (cleanArtist.isNotBlank() && cleanTitle.isNotBlank()) {
             val ovh = runCatching {
                 val url = "https://api.lyrics.ovh/v1/${URLEncoder.encode(cleanArtist, "UTF-8")}/${URLEncoder.encode(cleanTitle, "UTF-8")}"
@@ -1205,7 +1203,7 @@ class StreamRepository(private val context: Context) {
                 val ct = tracks.optJSONObject(i) ?: continue
                 val base = ct.optString("baseUrl")
                 val lang = ct.optString("languageCode")
-                val kind = ct.optString("kind") // empty = manual lyrics/subtitles (much better than asr)
+                val kind = ct.optString("kind")
                 if (base.startsWith("http")) {
                     if (kind.isBlank() && (lang.startsWith("he") || lang.startsWith("iw") || lang.startsWith("en"))) {
                         bestUrl = base; break
@@ -1313,4 +1311,3 @@ class StreamRepository(private val context: Context) {
         return list
     }
 }
-0
