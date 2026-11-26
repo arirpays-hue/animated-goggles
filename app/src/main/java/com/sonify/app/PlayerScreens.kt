@@ -21,6 +21,7 @@ import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -173,6 +174,12 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
         Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
             if (state.isUsingWebEngine) {
                 AndroidView(factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } }, update = { vm.audioEngine.attachWebView(it) }, modifier = Modifier.fillMaxSize())
+                // Shield prevents accidental taps from waking YouTube UI; tap toggles play/pause
+                Box(
+                    modifier = Modifier.fillMaxSize().clickable(
+                        interactionSource = remember { MutableInteractionSource() }, indication = null
+                    ) { vm.togglePlayPause() }
+                )
             } else {
                 AndroidView(
                     factory = { ctx -> PlayerView(ctx).apply { player = vm.audioEngine.player; useController = false; resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT } },
@@ -212,8 +219,9 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(10.dp))
 
+            // Clean 16:9 Music Video frame (or 1:1 HD Album Art) with touch shield over WebView
             Box(
-                modifier = Modifier.fillMaxWidth().aspectRatio(if (state.isVideoMode) 16f / 10f else 1f)
+                modifier = Modifier.fillMaxWidth().aspectRatio(if (state.isVideoMode) 16f / 9f else 1f)
                     .clip(RoundedCornerShape(14.dp)).background(Color.Black),
                 contentAlignment = Alignment.Center
             ) {
@@ -235,10 +243,19 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
 
+                // Transparent shield over WebView in Video Mode: blocks YouTube page scroll/taps, toggles Play/Pause cleanly
+                if (state.isVideoMode && state.isUsingWebEngine) {
+                    Box(
+                        modifier = Modifier.fillMaxSize().clickable(
+                            interactionSource = remember { MutableInteractionSource() }, indication = null
+                        ) { vm.togglePlayPause() }
+                    )
+                }
+
                 if (canSwitchVideo) {
                     Row(
                         modifier = Modifier.align(Alignment.BottomStart).padding(12.dp)
-                            .clip(RoundedCornerShape(50)).background(Color.Black.copy(alpha = 0.8f))
+                            .clip(RoundedCornerShape(50)).background(Color.Black.copy(alpha = 0.82f))
                             .clickable { vm.toggleVideoClipMode() }.padding(horizontal = 14.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -251,7 +268,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                 if (state.isVideoMode) {
                     IconButton(
                         onClick = { isFullscreenVideo = true },
-                        modifier = Modifier.align(Alignment.BottomEnd).padding(10.dp).size(36.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.75f))
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(10.dp).size(36.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.78f))
                     ) { Icon(Icons.Rounded.Fullscreen, "Fullscreen", tint = SpotifyWhite, modifier = Modifier.size(20.dp)) }
                 }
             }
