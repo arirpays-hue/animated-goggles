@@ -48,11 +48,16 @@ data class Track(
 
 data class ResolvedStreams(
     val audioUrl: String,
-    val videoUrl: String? = null,
+    val videoUrl: String? = null,       // Muxed video+audio or HLS
+    val videoOnlyUrl: String? = null,   // Adaptive video-only to merge with audioUrl
+    val userAgent: String = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
     val isLossless: Boolean = false,
     val isOffline: Boolean = false,
     val codecLabel: String = "AAC"
-)
+) {
+    val hasVideoClip: Boolean
+        get() = !videoUrl.isNullOrBlank() || !videoOnlyUrl.isNullOrBlank()
+}
 
 data class LyricLine(
     val timeMs: Long,
@@ -75,6 +80,7 @@ data class AppSettings(
     val subsonicUrl: String = "",
     val subsonicUser: String = "",
     val subsonicPass: String = "",
+    val geminiApiKey: String = "",
     val normalizeVolume: Boolean = true,
     val gaplessPlayback: Boolean = true,
     val crossfadeSeconds: Int = 0,
