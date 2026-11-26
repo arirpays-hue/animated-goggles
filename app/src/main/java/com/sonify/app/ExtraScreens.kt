@@ -3,7 +3,10 @@
 package com.sonify.app
 
 import android.content.Intent
-import androidx.compose.foundation.Canvas
+import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -21,11 +24,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -33,7 +34,26 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlin.math.abs
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+
+private fun generateScannableQrBitmap(data: String, size: Int = 512): Bitmap? = runCatching {
+    val hints = mapOf(EncodeHintType.MARGIN to 1, EncodeHintType.CHARACTER_SET to "UTF-8")
+    val matrix = QRCodeWriter().encode(data, BarcodeFormat.QR_CODE, size, size, hints)
+    val pixels = IntArray(size * size)
+    for (y in 0 until size) {
+        val rowOffset = y * size
+        for (x in 0 until size) {
+            pixels[rowOffset + x] = if (matrix.get(x, y)) AndroidColor.BLACK else AndroidColor.WHITE
+        }
+    }
+    Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).apply {
+        setPixels(pixels, 0, size, 0, 0, size, size)
+    }
+}.getOrNull()
 
 @Composable
 fun StatsWrappedSheet(state: UiState, vm: AppViewModel) {
@@ -114,7 +134,6 @@ fun ListeningHistorySheet(state: UiState, vm: AppViewModel) {
     }
 }
 
-// Upgraded Messages & Friends Sheet (Per-friend threads, Online status, Blend/Jam invites, proper keyboard padding!)
 @Composable
 fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
     val str = state.strings
@@ -135,9 +154,7 @@ fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
         ) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(str.messagesAndFriends, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                IconButton(onClick = { showAddFriend = !showAddFriend }) {
-                    Icon(Icons.Rounded.PersonAdd, "Add Friend", tint = SpotifyGreen)
-                }
+                IconButton(onClick = { showAddFriend = !showAddFriend }) { Icon(Icons.Rounded.PersonAdd, "Add Friend", tint = SpotifyGreen) }
             }
 
             if (showAddFriend) {
@@ -149,7 +166,6 @@ fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // Friends / Threads Selector Row
             LazyRow(modifier = Modifier.padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 item {
                     val sel = activeThread == "כללי"
@@ -171,7 +187,6 @@ fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // Selected Friend Actions Card (Activity, Invite Jam, Create Blend, Remove)
             activeProfile?.let { fp ->
                 Row(
                     modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(SpotifyCard).padding(horizontal = 12.dp, vertical = 8.dp),
@@ -191,7 +206,6 @@ fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = SpotifyCard)
 
-            // Messages Thread
             Column(modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (threadMessages.isEmpty()) {
                     Text(str.t("אין עדיין הודעות עם $activeThread — שלח שיר, קוד Jam או הודעה!", "No messages with $activeThread yet — share a track or Jam!"), color = SpotifySubtle, fontSize = 13.sp)
@@ -253,36 +267,40 @@ fun MessagesAndFriendsSheet(state: UiState, vm: AppViewModel) {
     }
 }
 
-// Upgraded Visual Sonify Code (Copy + Share + Open/Paste Code to Play Immediately!)
+// REAL Scannable QR Code + Real Camera Scanner via ZXing!
 @Composable
 fun VisualCodeSheet(title: String, codeData: String, vm: AppViewModel, str: AppStrings, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var openCodeInput by remember { mutableStateOf("") }
-    val bars = remember(codeData) {
-        val hash = codeData.ifBlank { "sonify" }.hashCode()
-        List(23) { i -> 0.22f + (abs((hash * (i + 7) * 31 + i * 17) % 100) / 100f) * 0.78f }
+
+    val qrBitmap = remember(codeData) {
+        if (codeData.isNotBlank()) generateScannableQrBitmap(codeData, 512) else null
+    }
+
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val scanned = result.contents?.trim()
+        if (!scanned.isNullOrBlank()) {
+            vm.openSonifyCodeOrLink(scanned)
+        }
     }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = SpotifyDarkSurface, contentColor = SpotifyWhite) {
-        Column(modifier = Modifier.fillMaxWidth().padding(22.dp).imePadding(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(str.t("קוד Sonify לסריקה ושיתוף", "Sonify Share Code"), color = SpotifyGreen, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        Column(
+            modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(22.dp).imePadding(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(str.t("קוד QR של Sonify", "Sonify QR Code"), color = SpotifyGreen, fontWeight = FontWeight.Bold, fontSize = 16.sp)
             Spacer(Modifier.height(6.dp))
             Text(title, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 18.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
 
-            if (codeData.isNotBlank()) {
+            if (qrBitmap != null) {
                 Spacer(Modifier.height(14.dp))
-                Box(modifier = Modifier.fillMaxWidth().height(88.dp).clip(RoundedCornerShape(14.dp)).background(SpotifyWhite).padding(horizontal = 20.dp, vertical = 14.dp), contentAlignment = Alignment.Center) {
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val gap = size.width / (bars.size * 1.65f)
-                        val barW = gap * 0.8f
-                        var x = gap
-                        bars.forEach { frac ->
-                            val h = size.height * frac
-                            drawRoundRect(Color.Black, Offset(x, (size.height - h) / 2f), Size(barW, h), CornerRadius(barW / 2f, barW / 2f))
-                            x += gap * 1.6f
-                        }
-                    }
+                Box(
+                    modifier = Modifier.size(200.dp).clip(RoundedCornerShape(16.dp)).background(SpotifyWhite).padding(12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Image(bitmap = qrBitmap.asImageBitmap(), contentDescription = codeData, modifier = Modifier.fillMaxSize())
                 }
                 Spacer(Modifier.height(8.dp))
                 Text(codeData, color = SpotifySubtle, fontSize = 12.sp)
@@ -291,25 +309,46 @@ fun VisualCodeSheet(title: String, codeData: String, vm: AppViewModel, str: AppS
                     OutlinedButton(onClick = { clipboard.setText(AnnotatedString(codeData)) }, modifier = Modifier.weight(1f)) {
                         Icon(Icons.Rounded.ContentCopy, null, tint = SpotifyWhite, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(5.dp)); Text(str.t("העתק קוד", "Copy Code"), color = SpotifyWhite, fontSize = 12.sp)
                     }
-                    Button(
+                    OutlinedButton(
                         onClick = {
                             context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
                                 type = "text/plain"; putExtra(Intent.EXTRA_TEXT, "$title\n$codeData")
                             }, "Share Code"))
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
                         modifier = Modifier.weight(1f)
-                    ) { Icon(Icons.Rounded.Share, null, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(5.dp)); Text(str.t("שתף", "Share"), fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                    ) { Icon(Icons.Rounded.Share, null, tint = SpotifyGreen, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(5.dp)); Text(str.t("שתף", "Share"), color = SpotifyWhite, fontSize = 12.sp) }
                 }
             }
 
+            Spacer(Modifier.height(14.dp))
+            // Real Camera QR Scanner Button
+            Button(
+                onClick = {
+                    scanLauncher.launch(
+                        ScanOptions().apply {
+                            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            setPrompt(str.t("כוון את המצלמה לקוד Sonify", "Point camera at a Sonify QR code"))
+                            setBeepEnabled(true)
+                            setOrientationLocked(false)
+                        }
+                    )
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
+                modifier = Modifier.fillMaxWidth().height(50.dp),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Rounded.QrCodeScanner, null, modifier = Modifier.size(22.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(str.t("סרוק קוד עם המצלמה", "Scan QR Code with Camera"), fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            }
+
             HorizontalDivider(modifier = Modifier.padding(vertical = 14.dp), color = SpotifyCard)
-            Text(str.t("פתח קוד Sonify או קישור שיר/פלייליסט/Jam:", "Open a Sonify Code, Jam or YouTube Link:"), color = SpotifySubtle, fontSize = 12.sp, modifier = Modifier.align(Alignment.Start))
+            Text(str.t("או הדבק קוד / קישור ידנית:", "Or paste a code / link manually:"), color = SpotifySubtle, fontSize = 12.sp, modifier = Modifier.align(Alignment.Start))
             Spacer(Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(value = openCodeInput, onValueChange = { openCodeInput = it }, placeholder = { Text("sonify:track:... / youtu.be/...") }, singleLine = true, modifier = Modifier.weight(1f))
-                Button(onClick = { vm.openSonifyCodeOrLink(openCodeInput) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black)) {
-                    Text(str.t("פתח", "Open"), fontWeight = FontWeight.Bold)
+                Button(onClick = { vm.openSonifyCodeOrLink(openCodeInput) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyCard)) {
+                    Text(str.t("פתח", "Open"), color = SpotifyWhite, fontWeight = FontWeight.Bold)
                 }
             }
             Spacer(Modifier.height(18.dp))
@@ -409,3 +448,4 @@ fun RecoverPlaylistsSheet(state: UiState, vm: AppViewModel) {
         }
     }
 }
+
