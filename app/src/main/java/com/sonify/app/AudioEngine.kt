@@ -40,6 +40,7 @@ import androidx.media3.common.audio.BaseAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.AudioSink
@@ -124,7 +125,13 @@ object PlayerHolder {
                         return DefaultAudioSink.Builder(ctx).setAudioProcessors(arrayOf(balanceMonoProcessor)).build()
                     }
                 }
+                // Generous cellular-friendly buffers to eliminate audio stutter
+                val loadControl = DefaultLoadControl.Builder()
+                    .setBufferDurationsMs(20_000, 60_000, 2_500, 5_000)
+                    .build()
+
                 ExoPlayer.Builder(context.applicationContext, renderersFactory)
+                    .setLoadControl(loadControl)
                     .setAudioAttributes(
                         AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(),
                         true
@@ -250,14 +257,22 @@ class WebPlaybackEngine(private val context: Context) {
         }
     }
 
+    // FIXED: Never re-trigger onResume / resumeTimers / CSS injection on Compose recompositions when already attached!
     fun attachTo(container: FrameLayout) {
         mainHandler.post {
             val wv = getOrCreateWebView()
-            if (wv.parent !== container) {
-                (wv.parent as? ViewGroup)?.removeView(wv)
-                container.removeAllViews()
-                container.addView(wv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            if (wv.parent === container) {
+                val pending = pendingVideoId
+                if (isActive && !pending.isNullOrBlank()) {
+                    val startS = pendingStartSec
+                    pendingVideoId = null
+                    loadIframePlayer(wv, pending, startS)
+                }
+                return@post
             }
+            (wv.parent as? ViewGroup)?.removeView(wv)
+            container.removeAllViews()
+            container.addView(wv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             wv.onResume()
             wv.resumeTimers()
             if (isActive && isMobileWatchFallback) injectCleanVideoCssOnly()
@@ -332,7 +347,7 @@ class WebPlaybackEngine(private val context: Context) {
                   if (st === -1 && !userPaused) { try { player.playVideo(); } catch(err) {} }
                   SonifyBridge.onProgress(pos, dur, st === 1, st === 3);
                 }
-              }, 300);
+              }, 500);
               window.sonifyPlay = function() { userPaused = false; if (player && player.playVideo) player.playVideo(); };
               window.sonifyPause = function() { userPaused = true; if (player && player.pauseVideo) player.pauseVideo(); };
               window.sonifyToggle = function() { if (!player) return; if (player.getPlayerState && player.getPlayerState() === 1) window.sonifyPause(); else window.sonifyPlay(); };
@@ -375,92 +390,127 @@ class WebPlaybackEngine(private val context: Context) {
         }
     }
 
-    // ---------- Direct In-WebView JS Fetch Downloader (Same TLS/Session/Cookies -> Bypasses Cellular 403!) ----------
+    // Preserves every query parameter listed inside YouTube's signed `sparams` so URL never returns 403
+    private fun sanitizeSignedUrl(url: String): String {
+        val sparamsRaw = Regex("[?&]sparams=([^&]+)").find(url)?.groupValues?.get(1).orEmpty()
+        val signedParams = runCatching { URLDecoder.decode(sparamsRaw, "UTF-8") }
+            .getOrDefault(sparamsRaw)
+            .split(",")
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+
+        val removable = listOf("range", "rn", "rbuf", "alr", "ump", "srfvp", "sabr")
+            .filterNot { it in signedParams }
+        if (removable.isEmpty()) return url
+
+        val pattern = Regex("([?&])(${removable.joinToString("|")})=[^&]*", RegexOption.IGNORE_CASE)
+        return url
+            .replace(pattern, "$1")
+            .replace("?&", "?")
+            .replace(Regex("&{2,}"), "&")
+            .trimEnd('&', '?')
+    }
+
+    // FIXED: No `credentials: 'include'` (prevents CORS rejection) + preserves `sparams` + handles ALR redirects
     suspend fun downloadViaWebViewFetch(
         videoId: String,
         targetFile: File,
         onProgress: (Int) -> Unit
     ): Boolean {
         val wv = webView ?: return false
-        val captured = getCapturedStreams(videoId).sortedByDescending { it.isAudioOnly }.firstOrNull()
-        val rawUrl = captured?.url ?: return false
-        if (rawUrl.contains(".m3u8", true) || rawUrl.contains("sabr=1", true)) return false
+        val candidates = getCapturedStreams(videoId)
+            .sortedByDescending { it.isAudioOnly }
+            .filter { !it.url.contains(".m3u8", true) && !it.url.contains("sabr=1", true) }
+            .take(3)
+        if (candidates.isEmpty()) return false
 
-        val cleanUrl = rawUrl
-            .replace(Regex("([?&])(range|rn|rbuf|alr|ump|srfvp)=[^&]*"), "$1")
-            .replace("?&", "?").replace(Regex("&{2,}"), "&").trimEnd('&', '?')
+        for (cap in candidates) {
+            val cleanUrl = sanitizeSignedUrl(cap.url)
+            val dlId = UUID.randomUUID().toString().take(8)
+            val tmpFile = File(targetFile.parentFile, "${targetFile.name}.wvtmp")
+            val deferred = CompletableDeferred<Boolean>()
+            val fos = runCatching { FileOutputStream(tmpFile) }.getOrNull() ?: continue
+            activeDownloads[dlId] = ActiveWebDownload(tmpFile, targetFile, fos, onProgress, deferred)
 
-        val dlId = UUID.randomUUID().toString().take(8)
-        val tmpFile = File(targetFile.parentFile, "${targetFile.name}.wvtmp")
-        val deferred = CompletableDeferred<Boolean>()
-
-        val fos = runCatching { FileOutputStream(tmpFile) }.getOrNull() ?: return false
-        activeDownloads[dlId] = ActiveWebDownload(tmpFile, targetFile, fos, onProgress, deferred)
-
-        val escapedUrl = cleanUrl.replace("\\", "\\\\").replace("'", "\\'")
-        val js = """
-            (async function() {
-              const dlId = '$dlId';
-              const baseUrl = '$escapedUrl';
-              function abToB64(u8) {
-                let s = '';
-                const step = 0x8000;
-                for (let i = 0; i < u8.length; i += step) {
-                  s += String.fromCharCode.apply(null, u8.subarray(i, i + step));
-                }
-                return btoa(s);
-              }
-              try {
-                const clenMatch = baseUrl.match(/[?&]clen=(\d+)/);
-                const clen = clenMatch ? parseInt(clenMatch[1], 10) : 0;
-                if (clen > 0 && clen < 75000000) {
-                  let offset = 0;
-                  const chunk = 512 * 1024;
-                  while (offset < clen) {
-                    const end = Math.min(offset + chunk - 1, clen - 1);
-                    const sep = baseUrl.includes('?') ? '&' : '?';
-                    const resp = await fetch(baseUrl + sep + 'range=' + offset + '-' + end, { credentials: 'include' });
-                    if (!resp.ok) { SonifyBridge.onDownloadDone(dlId, false); return; }
+            val escapedUrl = cleanUrl.replace("\\", "\\\\").replace("'", "\\'")
+            val js = """
+                (async function() {
+                  const dlId = '$dlId';
+                  let baseUrl = '$escapedUrl';
+                  function abToB64(u8) {
+                    let s = '';
+                    const step = 0x8000;
+                    for (let i = 0; i < u8.length; i += step) {
+                      s += String.fromCharCode.apply(null, u8.subarray(i, i + step));
+                    }
+                    return btoa(s);
+                  }
+                  async function fetchChunk(url) {
+                    const resp = await fetch(url, { mode: 'cors', credentials: 'omit' });
+                    if (!resp.ok) return null;
                     const ct = (resp.headers.get('content-type') || '').toLowerCase();
-                    if (ct.includes('text/html') || ct.includes('yt-ump')) { SonifyBridge.onDownloadDone(dlId, false); return; }
+                    if (ct.includes('text/html') || ct.includes('yt-ump')) return null;
                     const buf = new Uint8Array(await resp.arrayBuffer());
-                    if (buf.length === 0) { SonifyBridge.onDownloadDone(dlId, false); return; }
-                    offset += buf.length;
-                    const pct = Math.min(98, Math.max(5, Math.floor((offset * 98) / clen)));
-                    SonifyBridge.onDownloadChunk(dlId, abToB64(buf), pct);
+                    if (ct.includes('text/plain') && buf.length < 2048) {
+                      const txt = new TextDecoder().decode(buf).trim();
+                      if (txt.startsWith('https://')) return { redirect: txt };
+                      return null;
+                    }
+                    return { data: buf };
                   }
-                  SonifyBridge.onDownloadDone(dlId, true);
-                } else {
-                  const resp = await fetch(baseUrl, { credentials: 'include' });
-                  if (!resp.ok || !resp.body) { SonifyBridge.onDownloadDone(dlId, false); return; }
-                  const total = parseInt(resp.headers.get('content-length') || '0', 10);
-                  const reader = resp.body.getReader();
-                  let loaded = 0;
-                  while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    loaded += value.length;
-                    const pct = total > 0 ? Math.min(98, Math.max(5, Math.floor((loaded * 98) / total))) : 50;
-                    SonifyBridge.onDownloadChunk(dlId, abToB64(value), pct);
+                  try {
+                    const clenMatch = baseUrl.match(/[?&]clen=(\d+)/);
+                    const clen = clenMatch ? parseInt(clenMatch[1], 10) : 0;
+                    if (clen > 0 && clen < 75000000) {
+                      let offset = 0;
+                      const chunk = 512 * 1024;
+                      while (offset < clen) {
+                        const end = Math.min(offset + chunk - 1, clen - 1);
+                        let res = null;
+                        for (let r = 0; r < 2; r++) {
+                          const sep = baseUrl.includes('?') ? '&' : '?';
+                          const attempt = await fetchChunk(baseUrl + sep + 'range=' + offset + '-' + end);
+                          if (attempt && attempt.redirect) { baseUrl = attempt.redirect; continue; }
+                          if (attempt && attempt.data && attempt.data.length > 0) { res = attempt.data; break; }
+                        }
+                        if (!res) { SonifyBridge.onDownloadDone(dlId, false); return; }
+                        offset += res.length;
+                        const pct = Math.min(98, Math.max(5, Math.floor((offset * 98) / clen)));
+                        SonifyBridge.onDownloadChunk(dlId, abToB64(res), pct);
+                      }
+                      SonifyBridge.onDownloadDone(dlId, true);
+                    } else {
+                      const resp = await fetch(baseUrl, { mode: 'cors', credentials: 'omit' });
+                      if (!resp.ok || !resp.body) { SonifyBridge.onDownloadDone(dlId, false); return; }
+                      const total = parseInt(resp.headers.get('content-length') || '0', 10);
+                      const reader = resp.body.getReader();
+                      let loaded = 0;
+                      while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        loaded += value.length;
+                        const pct = total > 0 ? Math.min(98, Math.max(5, Math.floor((loaded * 98) / total))) : 50;
+                        SonifyBridge.onDownloadChunk(dlId, abToB64(value), pct);
+                      }
+                      SonifyBridge.onDownloadDone(dlId, loaded > 16384);
+                    }
+                  } catch (e) {
+                    SonifyBridge.onDownloadDone(dlId, false);
                   }
-                  SonifyBridge.onDownloadDone(dlId, loaded > 16384);
-                }
-              } catch (e) {
-                SonifyBridge.onDownloadDone(dlId, false);
-              }
-            })();
-        """.trimIndent()
+                })();
+            """.trimIndent()
 
-        mainHandler.post { wv.evaluateJavascript(js, null) }
+            mainHandler.post { wv.evaluateJavascript(js, null) }
 
-        val ok = withTimeoutOrNull(45_000L) { deferred.await() } ?: false
-        if (!ok) {
+            val ok = withTimeoutOrNull(35_000L) { deferred.await() } ?: false
+            if (ok) return true
             activeDownloads.remove(dlId)?.let { dl ->
                 runCatching { dl.outStream.close() }
                 dl.tmpFile.delete()
             }
         }
-        return ok
+        return false
     }
 
     private fun injectCleanVideoCssOnly() {
@@ -541,7 +591,7 @@ class WebPlaybackEngine(private val context: Context) {
                 var buffering = !window.__sonifyUserPaused && !playing && v.readyState < 3;
                 SonifyBridge.onProgress(pos, dur, playing, buffering);
                 if (v.ended && !window.__sonifyEndedFired) { window.__sonifyEndedFired = true; SonifyBridge.onEnded(); }
-              }, 300);
+              }, 500);
 
               window.sonifyPlay = function() { window.__sonifyUserPaused = false; var v = document.querySelector('video'); if (v) { v.muted = false; v.play().catch(function(){}); } };
               window.sonifyPause = function() { window.__sonifyUserPaused = true; var v = document.querySelector('video'); if (v) v.pause(); };
@@ -638,7 +688,6 @@ class AudioEngine(private val context: Context) {
     private var loudnessEnhancer: LoudnessEnhancer? = null
     private var lastSettings: AppSettings = AppSettings()
 
-    // AI DJ Voice Announcer (TTS with automatic music ducking!)
     private var tts: TextToSpeech? = null
     private var ttsReady = false
 
@@ -707,7 +756,7 @@ class AudioEngine(private val context: Context) {
                         player.volume = 1f
                     }
                 }
-                delay(300)
+                delay(350)
             }
         }
     }
@@ -886,8 +935,7 @@ class AudioEngine(private val context: Context) {
     fun setSystemVolumeFraction(fraction: Float) {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-        val target = (fraction.coerceIn(0f, 1f) * max).toInt()
-        am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, (fraction.coerceIn(0f, 1f) * max).toInt(), 0)
     }
 
     fun adjustVolumeStep(up: Boolean) {
