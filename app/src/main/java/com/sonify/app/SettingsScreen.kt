@@ -72,6 +72,30 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
+        if (s.streamSource == StreamSource.YOUTUBE) {
+            Spacer(Modifier.height(16.dp))
+            SectionTitle("מנוע ניגון YouTube")
+            YouTubeEngineMode.entries.forEach { mode ->
+                val selected = s.ytEngineMode == mode
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth().padding(vertical = 3.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (selected) Color(0xFF1F3B33) else SpotifyDarkSurface)
+                        .clickable { vm.updateSettings(s.copy(ytEngineMode = mode)) }
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(selected = selected, onClick = { vm.updateSettings(s.copy(ytEngineMode = mode)) }, colors = RadioButtonDefaults.colors(selectedColor = SpotifyGreen))
+                    Spacer(Modifier.width(8.dp))
+                    Column {
+                        Text(mode.label, color = SpotifyWhite, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text(mode.subtitle, color = SpotifySubtle, fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+
         if (s.streamSource == StreamSource.OPENSUBSONIC) {
             Spacer(Modifier.height(10.dp))
             Card(colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface), shape = RoundedCornerShape(10.dp)) {
