@@ -57,15 +57,6 @@ import org.json.JSONArray
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
-// Shared Spotify Theme Palette
-val SpotifyBlack = Color(0xFF121212)
-val SpotifyDarkSurface = Color(0xFF1A1A1A)
-val SpotifyCard = Color(0xFF282828)
-val SpotifyWhite = Color(0xFFFFFFFF)
-val SpotifySubtle = Color(0xFFB3B3B3)
-val SpotifyMuted = Color(0xFF7A7A7A)
-val SpotifyGreen = Color(0xFF1DB954)
-
 private val liveSuggestClient = OkHttpClient.Builder()
     .connectTimeout(3, TimeUnit.SECONDS)
     .readTimeout(4, TimeUnit.SECONDS)
@@ -268,7 +259,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
     val isEn = str.isEn
     val listState = rememberLazyListState()
 
-    // Auto-trigger Infinite AI Home Feed when scrolling near bottom!
     val shouldLoadMore by remember {
         derivedStateOf {
             val total = listState.layoutInfo.totalItemsCount
@@ -287,7 +277,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
         modifier = Modifier.fillMaxSize().background(SpotifyBlack).statusBarsPadding(),
         contentPadding = PaddingValues(bottom = 165.dp)
     ) {
-        // Spotify Top Header with Filter Chips & Action Icons
         item(key = "home_header") {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -334,7 +323,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // 2-Column Spotify Quick-Pick Grid (6 compact tiles)
         item(key = "quick_grid") {
             val quickCards = buildList<Pair<String, () -> Unit>> {
                 add(str.likedSongs to { vm.openLikedSongsPlaylist() })
@@ -377,7 +365,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Daylist + AI DJ Banner
         item(key = "daylist_dj") {
             Spacer(Modifier.height(14.dp))
             Row(
@@ -428,7 +415,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Made For You Shelf (Unique AI Playlist Covers)
         if (state.homeMixPlaylists.isNotEmpty()) {
             item(key = "made_for_you") {
                 Spacer(Modifier.height(20.dp))
@@ -447,7 +433,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Ready-Made YouTube Playlists Shelf
         if (state.readyYoutubePlaylists.isNotEmpty() && state.settings.showYoutubePlaylistsHome) {
             item(key = "yt_ready_playlists") {
                 Spacer(Modifier.height(22.dp))
@@ -473,7 +458,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Recommended Songs
         if (state.trendingSongs.isNotEmpty()) {
             item(key = "rec_header") {
                 Spacer(Modifier.height(22.dp))
@@ -502,7 +486,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // INFINITE AI FEED SECTIONS (Continuously generated from liked songs & taste profile!)
         items(state.infiniteSections, key = { it.id }) { section ->
             Column(modifier = Modifier.fillMaxWidth().padding(top = 22.dp)) {
                 Column(modifier = Modifier.padding(horizontal = 16.dp)) {
@@ -560,7 +543,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Infinite Feed Loading Footer
         if (state.settings.infiniteAiHome && !state.settings.offlineMode) {
             item(key = "infinite_footer") {
                 Box(modifier = Modifier.fillMaxWidth().padding(vertical = 22.dp, horizontal = 16.dp), contentAlignment = Alignment.Center) {
@@ -596,7 +578,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
     val isEn = str.isEn
     val focusManager = LocalFocusManager.current
 
-    // Live type-as-you-go suggestions & instant songs (starts on the VERY FIRST LETTER!)
     var liveSuggestions by remember { mutableStateOf<List<String>>(emptyList()) }
     var instantTracks by remember { mutableStateOf<List<Track>>(emptyList()) }
     var isFetchingLive by remember { mutableStateOf(false) }
@@ -612,7 +593,7 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
             return@LaunchedEffect
         }
         isFetchingLive = true
-        delay(170) // Fast debounce: responsive on every keystroke without flooding network
+        delay(170)
         val (sugs, trks) = coroutineScope {
             val sJob = async { fetchLiveYouTubeSuggestions(q) }
             val tJob = async {
@@ -639,7 +620,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
         modifier = Modifier.fillMaxSize().background(SpotifyBlack).statusBarsPadding(),
         contentPadding = PaddingValues(bottom = 165.dp)
     ) {
-        // Header: Title + QR Scanner + Source Badge
         item(key = "search_top") {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -662,7 +642,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Spotify Signature High-Contrast White Search Input Bar
         item(key = "search_bar") {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
@@ -682,13 +661,7 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                         }
                         BasicTextField(
                             value = state.searchQuery,
-                            onValueChange = { newText ->
-                                vm.onSearchQueryChange(newText)
-                                // Switching back into live autocomplete mode while editing text
-                                if (state.hasSearched) {
-                                    // Keep hasSearched cleared only if user modifies text further via onSearchQueryChange
-                                }
-                            },
+                            onValueChange = { vm.onSearchQueryChange(it) },
                             singleLine = true,
                             textStyle = TextStyle(color = Color.Black, fontSize = 15.sp, fontWeight = FontWeight.Medium),
                             cursorBrush = SolidColor(SpotifyGreen),
@@ -716,7 +689,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
             Spacer(Modifier.height(10.dp))
         }
 
-        // Search Mode Filter Pills (Songs / Playlists / Podcasts / Audiobooks)
         item(key = "search_modes") {
             LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(SearchMode.entries) { mode ->
@@ -734,7 +706,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
             Spacer(Modifier.height(10.dp))
         }
 
-        // MODE A: LIVE TYPE-AHEAD SUGGESTIONS & INSTANT SONGS (updates on EVERY single letter typed!)
         if (state.searchQuery.isNotBlank() && !state.hasSearched) {
             if (isFetchingLive && liveSuggestions.isEmpty() && instantTracks.isEmpty()) {
                 item(key = "live_loading") {
@@ -749,7 +720,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // 1. Live Text Completions (Spotify Autocomplete Phrases)
             if (liveSuggestions.isNotEmpty()) {
                 items(liveSuggestions, key = { "sug_$it" }) { suggestion ->
                     val qTrim = state.searchQuery.trim()
@@ -790,7 +760,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // 2. Instant Top Artist Quick-Jump Card (if matching artist found)
             val topArtist = instantTracks.firstOrNull()?.artist?.takeIf { it.isNotBlank() && !it.equals("YouTube", true) }
             if (topArtist != null) {
                 item(key = "live_artist_jump") {
@@ -815,7 +784,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // 3. Instant Live Matching Songs (Playable Immediately as You Type!)
             if (instantTracks.isNotEmpty()) {
                 item(key = "live_songs_header") {
                     Text(
@@ -843,7 +811,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // Quick "See all results for X" button
             item(key = "see_all_live") {
                 TextButton(
                     onClick = { focusManager.clearFocus(); vm.performSearch() },
@@ -856,9 +823,7 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                     )
                 }
             }
-        }
-        // MODE B: FULL SEARCH RESULTS (Songs + Ready YouTube Playlists!)
-        else if (state.hasSearched) {
+        } else if (state.hasSearched) {
             if (state.isSearching) {
                 item(key = "searching_loader") {
                     Box(Modifier.fillMaxWidth().padding(36.dp), contentAlignment = Alignment.Center) {
@@ -886,7 +851,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
             } else {
-                // Matching Ready YouTube Playlists Shelf inside Song Search too!
                 if (state.searchMode == SearchMode.SONGS && state.searchPlaylists.isNotEmpty()) {
                     item(key = "search_yt_pls_shelf") {
                         Row(
@@ -933,9 +897,7 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
             }
-        }
-        // MODE C: EMPTY QUERY -> RECENT SEARCHES + SPOTIFY MOOD & GENRE CARDS
-        else {
+        } else {
             if (state.searchHistory.isNotEmpty()) {
                 item(key = "recent_searches") {
                     Text(str.t("חיפושים אחרונים", "Recent Searches"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
@@ -983,7 +945,7 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
 }
 
 // =====================================================================
-// 3. SPOTIFY-STYLE FULL ARTIST PAGE (Banner, Verified, Latest Release, Albums, Singles, Similar Artists!)
+// 3. SPOTIFY-STYLE FULL ARTIST PAGE
 // =====================================================================
 @Composable
 fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) {
@@ -1001,7 +963,6 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
         modifier = Modifier.fillMaxSize().background(SpotifyBlack),
         contentPadding = PaddingValues(bottom = 165.dp)
     ) {
-        // Full-Bleed Spotify Artist Hero Banner
         item(key = "artist_hero") {
             Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
                 ArtworkImage(bannerUrl, displayName, Modifier.fillMaxSize().clip(RoundedCornerShape(0.dp)))
@@ -1047,7 +1008,6 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
             }
         }
 
-        // Spotify Action Bar: Follow Pill + Concerts + Merch + Shuffle + Big Green Play FAB
         item(key = "artist_actions") {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp),
@@ -1097,7 +1057,6 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
             }
         }
 
-        // Latest Release Card ("יצא לאחרונה")
         profile?.latestRelease?.let { latest ->
             item(key = "artist_latest") {
                 Spacer(Modifier.height(10.dp))
@@ -1125,7 +1084,6 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
             }
         }
 
-        // Popular Tracks ("פופולרי") — Numbered 1..5 with Expand
         if (tracks.isNotEmpty()) {
             item(key = "artist_pop_hdr") {
                 Spacer(Modifier.height(20.dp))
@@ -1158,7 +1116,6 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
             }
         }
 
-        // Albums Shelf ("אלבומים")
         if (!profile?.albums.isNullOrEmpty()) {
             item(key = "artist_albums") {
                 Spacer(Modifier.height(16.dp))
@@ -1177,7 +1134,6 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
             }
         }
 
-        // Singles & EPs Shelf ("סינגלים ו-EP")
         if (!profile?.singles.isNullOrEmpty()) {
             item(key = "artist_singles") {
                 Spacer(Modifier.height(20.dp))
@@ -1196,7 +1152,6 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
             }
         }
 
-        // Featuring / Ready Playlists Shelf ("מופיע בפלייליסטים")
         if (!profile?.featuredPlaylists.isNullOrEmpty()) {
             item(key = "artist_feat_pls") {
                 Spacer(Modifier.height(20.dp))
@@ -1215,7 +1170,6 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
             }
         }
 
-        // Fans Also Like ("מעריצים אוהבים גם") — Circular Artist Avatars!
         if (!profile?.similarArtists.isNullOrEmpty()) {
             item(key = "artist_similar") {
                 Spacer(Modifier.height(22.dp))
@@ -1236,7 +1190,6 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
             }
         }
 
-        // About Artist Bio Card ("אודות")
         if (!profile?.bio.isNullOrBlank()) {
             item(key = "artist_bio") {
                 Spacer(Modifier.height(22.dp))
@@ -1263,7 +1216,7 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
 }
 
 // =====================================================================
-// 4. PLAYLIST DETAIL SCREEN (Restored Smart Shuffle + Fixed Download All + Empty Guard)
+// 4. PLAYLIST DETAIL SCREEN
 // =====================================================================
 @Composable
 fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
@@ -1286,7 +1239,6 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
         modifier = Modifier.fillMaxSize().background(SpotifyBlack).statusBarsPadding(),
         contentPadding = PaddingValues(bottom = 165.dp)
     ) {
-        // Header Row
         item(key = "pl_top_bar") {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
@@ -1313,7 +1265,6 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Cover Art + Title + Metadata
         item(key = "pl_header_art") {
             Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 AiPlaylistCoverArt(playlist, state.settings.aiUniqueCovers, Modifier.size(200.dp))
@@ -1327,7 +1278,6 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Search inside playlist (only if playlist has tracks)
         if (playlist.tracks.isNotEmpty()) {
             item(key = "pl_search_box") {
                 Spacer(Modifier.height(14.dp))
@@ -1354,7 +1304,6 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // Action Controls: Play All + Shuffle + RESTORED Smart Shuffle + FIXED Download All (hidden if empty!)
             item(key = "pl_actions") {
                 Spacer(Modifier.height(14.dp))
                 Row(
@@ -1363,7 +1312,6 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        // FIXED Download All Button (shows progress + cancel while active, green when done, NEVER shown when empty!)
                         Box(
                             modifier = Modifier.clip(RoundedCornerShape(50))
                                 .background(
@@ -1397,7 +1345,6 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                             }
                         }
 
-                        // RESTORED Smart Shuffle Pill inside Playlist!
                         Box(
                             modifier = Modifier.clip(RoundedCornerShape(50))
                                 .background(if (isSmartOn) SpotifyGreen else SpotifyCard)
@@ -1445,7 +1392,6 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                 }
             }
         } else if (playlist.tracks.isEmpty()) {
-            // Clean Empty Playlist State (NO Download All button!)
             item(key = "pl_empty") {
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(32.dp),
@@ -1610,7 +1556,6 @@ fun LibraryScreen(state: UiState, vm: AppViewModel) {
             Spacer(Modifier.height(10.dp))
         }
 
-        // Core Virtual Smart Playlists (Liked Songs, Offline Downloads, Local Files)
         if (state.libraryFilter == LibraryFilter.ALL || state.libraryFilter == LibraryFilter.PLAYLISTS || state.libraryFilter == LibraryFilter.OFFLINE) {
             item(key = "lib_virtual_cards") {
                 Column(modifier = Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1622,7 +1567,6 @@ fun LibraryScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Followed Artists Section
         if ((state.libraryFilter == LibraryFilter.ALL || state.libraryFilter == LibraryFilter.ARTISTS) && state.followedArtists.isNotEmpty()) {
             item(key = "lib_artists") {
                 Text(str.t("אמנים שאתה עוקב אחריהם", "Followed Artists"), color = SpotifySubtle, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
@@ -1641,7 +1585,6 @@ fun LibraryScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // User Playlists (List or Grid)
         if (state.libraryGridView) {
             items(sortedPlaylists.chunked(2), key = { "grid_${it.first().id}" }) { row ->
                 Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1699,7 +1642,7 @@ private fun LibrarySpecialRow(title: String, subtitle: String, bgHex: Long, icon
 @Composable
 fun CreateHubSheet(state: UiState, vm: AppViewModel) {
     val str = state.strings
-    var tab by remember { mutableIntStateOf(0) } // 0=Menu, 1=New Playlist, 2=AI Studio, 3=Blend
+    var tab by remember { mutableIntStateOf(0) }
     var plName by remember { mutableStateOf("") }
     var aiPrompt by remember { mutableStateOf("") }
     var aiCount by remember { mutableIntStateOf(25) }
