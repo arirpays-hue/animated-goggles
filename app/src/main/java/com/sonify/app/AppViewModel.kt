@@ -412,16 +412,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val d4 = async { runCatching { repo.searchTracks(q4, s, isPod, isBook, maxResults = 25) }.getOrDefault(emptyList()) }
             val d5 = async { runCatching { repo.searchTracks(q5, s, isPod, isBook, maxResults = 25) }.getOrDefault(emptyList()) }
             val dDay = async { runCatching { repo.searchTracks(dayQuery, s, isPod, isBook, maxResults = 25) }.getOrDefault(emptyList()) }
-            val dYtPls = if (!isPod && !isBook && s.showYoutubePlaylistsHome) {
-                async {
+            val dYtPls = async {
+                if (!isPod && !isBook && s.showYoutubePlaylistsHome) {
                     val ytQs = buildList {
                         if (likedSeedArtist != null) add("$likedSeedArtist mix")
                         add("top hits 2026")
                         add("מוזיקה ישראלית להיטים")
                     }
                     runCatching { repo.fetchReadyYoutubePlaylists(ytQs, maxTotal = 10) }.getOrDefault(emptyList())
+                } else {
+                    emptyList<RemotePlaylist>()
                 }
-            } else null
+            }
 
             val list1 = filterByTaste(d1.await())
             val list2 = filterByTaste(d2.await())
@@ -429,7 +431,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val list4 = filterByTaste(d4.await())
             val list5 = filterByTaste(d5.await())
             val dayT = filterByTaste(dDay.await())
-            val ytPls = dYtPls?.await().orEmpty()
+            val ytPls = dYtPls.await()
 
             val mixes = when (filter) {
                 HomeFilter.AUDIOBOOKS -> buildList {
@@ -451,7 +453,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     buildOnRepeatPlaylist()?.let { add(it) }
                     buildRepeatRewindPlaylist()?.let { add(it) }
                     val mix1Title = if (likedSeedArtist != null) {
-                        if (isEn) "Daily Mix 1 • $likedSeedArtist" else "Daily Mix 1 • $likedSeedArtist"
+                        "Daily Mix 1 • $likedSeedArtist"
                     } else if (isEn) "Daily Mix 1 • Israeli" else "Daily Mix 1 • ישראלי"
                     if (list1.isNotEmpty()) add(Playlist("home_daily_1", mix1Title, "Sonify", "", list1.first().artworkUrl, tracks = list1, isRemote = true, aiSeedPrompt = q1, aiStyleTag = "DAILY 1"))
                     if (list2.isNotEmpty()) add(Playlist("home_daily_2", if (isEn) "Daily Mix 2 • Global Pop" else "Daily Mix 2 • פופ עולמי", "Sonify", "", list2.first().artworkUrl, tracks = list2, isRemote = true, aiSeedPrompt = q2, aiStyleTag = "DAILY 2"))
@@ -476,7 +478,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // Infinite AI Home Feed Loader (called automatically when scrolling near bottom!)
     fun loadMoreHomeContent() {
         val st = _uiState.value
         if (!st.settings.infiniteAiHome || st.settings.offlineMode || st.isLoadingHome || st.isLoadingMoreHome) return
@@ -805,8 +806,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- Search (Songs + Ready YouTube Playlists!) ----------
-    fun onSearchQueryChange(query: String) { _uiState.update { it.copy(searchQuery = query, hasSearched = if (query.isBlank()) false else it.hasSearched) } }
+    // ---------- Search (Live Type-Ahead + Songs + Ready YouTube Playlists!) ----------
+    fun onSearchQueryChange(query: String) {
+        _uiState.update { it.copy(searchQuery = query, hasSearched = false) }
+    }
 
     fun removeSearchHistoryItem(q: String) {
         val updated = _uiState.value.searchHistory.filterNot { it == q }
@@ -838,7 +841,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update { it.copy(searchResults = res, isSearching = false) }
                 }
                 SearchMode.SONGS -> {
-                    // Fetch both Songs AND matching Ready YouTube Playlists concurrently!
                     val (songs, pls) = coroutineScope {
                         val sJob = async { repo.searchTracks(clean, _uiState.value.settings) }
                         val pJob = async { runCatching { repo.searchPlaylists(clean).take(8) }.getOrDefault(emptyList()) }
@@ -1270,7 +1272,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            // Interleave 1 smart-injected recommendation every 2-3 original tracks
             val baseTracks = playlist.tracks.filterNot { it.isSmartInjected }
             val woven = mutableListOf<Track>()
             var smartIdx = 0
@@ -1412,7 +1413,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val st = _uiState.value
         val s = st.strings
 
-        // Toggle cancel if already downloading this playlist
         if (st.activeBulkDownloadPlaylistId == playlist.id) {
             cancelPlaylistDownload()
             return
@@ -1919,7 +1919,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val st = _uiState.value
         if (!st.jamState.active) return
 
-        // Track participant list live
         if (ev.senderName.isNotBlank()) {
             _uiState.update { cur ->
                 val list = when (ev.type) {
@@ -1936,7 +1935,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (ev.type == "LEAVE") return
 
-        // Update host permissions on guests
         if (!st.jamState.isHost) {
             _uiState.update { cur ->
                 cur.copy(
