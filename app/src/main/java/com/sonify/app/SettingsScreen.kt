@@ -3,6 +3,8 @@ package com.sonify.app
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -23,6 +25,14 @@ import androidx.compose.ui.unit.sp
 fun SettingsScreen(state: UiState, vm: AppViewModel) {
     val s = state.settings
     val bandLabels = listOf("60Hz", "230Hz", "910Hz", "3.6kHz", "14kHz")
+    val eqPresets = listOf(
+        "רגיל" to listOf(0, 0, 0, 0, 0),
+        "בס חזק" to listOf(8, 5, 0, 1, 2),
+        "פופ" to listOf(-1, 3, 5, 3, -1),
+        "רוק" to listOf(6, 2, -2, 4, 6),
+        "אלקטרוני" to listOf(7, 4, -1, 3, 6),
+        "ווקאלי" to listOf(-2, 1, 6, 5, 1)
+    )
 
     Column(
         modifier = Modifier
@@ -31,11 +41,11 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
             .statusBarsPadding()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 16.dp, vertical = 10.dp)
-            .padding(bottom = 120.dp)
+            .padding(bottom = 100.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { vm.setShowSettings(false) }) {
-                Icon(Icons.Rounded.Close, contentDescription = "סגור", tint = SpotifyWhite)
+                Icon(Icons.Rounded.ArrowForward, contentDescription = "חזרה", tint = SpotifyWhite)
             }
             Text("הגדרות הזרמה וסאונד", color = SpotifyWhite, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         }
@@ -67,7 +77,6 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // OpenSubsonic / Navidrome Credentials
         if (s.streamSource == StreamSource.OPENSUBSONIC) {
             Spacer(Modifier.height(10.dp))
             Card(colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface), shape = RoundedCornerShape(10.dp)) {
@@ -76,7 +85,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                     OutlinedTextField(
                         value = s.subsonicUrl,
                         onValueChange = { vm.updateSettings(s.copy(subsonicUrl = it)) },
-                        label = { Text("כתובת שרת (למשל https://music.myserver.com)") },
+                        label = { Text("כתובת שרת (https://...)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -95,7 +104,29 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Button(
+                        onClick = { vm.testSubsonicServer() },
+                        colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Rounded.Wifi, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("בדוק חיבור לשרת", fontWeight = FontWeight.Bold)
+                    }
                 }
+            }
+        }
+
+        if (s.streamSource == StreamSource.LOCAL) {
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = { vm.scanLocalFiles() },
+                colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Rounded.Folder, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("סרוק קובצי FLAC/MP3 במכשיר", fontWeight = FontWeight.Bold)
             }
         }
 
@@ -142,10 +173,24 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
 
         Spacer(Modifier.height(18.dp))
         SectionTitle("אקולייזר מובנה")
-        ToggleSettingRow("הפעל אקולייזר", "שליטה ב-5 תדרים בזמן אמת", s.eqEnabled) {
+        ToggleSettingRow("הפעל אקולייזר", "שליטה ב-5 תדרים בזמן אמת + פריסטים", s.eqEnabled) {
             vm.updateSettings(s.copy(eqEnabled = it))
         }
         if (s.eqEnabled) {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 8.dp)) {
+                itemsIndexed(eqPresets) { idx, (name, bands) ->
+                    val sel = s.eqPresetIndex == idx
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(if (sel) SpotifyGreen else SpotifyCard)
+                            .clickable { vm.updateSettings(s.copy(eqPresetIndex = idx, eqBands = bands)) }
+                            .padding(horizontal = 14.dp, vertical = 7.dp)
+                    ) {
+                        Text(name, color = if (sel) Color.Black else SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
             Card(colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface), shape = RoundedCornerShape(10.dp)) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     s.eqBands.forEachIndexed { idx, value ->
@@ -156,7 +201,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                                 onValueChange = { v ->
                                     val updated = s.eqBands.toMutableList()
                                     updated[idx] = v.toInt()
-                                    vm.updateSettings(s.copy(eqBands = updated))
+                                    vm.updateSettings(s.copy(eqBands = updated, eqPresetIndex = -1))
                                 },
                                 valueRange = -10f..10f,
                                 modifier = Modifier.weight(1f),
@@ -168,6 +213,23 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                 }
             }
         }
+
+        Spacer(Modifier.height(18.dp))
+        SectionTitle("AI Playlist מתקדם (אופציונלי)")
+        Text(
+            "AI Playlist עובד אוטומטית גם בלי מפתח. אם תזין מפתח Gemini API, ה-AI ירכיב בחירות שירים מותאמות עוד יותר.",
+            color = SpotifySubtle,
+            fontSize = 12.sp
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = s.geminiApiKey,
+            onValueChange = { vm.updateSettings(s.copy(geminiApiKey = it.trim())) },
+            label = { Text("Gemini API Key (אופציונלי)") },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
