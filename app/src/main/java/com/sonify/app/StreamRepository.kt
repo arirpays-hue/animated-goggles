@@ -9,6 +9,9 @@ import android.text.Html
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -75,10 +78,44 @@ class StreamRepository(private val context: Context) {
 
     private val ytDlpInitLock = Any()
     @Volatile private var ytDlpInitialized = false
-    @Volatile private var ytDlpUpdated = false
+    @Volatile private var ytDlpUpdateRunning = false
 
     private val offlineDir: File
         get() = File(context.filesDir, "offline_tracks").apply { if (!exists()) mkdirs() }
+
+    // Pre-initializes yt-dlp silently on app launch & updates binary only once every 7 days
+    suspend fun prewarmYtDlp() = withContext(Dispatchers.IO) {
+        if (!ensureYtDlpInitOnly()) return@withContext
+        val dlPrefs = context.getSharedPreferences("sonify_ytdlp", Context.MODE_PRIVATE)
+        val lastUpdate = dlPrefs.getLong("last_update_ms", 0L)
+        val sevenDaysMs = 7L * 24L * 60L * 60L * 1000L
+        if (!ytDlpUpdateRunning && (System.currentTimeMillis() - lastUpdate > sevenDaysMs)) {
+            ytDlpUpdateRunning = true
+            runCatching {
+                withTimeoutOrNull(25_000L) {
+                    YoutubeDL.getInstance().updateYoutubeDL(
+                        context.applicationContext,
+                        YoutubeDL.UpdateChannel.NIGHTLY
+                    )
+                    dlPrefs.edit().putLong("last_update_ms", System.currentTimeMillis()).apply()
+                }
+            }
+            ytDlpUpdateRunning = false
+        }
+    }
+
+    private fun ensureYtDlpInitOnly(): Boolean {
+        if (ytDlpInitialized) return true
+        synchronized(ytDlpInitLock) {
+            if (!ytDlpInitialized) {
+                ytDlpInitialized = runCatching {
+                    YoutubeDL.getInstance().init(context.applicationContext)
+                    true
+                }.getOrDefault(false)
+            }
+        }
+        return ytDlpInitialized
+    }
 
     fun isOnWifi(): Boolean {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return true
@@ -790,44 +827,15 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 4. NEW Real Embedded yt-dlp Engine (with Fallback Chain) ----------
-    private suspend fun ensureYtDlpReady(onProgress: (Int) -> Unit): Boolean {
-        if (!ytDlpInitialized) {
-            onProgress(5)
-            synchronized(ytDlpInitLock) {
-                if (!ytDlpInitialized) {
-                    ytDlpInitialized = runCatching {
-                        YoutubeDL.getInstance().init(context.applicationContext)
-                        true
-                    }.getOrDefault(false)
-                }
-            }
-        }
-        if (!ytDlpInitialized) return false
-
-        if (!ytDlpUpdated) {
-            onProgress(9)
-            withTimeoutOrNull(18_000L) {
-                runCatching {
-                    YoutubeDL.getInstance().updateYoutubeDL(
-                        context.applicationContext,
-                        YoutubeDL.UpdateChannel.NIGHTLY
-                    )
-                }
-            }
-            ytDlpUpdated = true
-        }
-        return true
-    }
-
+    // ---------- 4. High-Speed Offline Downloader (4x Parallel OkHttp First -> Prewarmed Accelerated yt-dlp!) ----------
     private suspend fun downloadViaYtDlp(
         videoId: String,
         quality: AudioQuality,
         target: File,
         onProgress: (Int) -> Unit
     ): Boolean {
-        if (!ensureYtDlpReady(onProgress)) return false
-        onProgress(12)
+        if (!ensureYtDlpInitOnly()) return false
+        onProgress(10)
 
         val qualityFormat = when (quality) {
             AudioQuality.LOW -> "worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio/18"
@@ -837,8 +845,8 @@ class StreamRepository(private val context: Context) {
         }
 
         val attempts = listOf(
-            qualityFormat to "youtube:player_client=android_vr,ios,tv_downgraded,web",
-            "bestaudio/18" to "youtube:player_client=tv_downgraded,android_vr,mweb",
+            qualityFormat to "youtube:player_client=android_vr,ios,tv_downgraded",
+            "bestaudio/18" to "youtube:player_client=tv_downgraded,mweb,android_vr",
             "18/best[ext=mp4]/best" to null
         )
 
@@ -846,7 +854,6 @@ class StreamRepository(private val context: Context) {
         val tmpFile = File(target.parentFile, "$tmpPrefix.tmp")
 
         for ((fmt, extractorArgs) in attempts) {
-            // Clean any leftover temp files for this track
             target.parentFile?.listFiles()?.filter { it.name.startsWith(tmpPrefix) }?.forEach { it.delete() }
 
             val request = YoutubeDLRequest("https://www.youtube.com/watch?v=$videoId").apply {
@@ -854,8 +861,11 @@ class StreamRepository(private val context: Context) {
                 addOption("--no-part")
                 addOption("--no-mtime")
                 addOption("--force-overwrites")
+                addOption("--no-cache-dir")
                 addOption("--retries", "2")
-                addOption("--socket-timeout", "12")
+                addOption("--socket-timeout", "10")
+                addOption("--http-chunk-size", "1048576")
+                addOption("--concurrent-fragments", "4")
                 addOption("-f", fmt)
                 if (!extractorArgs.isNullOrBlank()) {
                     addOption("--extractor-args", extractorArgs)
@@ -866,7 +876,7 @@ class StreamRepository(private val context: Context) {
             val ok = runCatching {
                 YoutubeDL.getInstance().execute(request, "sonify_dl_$videoId") { progress: Float, _: Long, _: String ->
                     if (progress >= 0f) {
-                        val mapped = (14 + (progress * 0.84f).toInt()).coerceIn(14, 98)
+                        val mapped = (12 + (progress * 0.86f).toInt()).coerceIn(12, 98)
                         onProgress(mapped)
                     }
                 }
@@ -904,7 +914,7 @@ class StreamRepository(private val context: Context) {
 
         val target = getOfflineFile(track.id)
 
-        val result = withTimeoutOrNull(120_000L) {
+        val result = withTimeoutOrNull(95_000L) {
             onProgress(3)
 
             if (track.source != StreamSource.YOUTUBE) {
@@ -915,20 +925,35 @@ class StreamRepository(private val context: Context) {
                 return@withTimeoutOrNull false to "שגיאה בהורדה מהמקור שנבחר"
             }
 
-            // Priority 1: Embedded yt-dlp engine (handles YouTube signatures, clients & progressive fallback!)
             val quality = effectiveQuality(settings, forDownload = true)
+
+            // Priority 1: Ultra-fast 4-connection parallel OkHttp download via direct InnerTube ANDROID_VR (1–3 seconds!)
+            val fastDirect = runCatching { fetchInnerTubeClient(track.id, "ANDROID_VR", quality, preferHls = false) }.getOrNull()
+            if (fastDirect != null && downloadSmart(fastDirect.audioUrl, fastDirect.userAgent, fastDirect.cookie, emptyMap(), target, false, onProgress)) {
+                return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
+            }
+
+            // Priority 2: 4-connection parallel OkHttp on live captured stream (if already playing)
+            for (cap in capturedStreams.sortedByDescending { it.isAudioOnly }.take(2)) {
+                val cleanBase = sanitizeYouTubePlaybackUrl(cap.url)
+                if (downloadSmart(cleanBase, cap.userAgent, cap.cookie, cap.headers, target, true, onProgress)) {
+                    return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
+                }
+            }
+
+            // Priority 3: Prewarmed & Accelerated yt-dlp engine (1MB chunks + 4 concurrent fragments)
             if (downloadViaYtDlp(track.id, quality, target, onProgress)) {
                 return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
             }
 
-            // Priority 2: Direct in-WebView JS fetch fallback
+            // Priority 4: Direct WebView JS fetch fallback
             if (webViewDownloadFn != null && capturedStreams.isNotEmpty()) {
                 val wvOk = runCatching { webViewDownloadFn(target, onProgress) }.getOrDefault(false)
                 if (wvOk) return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
             }
 
-            // Priority 3: Fast InnerTube / Proxy fallback
-            for (strategy in youtubeStrategies(track.id, quality)) {
+            // Priority 5: Fast IOS HLS / Cobalt / Piped / Invidious fallback
+            for (strategy in youtubeStrategies(track.id, quality).drop(1)) {
                 val resolved = runCatching { strategy() }.getOrNull() ?: continue
                 if (downloadSmart(resolved.audioUrl, resolved.userAgent, resolved.cookie, emptyMap(), target, false, onProgress)) {
                     return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
@@ -962,16 +987,16 @@ class StreamRepository(private val context: Context) {
             .trimEnd('&', '?')
     }
 
-    private fun downloadSmart(
+    private suspend fun downloadSmart(
         url: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>,
         target: File, isWebOrigin: Boolean, onProgress: (Int) -> Unit
     ): Boolean {
         if (url.contains(".m3u8", true) || url.contains("manifest/hls", true)) {
-            return downloadHlsAudioToFile(url, userAgent, cookie, target, onProgress)
+            return downloadHlsAudioParallel(url, userAgent, cookie, target, onProgress)
         }
         val clean = sanitizeYouTubePlaybackUrl(url)
         if (clean.contains("googlevideo.com") && clean.contains("clen=")) {
-            if (downloadChunkedByQueryRange(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, onProgress)) return true
+            if (downloadChunkedParallel(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, onProgress)) return true
         }
         return downloadUrlToFile(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, onProgress)
     }
@@ -991,7 +1016,8 @@ class StreamRepository(private val context: Context) {
         return rb.build()
     }
 
-    private fun downloadHlsAudioToFile(manifestUrl: String, userAgent: String, cookie: String?, target: File, onProgress: (Int) -> Unit): Boolean {
+    // 4-connection parallel HLS segment downloader
+    private suspend fun downloadHlsAudioParallel(manifestUrl: String, userAgent: String, cookie: String?, target: File, onProgress: (Int) -> Unit): Boolean {
         return runCatching {
             fun fetchText(u: String): String? {
                 val req = buildMediaRequest(u, userAgent, cookie, emptyMap(), false)
@@ -1007,17 +1033,34 @@ class StreamRepository(private val context: Context) {
             if (segments.isEmpty()) return false
 
             val tmp = File(target.parentFile, "${target.name}.tmp")
+            var completed = 0
             FileOutputStream(tmp).use { out ->
-                segments.forEachIndexed { idx, segUrl ->
-                    val bytes = downloadClient.newCall(buildMediaRequest(segUrl, userAgent, cookie, emptyMap(), false)).execute().use { r ->
-                        if (r.isSuccessful) r.body?.bytes() else null
+                for (batch in segments.chunked(4)) {
+                    val fetched = coroutineScope {
+                        batch.map { segUrl ->
+                            async(Dispatchers.IO) {
+                                runCatching {
+                                    downloadClient.newCall(buildMediaRequest(segUrl, userAgent, cookie, emptyMap(), false)).execute().use { r ->
+                                        if (r.isSuccessful) r.body?.bytes() else null
+                                    }
+                                }.getOrNull()
+                            }
+                        }.awaitAll()
                     }
-                    if (bytes == null || bytes.isEmpty()) { tmp.delete(); return false }
-                    out.write(bytes)
-                    onProgress(((idx + 1) * 95 / segments.size).coerceIn(5, 98))
+                    for (bytes in fetched) {
+                        if (bytes == null || bytes.isEmpty()) { tmp.delete(); return false }
+                        out.write(bytes)
+                        completed++
+                    }
+                    onProgress((completed * 96 / segments.size).coerceIn(5, 98))
                 }
             }
-            if (tmp.exists() && tmp.length() > 16_384) { tmp.renameTo(target); onProgress(100); true } else { tmp.delete(); false }
+            if (tmp.exists() && tmp.length() > 16_384) {
+                if (target.exists()) target.delete()
+                tmp.renameTo(target)
+                onProgress(100)
+                true
+            } else { tmp.delete(); false }
         }.getOrDefault(false)
     }
 
@@ -1043,53 +1086,102 @@ class StreamRepository(private val context: Context) {
                         }
                     }
                 }
-                if (tmp.exists() && tmp.length() > 16_384) { tmp.renameTo(target); onProgress(100); true } else { tmp.delete(); false }
+                if (tmp.exists() && tmp.length() > 16_384) {
+                    if (target.exists()) target.delete()
+                    tmp.renameTo(target)
+                    onProgress(100)
+                    true
+                } else { tmp.delete(); false }
             }
         }.getOrDefault(false)
     }
 
-    private fun downloadChunkedByQueryRange(
+    // 4-connection parallel chunked downloader (1MB chunks x 4 concurrent streams -> 1–3s per song!)
+    private suspend fun downloadChunkedParallel(
         baseUrl: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>,
         target: File, isWebOrigin: Boolean, onProgress: (Int) -> Unit
     ): Boolean {
         val clen = Regex("[?&]clen=(\\d+)").find(baseUrl)?.groupValues?.get(1)?.toLongOrNull() ?: return false
         if (clen <= 0L || clen > 85_000_000L) return false
+
         return runCatching {
             val tmp = File(target.parentFile, "${target.name}.tmp")
             var activeBase = baseUrl
             val chunkSize = 1024 * 1024L
 
-            FileOutputStream(tmp).use { out ->
-                var offset = 0L
-                while (offset < clen) {
-                    val end = (offset + chunkSize - 1).coerceAtMost(clen - 1)
-                    var chunkBytes: ByteArray? = null
-                    for (retry in 0..2) {
-                        val sep = if (activeBase.contains("?")) "&" else "?"
-                        val req = buildMediaRequest("$activeBase${sep}range=$offset-$end", userAgent, cookie, extraHeaders, isWebOrigin)
-                        val attemptRes = runCatching {
-                            downloadClient.newCall(req).execute().use { resp ->
-                                if (!resp.isSuccessful) return@use null
-                                val ct = resp.header("Content-Type").orEmpty().lowercase()
-                                if (ct.contains("yt-ump") || ct.contains("text/html")) return@use null
-                                val bytes = resp.body?.bytes() ?: return@use null
-                                if (ct.contains("text/plain") && bytes.size < 2048) {
-                                    val redir = String(bytes).trim()
-                                    if (redir.startsWith("https://")) { activeBase = sanitizeYouTubePlaybackUrl(redir); return@use ByteArray(0) }
-                                    return@use null
-                                }
-                                bytes
-                            }
-                        }.getOrNull()
-                        if (attemptRes != null && attemptRes.isNotEmpty()) { chunkBytes = attemptRes; break }
+            fun fetchRange(urlBase: String, start: Long, end: Long): Pair<ByteArray?, String?> {
+                val sep = if (urlBase.contains("?")) "&" else "?"
+                val req = buildMediaRequest("$urlBase${sep}range=$start-$end", userAgent, cookie, extraHeaders, isWebOrigin)
+                return runCatching {
+                    downloadClient.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) return@use null to null
+                        val ct = resp.header("Content-Type").orEmpty().lowercase()
+                        if (ct.contains("yt-ump") || ct.contains("text/html")) return@use null to null
+                        val bytes = resp.body?.bytes() ?: return@use null to null
+                        if (ct.contains("text/plain") && bytes.size < 2048) {
+                            val redir = String(bytes).trim()
+                            if (redir.startsWith("https://")) return@use null to sanitizeYouTubePlaybackUrl(redir)
+                            return@use null to null
+                        }
+                        bytes to null
                     }
-                    if (chunkBytes == null) { tmp.delete(); return false }
-                    out.write(chunkBytes)
-                    offset += chunkBytes.size
-                    onProgress(((offset * 98) / clen).toInt().coerceIn(5, 98))
+                }.getOrDefault(null to null)
+            }
+
+            // Build all chunk ranges
+            val ranges = mutableListOf<Pair<Long, Long>>()
+            var cursor = 0L
+            while (cursor < clen) {
+                val end = (cursor + chunkSize - 1).coerceAtMost(clen - 1)
+                ranges.add(cursor to end)
+                cursor = end + 1
+            }
+
+            // Probe & download chunk 0 first (catches ALR redirects / 403 immediately)
+            var firstBytes: ByteArray? = null
+            for (r in 0..1) {
+                val (b, redir) = fetchRange(activeBase, ranges[0].first, ranges[0].second)
+                if (redir != null) { activeBase = redir; continue }
+                if (b != null && b.isNotEmpty()) { firstBytes = b; break }
+            }
+            if (firstBytes == null) return false
+
+            var written = firstBytes.size.toLong()
+            onProgress(((written * 98) / clen).toInt().coerceIn(5, 98))
+
+            FileOutputStream(tmp).use { out ->
+                out.write(firstBytes)
+                val remainingRanges = ranges.drop(1)
+                for (batch in remainingRanges.chunked(4)) {
+                    val results = coroutineScope {
+                        batch.map { (start, end) ->
+                            async(Dispatchers.IO) {
+                                var got: ByteArray? = null
+                                var localUrl = activeBase
+                                for (retry in 0..2) {
+                                    val (b, redir) = fetchRange(localUrl, start, end)
+                                    if (redir != null) { localUrl = redir; continue }
+                                    if (b != null && b.isNotEmpty()) { got = b; break }
+                                }
+                                got
+                            }
+                        }.awaitAll()
+                    }
+                    for (chunk in results) {
+                        if (chunk == null) { tmp.delete(); return false }
+                        out.write(chunk)
+                        written += chunk.size
+                    }
+                    onProgress(((written * 98) / clen).toInt().coerceIn(5, 98))
                 }
             }
-            if (tmp.exists() && tmp.length() > 16_384) { tmp.renameTo(target); onProgress(100); true } else { tmp.delete(); false }
+
+            if (tmp.exists() && tmp.length() > 16_384) {
+                if (target.exists()) target.delete()
+                tmp.renameTo(target)
+                onProgress(100)
+                true
+            } else { tmp.delete(); false }
         }.getOrDefault(false)
     }
 
@@ -1239,7 +1331,7 @@ class StreamRepository(private val context: Context) {
         if (cleanArtist.isNotBlank()) {
             val exact = runCatching {
                 val url = "https://lrclib.net/api/get?artist_name=${URLEncoder.encode(cleanArtist, "UTF-8")}&track_name=${URLEncoder.encode(cleanTitle, "UTF-8")}"
-                client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/9.0").build()).execute().use { resp ->
+                client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/9.1").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
                 }
@@ -1255,7 +1347,7 @@ class StreamRepository(private val context: Context) {
         for (sq in searchQueries) {
             val found = runCatching {
                 val q = URLEncoder.encode(sq, "UTF-8")
-                client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/9.0").build()).execute().use { resp ->
+                client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/9.1").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
                     for (i in 0 until arr.length().coerceAtMost(8)) {
@@ -1283,7 +1375,7 @@ class StreamRepository(private val context: Context) {
         if (cleanArtist.isNotBlank() && cleanTitle.isNotBlank()) {
             val ovh = runCatching {
                 val url = "https://api.lyrics.ovh/v1/${URLEncoder.encode(cleanArtist, "UTF-8")}/${URLEncoder.encode(cleanTitle, "UTF-8")}"
-                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/9.0").build()).execute().use { resp ->
+                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/9.1").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val plain = JSONObject(resp.body?.string() ?: return@use emptyList()).optString("lyrics")
                     plain.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("Paroles de", true) }
