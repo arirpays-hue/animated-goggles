@@ -27,6 +27,29 @@ enum class AppLanguage(val label: String, val code: String) {
     ENGLISH("English", "en")
 }
 
+enum class LyricsLanguage(val apiName: String, val labelHe: String, val labelEn: String) {
+    HEBREW("Hebrew", "עברית", "Hebrew"),
+    ENGLISH("English", "אנגלית", "English"),
+    SPANISH("Spanish", "ספרדית", "Spanish"),
+    FRENCH("French", "צרפתית", "French"),
+    RUSSIAN("Russian", "רוסית", "Russian"),
+    ARABIC("Arabic", "ערבית", "Arabic");
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
+}
+
+enum class DownloadSpeedMode(val parallelChunks: Int, val concurrentSongs: Int, val labelHe: String, val labelEn: String) {
+    BALANCED(4, 2, "מאוזן (4 חיבורים)", "Balanced (4x)"),
+    TURBO(8, 3, "טורבו (8 חיבורים)", "Turbo (8x)"),
+    MAX(10, 4, "מקסימום (10 חיבורים)", "Max (10x)");
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
+}
+
+enum class AudioBufferProfile(val minMs: Int, val maxMs: Int, val playMs: Int, val rebufferMs: Int, val labelHe: String, val labelEn: String) {
+    STANDARD(25_000, 75_000, 1_500, 2_500, "רגיל (25s)", "Standard (25s)"),
+    HIGH_STABILITY(45_000, 120_000, 2_200, 3_500, "יציב נגד קטיעות (45s)", "Anti-Stutter (45s)");
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
+}
+
 enum class SettingsSection {
     ROOT,
     UI_LANGUAGE,
@@ -35,7 +58,8 @@ enum class SettingsSection {
     EQUALIZER,
     PRIVACY_TASTE,
     STORAGE_OFFLINE,
-    AI_NOTIFICATIONS
+    AI_NOTIFICATIONS,
+    JAM_SOCIAL
 }
 
 enum class HomeFilter(val labelHe: String, val labelEn: String) {
@@ -180,7 +204,8 @@ data class ResolvedStreams(
 
 data class LyricLine(
     val timeMs: Long,
-    val text: String
+    val text: String,
+    val translatedText: String? = null
 )
 
 data class Playlist(
@@ -204,7 +229,17 @@ data class Playlist(
     val isMixedMode: Boolean = false,
     val folderId: String? = null,
     val aiSeedPrompt: String = "",
+    val aiStyleTag: String = "",
     val createdAt: Long = System.currentTimeMillis()
+)
+
+data class HomeFeedSection(
+    val id: String,
+    val title: String,
+    val subtitle: String = "",
+    val playlists: List<Playlist> = emptyList(),
+    val tracks: List<Track> = emptyList(),
+    val remotePlaylists: List<RemotePlaylist> = emptyList()
 )
 
 data class PlaylistFolder(
@@ -296,7 +331,20 @@ data class AppSettings(
     val notifyNewReleases: Boolean = true,
     val notifyConcerts: Boolean = true,
     val notifyPodcasts: Boolean = true,
-    val carModeOptimized: Boolean = false
+    val carModeOptimized: Boolean = false,
+    // v10.0.0 Customization Settings
+    val infiniteAiHome: Boolean = true,
+    val showYoutubePlaylistsHome: Boolean = true,
+    val aiUniqueCovers: Boolean = true,
+    val downloadSpeedMode: DownloadSpeedMode = DownloadSpeedMode.TURBO,
+    val audioBufferProfile: AudioBufferProfile = AudioBufferProfile.HIGH_STABILITY,
+    val keepWakeLockAudio: Boolean = true,
+    val jamLiveSyncEnabled: Boolean = true,
+    val jamSyncServerUrl: String = "https://ntfy.sh",
+    val jamUserDisplayName: String = "",
+    val jamSyncToleranceSec: Int = 3,
+    val lyricsTargetLanguage: LyricsLanguage = LyricsLanguage.HEBREW,
+    val autoTranslateLyrics: Boolean = false
 )
 
 data class AudioOutputItem(
@@ -317,7 +365,9 @@ data class JamState(
     val isHost: Boolean = true,
     val guestsCanControlQueue: Boolean = true,
     val guestsCanControlVolume: Boolean = false,
-    val participants: List<String> = emptyList()
+    val participants: List<String> = emptyList(),
+    val liveConnected: Boolean = false,
+    val syncStatus: String = ""
 )
 
 data class BrowseCategory(
