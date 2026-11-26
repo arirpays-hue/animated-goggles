@@ -4,6 +4,7 @@ import android.Manifest
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -71,71 +72,85 @@ private fun SonifyAppRoot(vm: AppViewModel) {
     val state by vm.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
 
+    // Proper Android Back button handling
+    BackHandler(enabled = state.showNowPlaying || state.showSettings || state.openedPlaylistId != null || state.selectedTab != MainTab.HOME) {
+        when {
+            state.showNowPlaying -> vm.setShowNowPlaying(false)
+            state.showSettings -> vm.setShowSettings(false)
+            state.openedPlaylistId != null -> vm.openPlaylist(null)
+            state.selectedTab != MainTab.HOME -> vm.selectTab(MainTab.HOME)
+        }
+    }
+
     LaunchedEffect(state.statusMessage) {
         val msg = state.statusMessage ?: return@LaunchedEffect
         snackbarHostState.showSnackbar(msg, duration = SnackbarDuration.Short)
         vm.clearStatus()
     }
 
+    val openedPlaylist = state.playlists.firstOrNull { it.id == state.openedPlaylistId }
+
     Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
-        // Main Tab Content
-        if (state.showSettings) {
-            SettingsScreen(state, vm)
-        } else {
-            when (state.selectedTab) {
+        // Main Content
+        when {
+            state.showSettings -> SettingsScreen(state, vm)
+            openedPlaylist != null -> PlaylistDetailScreen(openedPlaylist, state, vm)
+            else -> when (state.selectedTab) {
                 MainTab.HOME -> HomeScreen(state, vm)
                 MainTab.SEARCH -> SearchScreen(state, vm)
                 MainTab.LIBRARY -> LibraryScreen(state, vm)
             }
         }
 
-        // Bottom Area: Floating MiniPlayer + Bottom Navigation Bar
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .background(
-                    Brush.verticalGradient(
-                        listOf(Color.Transparent, SpotifyBlack.copy(alpha = 0.94f), SpotifyBlack)
-                    )
-                )
-                .navigationBarsPadding()
-        ) {
-            if (state.currentTrack != null && !state.showNowPlaying) {
-                FloatingMiniPlayer(state, vm)
-            }
-
-            Row(
+        // Bottom Area: MiniPlayer + Bottom Nav (hidden inside Settings)
+        if (!state.showSettings) {
+            Column(
                 modifier = Modifier
+                    .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .height(60.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Transparent, SpotifyBlack.copy(alpha = 0.94f), SpotifyBlack)
+                        )
+                    )
+                    .navigationBarsPadding()
             ) {
-                BottomNavItem(
-                    label = "בית",
-                    icon = if (state.selectedTab == MainTab.HOME && !state.showSettings) Icons.Rounded.Home else Icons.Outlined.Home,
-                    selected = state.selectedTab == MainTab.HOME && !state.showSettings,
-                    onClick = { vm.selectTab(MainTab.HOME) }
-                )
-                BottomNavItem(
-                    label = "חיפוש",
-                    icon = if (state.selectedTab == MainTab.SEARCH && !state.showSettings) Icons.Rounded.Search else Icons.Outlined.Search,
-                    selected = state.selectedTab == MainTab.SEARCH && !state.showSettings,
-                    onClick = { vm.selectTab(MainTab.SEARCH) }
-                )
-                BottomNavItem(
-                    label = "הספרייה שלך",
-                    icon = if (state.selectedTab == MainTab.LIBRARY && !state.showSettings) Icons.Rounded.LibraryMusic else Icons.Outlined.LibraryMusic,
-                    selected = state.selectedTab == MainTab.LIBRARY && !state.showSettings,
-                    onClick = { vm.selectTab(MainTab.LIBRARY) }
-                )
-                BottomNavItem(
-                    label = "יצירה",
-                    icon = Icons.Rounded.Add,
-                    selected = false,
-                    onClick = { vm.setShowCreateSheet(true) }
-                )
+                if (state.currentTrack != null && !state.showNowPlaying) {
+                    FloatingMiniPlayer(state, vm)
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(60.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    BottomNavItem(
+                        label = "בית",
+                        icon = if (state.selectedTab == MainTab.HOME && openedPlaylist == null) Icons.Rounded.Home else Icons.Outlined.Home,
+                        selected = state.selectedTab == MainTab.HOME && openedPlaylist == null,
+                        onClick = { vm.selectTab(MainTab.HOME) }
+                    )
+                    BottomNavItem(
+                        label = "חיפוש",
+                        icon = if (state.selectedTab == MainTab.SEARCH && openedPlaylist == null) Icons.Rounded.Search else Icons.Outlined.Search,
+                        selected = state.selectedTab == MainTab.SEARCH && openedPlaylist == null,
+                        onClick = { vm.selectTab(MainTab.SEARCH) }
+                    )
+                    BottomNavItem(
+                        label = "הספרייה שלך",
+                        icon = if (state.selectedTab == MainTab.LIBRARY) Icons.Rounded.LibraryMusic else Icons.Outlined.LibraryMusic,
+                        selected = state.selectedTab == MainTab.LIBRARY,
+                        onClick = { vm.selectTab(MainTab.LIBRARY) }
+                    )
+                    BottomNavItem(
+                        label = "יצירה",
+                        icon = Icons.Rounded.Add,
+                        selected = false,
+                        onClick = { vm.setShowCreateSheet(true) }
+                    )
+                }
             }
         }
 
@@ -148,9 +163,24 @@ private fun SonifyAppRoot(vm: AppViewModel) {
             NowPlayingScreen(state, vm)
         }
 
-        // Create Sheet
+        // Bottom Sheets
         if (state.showCreateSheet) {
             CreateBottomSheet(state, vm)
+        }
+        if (state.showDevicesSheet) {
+            DevicesBottomSheet(state, vm)
+        }
+        state.trackForOptions?.let { track ->
+            TrackOptionsBottomSheet(track, state, vm)
+        }
+
+        // AI Playlist building indicator
+        if (state.isBuildingAiPlaylist) {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter).statusBarsPadding(),
+                color = SpotifyGreen,
+                trackColor = SpotifyCard
+            )
         }
 
         SnackbarHost(
