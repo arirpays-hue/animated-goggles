@@ -54,14 +54,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+import java.net.URLDecoder
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 
-// ---------- Real-Time PCM Mono & Left/Right Balance Processor ----------
 class ChannelBalanceMonoProcessor : BaseAudioProcessor() {
     @Volatile var monoEnabled: Boolean = false
-    @Volatile var balance: Float = 0f // -1f (Left) .. 0f (Center) .. +1f (Right)
+    @Volatile var balance: Float = 0f
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT || inputAudioFormat.channelCount != 2) {
@@ -91,10 +92,8 @@ class ChannelBalanceMonoProcessor : BaseAudioProcessor() {
                 val r = inputBuffer.getShort(i + 2).toInt()
                 val baseL = if (mono) (l + r) / 2 else l
                 val baseR = if (mono) (l + r) / 2 else r
-                val outL = (baseL * leftGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                val outR = (baseR * rightGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                out.putShort(outL)
-                out.putShort(outR)
+                out.putShort((baseL * leftGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort())
+                out.putShort((baseR * rightGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort())
                 i += 4
             }
             inputBuffer.position(limit)
@@ -111,22 +110,13 @@ object PlayerHolder {
         return player ?: synchronized(this) {
             player ?: run {
                 val renderersFactory = object : DefaultRenderersFactory(context.applicationContext) {
-                    override fun buildAudioSink(
-                        ctx: Context,
-                        enableFloatOutput: Boolean,
-                        enableAudioTrackPlaybackParams: Boolean
-                    ): AudioSink {
-                        return DefaultAudioSink.Builder(ctx)
-                            .setAudioProcessors(arrayOf(balanceMonoProcessor))
-                            .build()
+                    override fun buildAudioSink(ctx: Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): AudioSink {
+                        return DefaultAudioSink.Builder(ctx).setAudioProcessors(arrayOf(balanceMonoProcessor)).build()
                     }
                 }
                 ExoPlayer.Builder(context.applicationContext, renderersFactory)
                     .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(C.USAGE_MEDIA)
-                            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
-                            .build(),
+                        AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(),
                         true
                     )
                     .setHandleAudioBecomingNoisy(true)
@@ -139,22 +129,14 @@ object PlayerHolder {
 
 class PlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
-
     override fun onCreate() {
         super.onCreate()
         mediaSession = MediaSession.Builder(this, PlayerHolder.getOrCreate(this)).build()
     }
-
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
-
-    override fun onDestroy() {
-        mediaSession?.release()
-        mediaSession = null
-        super.onDestroy()
-    }
+    override fun onDestroy() { mediaSession?.release(); mediaSession = null; super.onDestroy() }
 }
 
-// ---------- Built-In YouTube Web Engine with Live Audio Stream Capture (Fixes Downloads!) ----------
 class WebPlaybackEngine(private val context: Context) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -166,7 +148,7 @@ class WebPlaybackEngine(private val context: Context) {
     private var watchdogRunnable: Runnable? = null
     private var currentSpeed: Float = 1.0f
 
-    val capturedStreams = ConcurrentHashMap<String, CapturedMediaStream>()
+    val capturedStreamsMap = ConcurrentHashMap<String, CopyOnWriteArrayList<CapturedMediaStream>>()
     private val mobileUa = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
     @Volatile var isActive: Boolean = false
@@ -176,6 +158,17 @@ class WebPlaybackEngine(private val context: Context) {
 
     var onProgress: ((Long, Long, Boolean, Boolean) -> Unit)? = null
     var onEnded: (() -> Unit)? = null
+
+    private fun recordCapturedUrl(videoId: String, rawUrl: String, isAudio: Boolean) {
+        if (videoId.isBlank() || !rawUrl.startsWith("http")) return
+        val list = capturedStreamsMap.getOrPut(videoId) { CopyOnWriteArrayList() }
+        if (list.any { it.url.substringBefore("&range=") == rawUrl.substringBefore("&range=") }) return
+        val cookie = runCatching { CookieManager.getInstance().getCookie(rawUrl) }.getOrNull()
+        list.add(0, CapturedMediaStream(videoId, rawUrl, mobileUa, cookie, isAudioOnly = isAudio))
+        while (list.size > 6) list.removeAt(list.lastIndex)
+    }
+
+    fun getCapturedStreams(videoId: String): List<CapturedMediaStream> = capturedStreamsMap[videoId]?.toList() ?: emptyList()
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun getOrCreateWebView(): WebView {
@@ -205,12 +198,13 @@ class WebPlaybackEngine(private val context: Context) {
                     val url = request?.url?.toString().orEmpty()
                     val vid = currentVideoId
                     if (vid.isNotBlank() && url.contains("googlevideo.com/videoplayback")) {
-                        val isAudio = url.contains("mime=audio", true) ||
-                            url.contains("itag=140") || url.contains("itag=251") ||
-                            url.contains("itag=250") || url.contains("itag=249") || url.contains("itag=18")
-                        if (isAudio) {
-                            val cookie = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
-                            capturedStreams[vid] = CapturedMediaStream(vid, url, mobileUa, cookie)
+                        val decoded = runCatching { URLDecoder.decode(url, "UTF-8") }.getOrDefault(url)
+                        val isAudio = decoded.contains("mime=audio", true) ||
+                            decoded.contains("itag=140") || decoded.contains("itag=251") ||
+                            decoded.contains("itag=250") || decoded.contains("itag=249")
+                        val isMuxed = decoded.contains("itag=18") || decoded.contains("itag=22")
+                        if (isAudio || isMuxed) {
+                            recordCapturedUrl(vid, url, isAudio)
                         }
                     }
                     return super.shouldInterceptRequest(view, request)
@@ -299,7 +293,7 @@ class WebPlaybackEngine(private val context: Context) {
                   if (st === -1 && !userPaused) { try { player.playVideo(); } catch(err) {} }
                   SonifyBridge.onProgress(pos, dur, st === 1, st === 3);
                 }
-              }, 350);
+              }, 300);
               window.sonifyPlay = function() { userPaused = false; if (player && player.playVideo) player.playVideo(); };
               window.sonifyPause = function() { userPaused = true; if (player && player.pauseVideo) player.pauseVideo(); };
               window.sonifyToggle = function() { if (!player) return; if (player.getPlayerState && player.getPlayerState() === 1) window.sonifyPause(); else window.sonifyPlay(); };
@@ -347,6 +341,29 @@ class WebPlaybackEngine(private val context: Context) {
               window.__sonifyUserPaused = false;
               window.__sonifyEndedFired = false;
               if (window.__sonifyTimer) clearInterval(window.__sonifyTimer);
+
+              // Extract direct stream URLs from ytInitialPlayerResponse if present
+              try {
+                var sd = window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.streamingData;
+                if (sd) {
+                  if (sd.hlsManifestUrl) SonifyBridge.onCapturedUrl(sd.hlsManifestUrl, true);
+                  if (sd.adaptiveFormats) {
+                    for (var i = 0; i < sd.adaptiveFormats.length; i++) {
+                      var af = sd.adaptiveFormats[i];
+                      if (af.url && af.mimeType && af.mimeType.indexOf('audio/') === 0) {
+                        SonifyBridge.onCapturedUrl(af.url, true);
+                        break;
+                      }
+                    }
+                  }
+                  if (sd.formats) {
+                    for (var j = 0; j < sd.formats.length; j++) {
+                      if (sd.formats[j].url) { SonifyBridge.onCapturedUrl(sd.formats[j].url, false); break; }
+                    }
+                  }
+                }
+              } catch(e) {}
+
               window.__sonifyTimer = setInterval(function() {
                 var skip = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern');
                 if (skip) { try { skip.click(); } catch(e){} }
@@ -354,6 +371,9 @@ class WebPlaybackEngine(private val context: Context) {
                 if (unmuteBtn && unmuteBtn.offsetParent !== null) { try { unmuteBtn.click(); } catch(e){} }
                 var v = document.querySelector('video');
                 if (!v) return;
+                if (v.currentSrc && v.currentSrc.indexOf('http') === 0) {
+                  SonifyBridge.onCapturedUrl(v.currentSrc, false);
+                }
                 if (Math.abs(v.playbackRate - $currentSpeed) > 0.05) { try { v.playbackRate = $currentSpeed; } catch(e){} }
                 if (!window.__sonifyUserPaused) {
                   if (v.muted) v.muted = false;
@@ -366,7 +386,8 @@ class WebPlaybackEngine(private val context: Context) {
                 var buffering = !window.__sonifyUserPaused && !playing && v.readyState < 3;
                 SonifyBridge.onProgress(pos, dur, playing, buffering);
                 if (v.ended && !window.__sonifyEndedFired) { window.__sonifyEndedFired = true; SonifyBridge.onEnded(); }
-              }, 350);
+              }, 300);
+
               window.sonifyPlay = function() { window.__sonifyUserPaused = false; var v = document.querySelector('video'); if (v) { v.muted = false; v.play().catch(function(){}); } };
               window.sonifyPause = function() { window.__sonifyUserPaused = true; var v = document.querySelector('video'); if (v) v.pause(); };
               window.sonifyToggle = function() { var v = document.querySelector('video'); if (!v) return; if (v.paused) window.sonifyPlay(); else window.sonifyPause(); };
@@ -413,6 +434,9 @@ class WebPlaybackEngine(private val context: Context) {
 
         @JavascriptInterface fun onEnded() { if (isActive) mainHandler.post { onEnded?.invoke() } }
         @JavascriptInterface fun onEmbedError(code: Int) { if (isActive) switchToMobileWatchFallback() }
+        @JavascriptInterface fun onCapturedUrl(url: String, isAudio: Boolean) {
+            if (currentVideoId.isNotBlank()) recordCapturedUrl(currentVideoId, url, isAudio)
+        }
     }
 }
 
@@ -492,7 +516,7 @@ class AudioEngine(private val context: Context) {
     }
 
     fun attachWebView(container: FrameLayout) = webEngine.attachTo(container)
-    fun getCapturedStream(videoId: String): CapturedMediaStream? = webEngine.capturedStreams[videoId]
+    fun getCapturedStreams(videoId: String): List<CapturedMediaStream> = webEngine.getCapturedStreams(videoId)
 
     private fun attachAudioEffects(sessionId: Int) {
         if (sessionId == C.AUDIO_SESSION_ID_UNSET || sessionId <= 0) return
@@ -501,12 +525,7 @@ class AudioEngine(private val context: Context) {
             runCatching {
                 dynamicsProcessing?.release()
                 val cfg = DynamicsProcessing.Config.Builder(
-                    DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-                    2,
-                    true, 10,
-                    false, 0,
-                    false, 0,
-                    true
+                    DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION, 2, true, 10, false, 0, false, 0, true
                 ).build()
                 dynamicsProcessing = DynamicsProcessing(0, sessionId, cfg)
             }
@@ -536,16 +555,14 @@ class AudioEngine(private val context: Context) {
                     dp.enabled = settings.eqEnabled
                     val eq = DynamicsProcessing.Eq(true, settings.eqEnabled, 10)
                     for (i in 0 until 10) {
-                        val bandGainDb = settings.eqBands.getOrElse(i) { 0 }.toFloat().coerceIn(-12f, 12f)
                         eq.getBand(i).apply {
                             isEnabled = settings.eqEnabled
                             cutoffFrequency = eqCenterFreqs[i]
-                            gain = bandGainDb
+                            gain = settings.eqBands.getOrElse(i) { 0 }.toFloat().coerceIn(-12f, 12f)
                         }
                     }
                     dp.setPreEqAllChannelsTo(eq)
-                    val limiter = DynamicsProcessing.Limiter(true, true, 0, 2f, 60f, 4f, -1.5f, 0f)
-                    dp.setLimiterAllChannelsTo(limiter)
+                    dp.setLimiterAllChannelsTo(DynamicsProcessing.Limiter(true, true, 0, 2f, 60f, 4f, -1.5f, 0f))
                 }
             }
         } else {
@@ -557,8 +574,7 @@ class AudioEngine(private val context: Context) {
                     val maxLvl = eq.bandLevelRange[1].toInt()
                     for (i in 0 until bands) {
                         val mapped = settings.eqBands.getOrElse((i * 2).coerceAtMost(9)) { 0 }
-                        val lvl = ((mapped / 12f) * (maxLvl - minLvl) / 2f).toInt().coerceIn(minLvl, maxLvl)
-                        eq.setBandLevel(i.toShort(), lvl.toShort())
+                        eq.setBandLevel(i.toShort(), ((mapped / 12f) * (maxLvl - minLvl) / 2f).toInt().coerceIn(minLvl, maxLvl).toShort())
                     }
                 }
             }
