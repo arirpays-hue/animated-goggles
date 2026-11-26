@@ -30,9 +30,6 @@ class StreamRepository(private val context: Context) {
         .followRedirects(true)
         .build()
 
-    @Volatile
-    private var cachedVisitorData: String? = null
-
     private val pipedInstances = listOf(
         "https://pipedapi.kavin.rocks",
         "https://pipedapi.adminforge.de",
@@ -62,34 +59,7 @@ class StreamRepository(private val context: Context) {
             ?: emptySet()
     }
 
-    private fun getOrFetchVisitorData(): String {
-        cachedVisitorData?.let { return it }
-        val fetched = runCatching {
-            val body = JSONObject().apply {
-                put("context", JSONObject().apply {
-                    put("client", JSONObject().apply {
-                        put("clientName", "WEB")
-                        put("clientVersion", "2.20250219.01.00")
-                        put("hl", "he")
-                        put("gl", "IL")
-                    })
-                })
-            }
-            val req = Request.Builder()
-                .url("https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")
-                .post(body.toString().toRequestBody("application/json".toMediaType()))
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-                .build()
-            client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use ""
-                JSONObject(resp.body?.string() ?: "").optJSONObject("responseContext")?.optString("visitorData").orEmpty()
-            }
-        }.getOrDefault("")
-        if (fetched.isNotBlank()) cachedVisitorData = fetched
-        return fetched
-    }
-
-    // ---------- 1. Search Songs (YouTube Music Songs-Only First!) ----------
+    // ---------- 1. Search Songs (YouTube Music Songs-Only First) ----------
     suspend fun searchTracks(
         query: String,
         settings: AppSettings,
@@ -538,20 +508,19 @@ class StreamRepository(private val context: Context) {
         resolveYouTubeNonWrapping(track.id, settings.quality, attemptIndex)
     }
 
-    private fun verifyMediaStreamDeep(url: String, userAgent: String): Boolean {
+    private fun verifyMediaStreamDeep(url: String, userAgent: String, depth: Int = 0): Boolean {
+        if (depth > 3) return false
         return runCatching {
             if (url.contains(".m3u8", true) || url.contains("manifest/hls", true)) {
-                // Verify HLS manifest AND at least one inner media segment!
                 val req = Request.Builder().url(url).header("User-Agent", userAgent).build()
                 val text = probeClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return false
                     resp.body?.string().orEmpty()
                 }
                 val firstSubUrl = text.lines().firstOrNull { it.startsWith("http") } ?: return false
-                return verifyMediaStreamDeep(firstSubUrl, userAgent)
+                return verifyMediaStreamDeep(firstSubUrl, userAgent, depth + 1)
             }
 
-            // Direct media stream check: request 64KB chunk and verify non-HTML binary bytes
             val req = Request.Builder()
                 .url(url)
                 .header("User-Agent", userAgent)
@@ -569,17 +538,15 @@ class StreamRepository(private val context: Context) {
     }
 
     private fun resolveYouTubeNonWrapping(videoId: String, quality: AudioQuality, startAttempt: Int): ResolvedStreams? {
-        val visitorData = getOrFetchVisitorData()
         val strategies: List<() -> ResolvedStreams?> = listOf(
-            { fetchInnerTubeClient(videoId, "ANDROID_VR", quality, visitorData, preferMuxed = false) },
-            { fetchInnerTubeClient(videoId, "ANDROID_VR", quality, visitorData, preferMuxed = true) },
-            { fetchInnerTubeClient(videoId, "IOS", quality, visitorData, preferMuxed = false) },
-            { fetchInnerTubeClient(videoId, "TV_EMBEDDED", quality, visitorData, preferMuxed = false) },
+            { fetchInnerTubeClient(videoId, "ANDROID_VR", quality, preferMuxed = false) },
+            { fetchInnerTubeClient(videoId, "ANDROID_VR", quality, preferMuxed = true) },
+            { fetchInnerTubeClient(videoId, "ANDROID_VR_LEGACY", quality, preferMuxed = false) },
+            { fetchInnerTubeClient(videoId, "TV_EMBEDDED", quality, preferMuxed = false) },
             { fetchPipedStream(videoId, quality) },
             { fetchInvidiousProxiedStream(videoId) }
         )
 
-        // NEVER wrap around to already-failed strategies!
         for (i in startAttempt until strategies.size) {
             val res = runCatching { strategies[i]() }.getOrNull()
             if (res != null) return res
@@ -591,37 +558,33 @@ class StreamRepository(private val context: Context) {
         videoId: String,
         clientType: String,
         quality: AudioQuality,
-        visitorData: String,
         preferMuxed: Boolean
     ): ResolvedStreams? {
         val (clientObj, ua, idHeader, verHeader) = when (clientType) {
             "ANDROID_VR" -> Quad(
                 JSONObject().apply {
-                    put("clientName", "ANDROID_VR"); put("clientVersion", "1.60.19")
+                    put("clientName", "ANDROID_VR"); put("clientVersion", "1.61.48")
                     put("androidSdkVersion", 32); put("osName", "Android"); put("osVersion", "12L")
                     put("deviceMake", "Oculus"); put("deviceModel", "Quest 3")
                     put("hl", "he"); put("gl", "IL")
-                    if (visitorData.isNotBlank()) put("visitorData", visitorData)
                 },
-                "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-                "28", "1.60.19"
+                "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                "28", "1.61.48"
             )
-            "IOS" -> Quad(
+            "ANDROID_VR_LEGACY" -> Quad(
                 JSONObject().apply {
-                    put("clientName", "IOS"); put("clientVersion", "20.10.4")
-                    put("deviceMake", "Apple"); put("deviceModel", "iPhone16,2")
-                    put("osName", "iPhone"); put("osVersion", "18.3.2.22D82")
+                    put("clientName", "ANDROID_VR"); put("clientVersion", "1.56.21")
+                    put("androidSdkVersion", 32); put("osName", "Android"); put("osVersion", "12L")
+                    put("deviceMake", "Oculus"); put("deviceModel", "Quest 3")
                     put("hl", "he"); put("gl", "IL")
-                    if (visitorData.isNotBlank()) put("visitorData", visitorData)
                 },
-                "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)",
-                "5", "20.10.4"
+                "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                "28", "1.56.21"
             )
             else -> Quad(
                 JSONObject().apply {
                     put("clientName", "TVHTML5_SIMPLY_EMBEDDED_PLAYER"); put("clientVersion", "2.0")
                     put("hl", "he"); put("gl", "IL")
-                    if (visitorData.isNotBlank()) put("visitorData", visitorData)
                 },
                 "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
                 "85", "2.0"
@@ -635,15 +598,15 @@ class StreamRepository(private val context: Context) {
         val bodyJson = JSONObject().apply {
             put("videoId", videoId); put("contentCheckOk", true); put("racyCheckOk", true); put("context", contextObj)
         }
-        val reqBuilder = Request.Builder()
+        val req = Request.Builder()
             .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
             .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
             .header("User-Agent", ua)
             .header("X-YouTube-Client-Name", idHeader)
             .header("X-YouTube-Client-Version", verHeader)
-        if (visitorData.isNotBlank()) reqBuilder.header("X-Goog-Visitor-Id", visitorData)
+            .build()
 
-        return client.newCall(reqBuilder.build()).execute().use { resp ->
+        return client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return null
             val root = JSONObject(resp.body?.string() ?: return null)
             if (root.optJSONObject("playabilityStatus")?.optString("status") != "OK") return null
@@ -751,7 +714,6 @@ class StreamRepository(private val context: Context) {
     private fun fetchInvidiousProxiedStream(videoId: String): ResolvedStreams? {
         val ua = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
         for (base in invidiousInstances) {
-            // &local=true proxies the audio through Invidious server, bypassing cellular CGNAT 403!
             val audioProxy = "$base/latest_version?id=$videoId&itag=140&local=true"
             val videoProxy = "$base/latest_version?id=$videoId&itag=18&local=true"
             if (verifyMediaStreamDeep(audioProxy, ua)) {
