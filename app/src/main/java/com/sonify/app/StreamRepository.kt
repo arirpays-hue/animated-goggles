@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.provider.MediaStore
+import android.text.Html
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -19,6 +20,7 @@ import java.io.FileOutputStream
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 class StreamRepository(private val context: Context) {
 
@@ -31,8 +33,8 @@ class StreamRepository(private val context: Context) {
 
     private val downloadClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
-        .callTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(14, TimeUnit.SECONDS)
+        .callTimeout(22, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
@@ -91,10 +93,7 @@ class StreamRepository(private val context: Context) {
             ?: emptySet()
     }
 
-    fun getOfflineSizeMb(): Float {
-        val bytes = offlineDir.listFiles()?.sumOf { it.length() } ?: 0L
-        return bytes / (1024f * 1024f)
-    }
+    fun getOfflineSizeMb(): Float = (offlineDir.listFiles()?.sumOf { it.length() } ?: 0L) / (1024f * 1024f)
 
     fun getCacheSizeMb(): Float {
         fun dirSize(f: File): Long = if (f.isDirectory) f.listFiles()?.sumOf { dirSize(it) } ?: 0L else f.length()
@@ -105,12 +104,13 @@ class StreamRepository(private val context: Context) {
     fun deleteAllOfflineTracks() { runCatching { offlineDir.listFiles()?.forEach { it.delete() } } }
     fun deleteOfflineTrack(trackId: String) { val f = getOfflineFile(trackId); if (f.exists()) f.delete() }
 
-    // ---------- 1. Search Songs / Podcasts / Audiobooks ----------
+    // ---------- 1. Search Songs / Podcasts / Audiobooks / Artist Tracks ----------
     suspend fun searchTracks(
         query: String,
         settings: AppSettings,
         podcastsOnly: Boolean = false,
-        audiobooksOnly: Boolean = false
+        audiobooksOnly: Boolean = false,
+        maxResults: Int = 30
     ): List<Track> = withContext(Dispatchers.IO) {
         if (settings.offlineMode && settings.streamSource != StreamSource.LOCAL) return@withContext emptyList()
 
@@ -121,26 +121,73 @@ class StreamRepository(private val context: Context) {
         }
 
         val list = when (settings.streamSource) {
-            StreamSource.YOUTUBE -> searchYouTubeStrict(cleanQuery, podcastsOnly, audiobooksOnly)
+            StreamSource.YOUTUBE -> searchYouTubeStrict(cleanQuery, podcastsOnly, audiobooksOnly, maxResults)
             StreamSource.OPENSUBSONIC -> searchSubsonic(cleanQuery, settings)
             StreamSource.LOCAL -> searchLocalAudio(cleanQuery)
         }
         if (!settings.allowExplicit) list.filterNot { it.isExplicit } else list
     }
 
-    private fun searchYouTubeStrict(query: String, isPodcast: Boolean, isAudiobook: Boolean): List<Track> {
+    suspend fun searchArtistTracks(artistName: String, settings: AppSettings): List<Track> = withContext(Dispatchers.IO) {
+        val s1 = searchTracks(artistName, settings, maxResults = 25)
+        val s2 = searchTracks("$artistName top hits", settings, maxResults = 20)
+        (s1 + s2).distinctBy { it.id }.take(35)
+    }
+
+    // ---------- NEW: Official Music Video Finder (Fixes Frozen Album-Art Video!) ----------
+    suspend fun findOfficialMusicVideoId(track: Track): String? = withContext(Dispatchers.IO) {
+        val cleanTitle = cleanSongTitle(track.title)
+        val cleanArtist = cleanArtistName(track.artist)
+        val hasHebrew = cleanTitle.any { it in '\u0590'..'\u05FF' } || cleanArtist.any { it in '\u0590'..'\u05FF' }
+
+        val queries = buildList {
+            add("$cleanArtist $cleanTitle official music video")
+            if (hasHebrew) add("$cleanArtist $cleanTitle קליפ רשמי")
+            add("$cleanArtist $cleanTitle official video")
+        }
+
+        for (q in queries) {
+            val candidates = runCatching { searchYouTubeWeb(q, false, false, 10) }.getOrDefault(emptyList())
+            val scored = candidates
+                .filter { cand ->
+                    cand.id != track.id &&
+                        !cand.artist.endsWith("- Topic", true) &&
+                        (cand.durationMs == 0L || cand.durationMs in 70_000L..540_000L)
+                }
+                .map { cand ->
+                    var score = 0
+                    val lt = cand.title.lowercase()
+                    if (lt.contains("official music video") || lt.contains("קליפ רשמי")) score += 60
+                    else if (lt.contains("official video") || lt.contains("music video") || lt.contains("קליפ")) score += 45
+                    if (lt.contains("official audio") || lt.contains("lyric") || lt.contains("מילים") || lt.contains("audio only")) score -= 40
+                    if (lt.contains("live") || lt.contains("cover") || lt.contains("remix") || lt.contains("karaoke")) score -= 25
+                    if (track.durationMs > 0 && cand.durationMs > 0) {
+                        val diffSec = abs(track.durationMs - cand.durationMs) / 1000
+                        if (diffSec < 45) score += 20 else if (diffSec > 120) score -= 25
+                    }
+                    cand to score
+                }
+                .sortedByDescending { it.second }
+
+            val best = scored.firstOrNull { it.second >= 10 }?.first
+            if (best != null) return@withContext best.id
+        }
+        null
+    }
+
+    private fun searchYouTubeStrict(query: String, isPodcast: Boolean, isAudiobook: Boolean, maxResults: Int): List<Track> {
         val longForm = isPodcast || isAudiobook
         val raw = if (!longForm) {
-            runCatching { searchYouTubeMusicSongs(query) }.getOrDefault(emptyList())
-                .ifEmpty { runCatching { searchYouTubeWeb(query, false, false) }.getOrDefault(emptyList()) }
+            runCatching { searchYouTubeMusicSongs(query, maxResults) }.getOrDefault(emptyList())
+                .ifEmpty { runCatching { searchYouTubeWeb(query, false, false, maxResults) }.getOrDefault(emptyList()) }
                 .ifEmpty { searchPiped(query, false, false) }
                 .ifEmpty { searchInvidious(query, false, false) }
         } else {
-            runCatching { searchYouTubeWeb(query, isPodcast, isAudiobook) }.getOrDefault(emptyList())
+            runCatching { searchYouTubeWeb(query, isPodcast, isAudiobook, maxResults) }.getOrDefault(emptyList())
                 .ifEmpty { searchPiped(query, isPodcast, isAudiobook) }
         }
-        if (longForm) return raw.distinctBy { it.id }.take(20)
-        return raw.filter { isLikelySingleSong(it) }.distinctBy { it.id }.take(20)
+        if (longForm) return raw.distinctBy { it.id }.take(maxResults)
+        return raw.filter { isLikelySingleSong(it) }.distinctBy { it.id }.take(maxResults)
     }
 
     private fun isLikelySingleSong(t: Track): Boolean {
@@ -160,7 +207,7 @@ class StreamRepository(private val context: Context) {
         return l.contains("explicit") || l.contains("(e)") || l.contains("uncensored") || l.contains("fuck") || l.contains("bitch")
     }
 
-    private fun searchYouTubeMusicSongs(query: String): List<Track> {
+    private fun searchYouTubeMusicSongs(query: String, limit: Int): List<Track> {
         val bodyJson = JSONObject().apply {
             put("query", query)
             put("params", "EgWKAQIIAWoKEAkQBRAKEAMQBA==")
@@ -177,12 +224,12 @@ class StreamRepository(private val context: Context) {
         return client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return emptyList()
             val out = mutableListOf<Track>()
-            extractYtMusicSongs(JSONObject(resp.body?.string() ?: return emptyList()), out)
+            extractYtMusicSongs(JSONObject(resp.body?.string() ?: return emptyList()), out, limit)
             out.distinctBy { it.id }
         }
     }
 
-    // ---------- 2. Playlists Search, Browse & Import ----------
+    // ---------- 2. Playlists Search, Browse (Up to 100+ Songs!) & Import ----------
     suspend fun searchPlaylists(query: String): List<RemotePlaylist> = withContext(Dispatchers.IO) {
         val bodyJson = JSONObject().apply {
             put("query", query)
@@ -228,7 +275,7 @@ class StreamRepository(private val context: Context) {
         emptyList()
     }
 
-    suspend fun fetchPlaylistTracks(playlistId: String): List<Track> = withContext(Dispatchers.IO) {
+    suspend fun fetchPlaylistTracks(playlistId: String, maxTracks: Int = 100): List<Track> = withContext(Dispatchers.IO) {
         val browseId = if (playlistId.startsWith("VL") || playlistId.startsWith("MPRE")) playlistId else "VL$playlistId"
         val rawId = playlistId.removePrefix("VL")
 
@@ -248,7 +295,7 @@ class StreamRepository(private val context: Context) {
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@use emptyList()
                 val out = mutableListOf<Track>()
-                extractYtMusicSongs(JSONObject(resp.body?.string() ?: return@use emptyList()), out)
+                extractYtMusicSongs(JSONObject(resp.body?.string() ?: return@use emptyList()), out, maxTracks)
                 out.filter { isLikelySingleSong(it) }.distinctBy { it.id }
             }
         }.getOrDefault(emptyList())
@@ -260,7 +307,7 @@ class StreamRepository(private val context: Context) {
                     if (!resp.isSuccessful) return@use emptyList()
                     val arr = JSONObject(resp.body?.string() ?: return@use emptyList()).optJSONArray("relatedStreams") ?: return@use emptyList()
                     buildList {
-                        for (i in 0 until arr.length()) {
+                        for (i in 0 until arr.length().coerceAtMost(maxTracks)) {
                             val o = arr.optJSONObject(i) ?: continue
                             val id = o.optString("url").substringAfter("v=", "").substringBefore("&")
                             if (id.length != 11) continue
@@ -280,15 +327,15 @@ class StreamRepository(private val context: Context) {
         if (trimmed.contains("list=", ignoreCase = true)) {
             val listId = trimmed.substringAfter("list=").substringBefore("&").substringBefore("\n").trim()
             if (listId.isNotBlank()) {
-                val tracks = fetchPlaylistTracks(listId)
+                val tracks = fetchPlaylistTracks(listId, maxTracks = 100)
                 if (tracks.isNotEmpty()) return@withContext tracks
             }
         }
-        val lines = trimmed.lines().map { it.trim() }.filter { it.length >= 2 }.take(25)
+        val lines = trimmed.lines().map { it.trim() }.filter { it.length >= 2 }.take(60)
         val imported = mutableListOf<Track>()
         for (line in lines) {
             val cleaned = line.replace(Regex("^\\d+[.)\\s-]+"), "").trim()
-            val found = searchTracks(cleaned, settings)
+            val found = searchTracks(cleaned, settings, maxResults = 5)
             found.firstOrNull { cand -> imported.none { it.id == cand.id } }?.let { imported.add(it) }
         }
         imported
@@ -300,8 +347,8 @@ class StreamRepository(private val context: Context) {
         })
     }
 
-    private fun extractYtMusicSongs(node: Any?, out: MutableList<Track>) {
-        if (out.size >= 35 || node == null) return
+    private fun extractYtMusicSongs(node: Any?, out: MutableList<Track>, maxLimit: Int = 100) {
+        if (out.size >= maxLimit || node == null) return
         when (node) {
             is JSONObject -> {
                 if (node.has("musicResponsiveListItemRenderer")) {
@@ -346,15 +393,15 @@ class StreamRepository(private val context: Context) {
                     }
                 } else {
                     val keys = node.keys()
-                    while (keys.hasNext()) extractYtMusicSongs(node.opt(keys.next()), out)
+                    while (keys.hasNext()) extractYtMusicSongs(node.opt(keys.next()), out, maxLimit)
                 }
             }
-            is JSONArray -> { for (i in 0 until node.length()) extractYtMusicSongs(node.opt(i), out) }
+            is JSONArray -> { for (i in 0 until node.length()) extractYtMusicSongs(node.opt(i), out, maxLimit) }
         }
     }
 
     private fun extractYtMusicPlaylists(node: Any?, out: MutableList<RemotePlaylist>) {
-        if (out.size >= 20 || node == null) return
+        if (out.size >= 30 || node == null) return
         when (node) {
             is JSONObject -> {
                 if (node.has("musicResponsiveListItemRenderer")) {
@@ -377,7 +424,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    private fun searchYouTubeWeb(query: String, isPodcast: Boolean, isAudiobook: Boolean): List<Track> {
+    private fun searchYouTubeWeb(query: String, isPodcast: Boolean, isAudiobook: Boolean, maxLimit: Int = 30): List<Track> {
         val bodyJson = JSONObject().apply {
             put("query", query)
             put("context", JSONObject().apply {
@@ -394,7 +441,7 @@ class StreamRepository(private val context: Context) {
         return client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return emptyList()
             val out = mutableListOf<Track>()
-            extractVideoRenderers(JSONObject(resp.body?.string() ?: return emptyList()), out, isPodcast, isAudiobook)
+            extractVideoRenderers(JSONObject(resp.body?.string() ?: return emptyList()), out, isPodcast, isAudiobook, maxLimit)
             out.distinctBy { it.id }
         }
     }
@@ -430,7 +477,7 @@ class StreamRepository(private val context: Context) {
                     if (!resp.isSuccessful) return@use emptyList()
                     val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
                     buildList {
-                        for (i in 0 until arr.length().coerceAtMost(20)) {
+                        for (i in 0 until arr.length().coerceAtMost(25)) {
                             val o = arr.optJSONObject(i) ?: continue
                             val id = o.optString("videoId")
                             if (id.length != 11) continue
@@ -445,8 +492,8 @@ class StreamRepository(private val context: Context) {
         return emptyList()
     }
 
-    private fun extractVideoRenderers(node: Any?, out: MutableList<Track>, isPodcast: Boolean, isAudiobook: Boolean) {
-        if (out.size >= 30 || node == null) return
+    private fun extractVideoRenderers(node: Any?, out: MutableList<Track>, isPodcast: Boolean, isAudiobook: Boolean, maxLimit: Int) {
+        if (out.size >= maxLimit || node == null) return
         when (node) {
             is JSONObject -> {
                 if (node.has("videoRenderer")) {
@@ -462,10 +509,10 @@ class StreamRepository(private val context: Context) {
                     }
                 } else {
                     val keys = node.keys()
-                    while (keys.hasNext()) extractVideoRenderers(node.opt(keys.next()), out, isPodcast, isAudiobook)
+                    while (keys.hasNext()) extractVideoRenderers(node.opt(keys.next()), out, isPodcast, isAudiobook, maxLimit)
                 }
             }
-            is JSONArray -> { for (i in 0 until node.length()) extractVideoRenderers(node.opt(i), out, isPodcast, isAudiobook) }
+            is JSONArray -> { for (i in 0 until node.length()) extractVideoRenderers(node.opt(i), out, isPodcast, isAudiobook, maxLimit) }
         }
     }
 
@@ -717,17 +764,18 @@ class StreamRepository(private val context: Context) {
         val sorted = list.sortedBy { it.first }
         return when (quality) {
             AudioQuality.LOW -> sorted.first().second
-            AudioQuality.NORMAL -> sorted.minByOrNull { kotlin.math.abs(it.first - 96) }?.second
-            AudioQuality.HIGH -> sorted.minByOrNull { kotlin.math.abs(it.first - 160) }?.second
+            AudioQuality.NORMAL -> sorted.minByOrNull { abs(it.first - 96) }?.second
+            AudioQuality.HIGH -> sorted.minByOrNull { abs(it.first - 160) }?.second
             AudioQuality.VERY_HIGH, AudioQuality.LOSSLESS -> sorted.last().second
         }
     }
 
-    // ---------- 4. FIXED Offline Downloader (No 29% Stall! Strips UMP/ALR, Single-Pass Fallback, 75s Guard) ----------
+    // ---------- 4. Upgraded Offline Downloader (WebView JS Fetch FIRST -> OkHttp Captured -> 6 Strategies) ----------
     suspend fun downloadTrackOffline(
         track: Track,
         settings: AppSettings,
         capturedStreams: List<CapturedMediaStream> = emptyList(),
+        webViewDownloadFn: (suspend (File, (Int) -> Unit) -> Boolean)? = null,
         onProgress: (Int) -> Unit = {}
     ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         if (settings.offlineMode) return@withContext false to "מצב אופליין פעיל — כבה אותו כדי להוריד"
@@ -737,37 +785,43 @@ class StreamRepository(private val context: Context) {
 
         val target = getOfflineFile(track.id)
 
-        val result = withTimeoutOrNull(75_000L) {
+        val result = withTimeoutOrNull(85_000L) {
             onProgress(3)
 
-            // 1) Non-YouTube sources (OpenSubsonic / Local)
             if (track.source != StreamSource.YOUTUBE) {
                 val res = resolveStreams(track, settings, forDownload = true)
-                if (res != null && downloadSmart(res.audioUrl, res.userAgent, res.cookie, target, isWebOrigin = false, onProgress)) {
+                if (res != null && downloadSmart(res.audioUrl, res.userAgent, res.cookie, emptyMap(), target, false, onProgress)) {
                     return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
                 }
                 return@withTimeoutOrNull false to "שגיאה בהורדה מהמקור שנבחר"
             }
 
-            // 2) Try sanitized captured live streams from WebView (audio-only first)
+            // Priority 1: Direct in-WebView JS fetch() (uses live browser TLS & session -> immune to 403!)
+            if (webViewDownloadFn != null && capturedStreams.isNotEmpty()) {
+                val wvOk = runCatching { webViewDownloadFn(target, onProgress) }.getOrDefault(false)
+                if (wvOk) return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
+            }
+
+            // Priority 2: OkHttp with full captured headers/cookies
             for (cap in capturedStreams.sortedByDescending { it.isAudioOnly }.take(3)) {
-                onProgress(5)
+                onProgress(6)
                 val cleanBase = sanitizeYouTubePlaybackUrl(cap.url)
-                if (downloadSmart(cleanBase, cap.userAgent, cap.cookie, target, isWebOrigin = true, onProgress)) {
+                if (downloadSmart(cleanBase, cap.userAgent, cap.cookie, cap.headers, target, true, onProgress)) {
                     return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
                 }
             }
 
-            // 3) Single-pass through every YouTube strategy (NO redundant 6x6 looping!)
+            // Priority 3: Single-pass YouTube strategies (ANDROID_VR, IOS HLS, Cobalt, Piped, Invidious)
             val quality = effectiveQuality(settings, forDownload = true)
             for (strategy in youtubeStrategies(track.id, quality)) {
-                onProgress(5)
+                onProgress(8)
                 val resolved = runCatching { strategy() }.getOrNull() ?: continue
-                if (downloadSmart(resolved.audioUrl, resolved.userAgent, resolved.cookie, target, isWebOrigin = false, onProgress)) {
+                if (downloadSmart(resolved.audioUrl, resolved.userAgent, resolved.cookie, emptyMap(), target, false, onProgress)) {
                     return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
                 }
             }
-            false to "שרת ההורדה חסם את הגישה כרגע — נסה שוב או ב-Wi-Fi"
+
+            false to "לא ניתן להוריד כרגע — נגן את השיר 3 שניות ולחץ שוב הורדה"
         }
 
         result ?: (false to "ההורדה לקחה יותר מדי זמן — נסה שוב")
@@ -776,31 +830,30 @@ class StreamRepository(private val context: Context) {
     private fun sanitizeYouTubePlaybackUrl(url: String): String {
         return url
             .replace(Regex("([?&])(range|rn|rbuf|alr|ump|srfvp|sabr)=[^&]*"), "$1")
-            .replace("?&", "?")
-            .replace(Regex("&{2,}"), "&")
-            .trimEnd('&', '?')
+            .replace("?&", "?").replace(Regex("&{2,}"), "&").trimEnd('&', '?')
     }
 
     private fun downloadSmart(
-        url: String,
-        userAgent: String,
-        cookie: String?,
-        target: File,
-        isWebOrigin: Boolean,
-        onProgress: (Int) -> Unit
+        url: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>,
+        target: File, isWebOrigin: Boolean, onProgress: (Int) -> Unit
     ): Boolean {
         if (url.contains(".m3u8", true) || url.contains("manifest/hls", true)) {
             return downloadHlsAudioToFile(url, userAgent, cookie, target, onProgress)
         }
         val clean = sanitizeYouTubePlaybackUrl(url)
         if (clean.contains("googlevideo.com") && clean.contains("clen=")) {
-            if (downloadChunkedByQueryRange(clean, userAgent, cookie, target, isWebOrigin, onProgress)) return true
+            if (downloadChunkedByQueryRange(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, onProgress)) return true
         }
-        return downloadUrlToFile(clean, userAgent, cookie, target, isWebOrigin, onProgress)
+        return downloadUrlToFile(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, onProgress)
     }
 
-    private fun buildMediaRequest(url: String, userAgent: String, cookie: String?, isWebOrigin: Boolean): Request {
+    private fun buildMediaRequest(url: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>, isWebOrigin: Boolean): Request {
         val rb = Request.Builder().url(url).header("User-Agent", userAgent)
+        extraHeaders.forEach { (k, v) ->
+            if (!k.equals("Range", true) && !k.equals("Host", true) && !k.equals("Content-Length", true)) {
+                rb.header(k, v)
+            }
+        }
         if (!cookie.isNullOrBlank()) rb.header("Cookie", cookie)
         if (isWebOrigin && url.contains("googlevideo.com")) {
             rb.header("Origin", "https://m.youtube.com")
@@ -812,7 +865,7 @@ class StreamRepository(private val context: Context) {
     private fun downloadHlsAudioToFile(manifestUrl: String, userAgent: String, cookie: String?, target: File, onProgress: (Int) -> Unit): Boolean {
         return runCatching {
             fun fetchText(u: String): String? {
-                val req = buildMediaRequest(u, userAgent, cookie, isWebOrigin = false)
+                val req = buildMediaRequest(u, userAgent, cookie, emptyMap(), false)
                 return downloadClient.newCall(req).execute().use { r -> if (r.isSuccessful) r.body?.string() else null }
             }
             var playlistText = fetchText(manifestUrl) ?: return false
@@ -827,7 +880,7 @@ class StreamRepository(private val context: Context) {
             val tmp = File(target.parentFile, "${target.name}.tmp")
             FileOutputStream(tmp).use { out ->
                 segments.forEachIndexed { idx, segUrl ->
-                    val bytes = downloadClient.newCall(buildMediaRequest(segUrl, userAgent, cookie, false)).execute().use { r ->
+                    val bytes = downloadClient.newCall(buildMediaRequest(segUrl, userAgent, cookie, emptyMap(), false)).execute().use { r ->
                         if (r.isSuccessful) r.body?.bytes() else null
                     }
                     if (bytes == null || bytes.isEmpty()) { tmp.delete(); return false }
@@ -839,9 +892,9 @@ class StreamRepository(private val context: Context) {
         }.getOrDefault(false)
     }
 
-    private fun downloadUrlToFile(url: String, userAgent: String, cookie: String?, target: File, isWebOrigin: Boolean, onProgress: (Int) -> Unit): Boolean {
+    private fun downloadUrlToFile(url: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>, target: File, isWebOrigin: Boolean, onProgress: (Int) -> Unit): Boolean {
         return runCatching {
-            val req = buildMediaRequest(url, userAgent, cookie, isWebOrigin)
+            val req = buildMediaRequest(url, userAgent, cookie, extraHeaders, isWebOrigin)
             downloadClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return false
                 val ct = resp.header("Content-Type").orEmpty().lowercase()
@@ -867,54 +920,40 @@ class StreamRepository(private val context: Context) {
     }
 
     private fun downloadChunkedByQueryRange(
-        baseUrl: String,
-        userAgent: String,
-        cookie: String?,
-        target: File,
-        isWebOrigin: Boolean,
-        onProgress: (Int) -> Unit
+        baseUrl: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>,
+        target: File, isWebOrigin: Boolean, onProgress: (Int) -> Unit
     ): Boolean {
         val clen = Regex("[?&]clen=(\\d+)").find(baseUrl)?.groupValues?.get(1)?.toLongOrNull() ?: return false
         if (clen <= 0L || clen > 85_000_000L) return false
         return runCatching {
             val tmp = File(target.parentFile, "${target.name}.tmp")
             var activeBase = baseUrl
-            val chunkSize = 1024 * 1024L // 1 MB chunks (fast + avoids per-chunk throttle!)
+            val chunkSize = 1024 * 1024L
 
             FileOutputStream(tmp).use { out ->
                 var offset = 0L
                 while (offset < clen) {
                     val end = (offset + chunkSize - 1).coerceAtMost(clen - 1)
                     var chunkBytes: ByteArray? = null
-
                     for (retry in 0..2) {
                         val sep = if (activeBase.contains("?")) "&" else "?"
-                        val req = buildMediaRequest("$activeBase${sep}range=$offset-$end", userAgent, cookie, isWebOrigin)
+                        val req = buildMediaRequest("$activeBase${sep}range=$offset-$end", userAgent, cookie, extraHeaders, isWebOrigin)
                         val attemptRes = runCatching {
                             downloadClient.newCall(req).execute().use { resp ->
                                 if (!resp.isSuccessful) return@use null
                                 val ct = resp.header("Content-Type").orEmpty().lowercase()
                                 if (ct.contains("yt-ump") || ct.contains("text/html")) return@use null
                                 val bytes = resp.body?.bytes() ?: return@use null
-                                // Handle YouTube ALR text redirect if returned
                                 if (ct.contains("text/plain") && bytes.size < 2048) {
                                     val redir = String(bytes).trim()
-                                    if (redir.startsWith("https://")) {
-                                        activeBase = sanitizeYouTubePlaybackUrl(redir)
-                                        return@use ByteArray(0) // trigger retry with new URL
-                                    }
+                                    if (redir.startsWith("https://")) { activeBase = sanitizeYouTubePlaybackUrl(redir); return@use ByteArray(0) }
                                     return@use null
                                 }
                                 bytes
                             }
                         }.getOrNull()
-
-                        if (attemptRes != null && attemptRes.isNotEmpty()) {
-                            chunkBytes = attemptRes
-                            break
-                        }
+                        if (attemptRes != null && attemptRes.isNotEmpty()) { chunkBytes = attemptRes; break }
                     }
-
                     if (chunkBytes == null) { tmp.delete(); return false }
                     out.write(chunkBytes)
                     offset += chunkBytes.size
@@ -925,81 +964,108 @@ class StreamRepository(private val context: Context) {
         }.getOrDefault(false)
     }
 
-    // ---------- 5. AI Playlist Builder ----------
-    suspend fun buildAiPlaylist(prompt: String, settings: AppSettings): Pair<String, List<Track>> = withContext(Dispatchers.IO) {
-        val cleanPrompt = prompt.trim()
+    // ---------- 5. Advanced AI Playlist Studio (15 / 25 / 40 / 50 Songs!) ----------
+    suspend fun buildAiPlaylist(config: AiPlaylistConfig, settings: AppSettings): Pair<String, List<Track>> = withContext(Dispatchers.IO) {
+        val cleanPrompt = config.prompt.trim()
+        val targetCount = config.targetCount.coerceIn(10, 50)
+
         if (settings.geminiApiKey.isNotBlank()) {
-            val geminiPlan = runCatching { requestGeminiSongList(cleanPrompt, settings.geminiApiKey) }.getOrNull()
+            val geminiPlan = runCatching { requestGeminiSongList(config, settings.geminiApiKey) }.getOrNull()
             if (geminiPlan != null && geminiPlan.second.isNotEmpty()) {
                 val curated = mutableListOf<Track>()
-                for (songQuery in geminiPlan.second.take(12)) {
-                    val found = searchTracks(songQuery, settings)
+                for (songQuery in geminiPlan.second.take(targetCount)) {
+                    val found = searchTracks(songQuery, settings, maxResults = 4)
                     found.firstOrNull { cand -> curated.none { it.id == cand.id } }?.let { curated.add(it) }
                 }
-                if (curated.isNotEmpty()) return@withContext geminiPlan.first to curated
+                if (curated.size >= 5) return@withContext geminiPlan.first to curated
             }
         }
-        val (playlistTitle, queries) = expandPromptIntoSmartQueries(cleanPrompt)
+
+        val (playlistTitle, queries) = expandConfigIntoSmartQueries(config)
         val curated = mutableListOf<Track>()
         val seenTitles = mutableSetOf<String>()
         for (q in queries) {
-            val results = searchTracks(q, settings)
+            val results = searchTracks(q, settings, maxResults = 15)
             for (t in results) {
                 val normTitle = t.title.lowercase().replace(Regex("[^a-z0-9א-ת]"), "").take(18)
                 if (curated.none { it.id == t.id } && seenTitles.add(normTitle)) {
                     curated.add(t)
-                    if (curated.size >= 15) break
+                    if (curated.size >= targetCount) break
                 }
             }
-            if (curated.size >= 15) break
+            if (curated.size >= targetCount) break
         }
         playlistTitle to curated.shuffled()
     }
 
-    private fun expandPromptIntoSmartQueries(prompt: String): Pair<String, List<String>> {
+    private fun expandConfigIntoSmartQueries(config: AiPlaylistConfig): Pair<String, List<String>> {
+        val prompt = config.prompt.trim()
         val lower = prompt.lowercase()
-        val isHebrewPrompt = prompt.any { it in '\u0590'..'\u05FF' }
-        val wantsEnglish = lower.contains("אנגלית") || lower.contains("english") || lower.contains("לועזי")
-        val wantsHebrew = lower.contains("עברית") || lower.contains("ישראלי") || lower.contains("hebrew") || (isHebrewPrompt && !wantsEnglish)
+        val isHeb = config.languagePref == "עברית" || (config.languagePref == "משולב" && prompt.any { it in '\u0590'..'\u05FF' })
+        val isEng = config.languagePref == "אנגלית" || config.languagePref == "משולב"
+        val eraSuffix = when (config.eraPref) {
+            "חדש (2024+)" -> " 2025 2026"
+            "2010s" -> " 2010s hits"
+            "קלאסיקות" -> " classic hits"
+            else -> ""
+        }
+        val energySuffix = when (config.energyPref) {
+            "אנרגטי" -> " upbeat energy"
+            "רגוע" -> " chill acoustic"
+            else -> ""
+        }
+
         val queries = mutableListOf<String>()
         when {
             lower.contains("אימון") || lower.contains("כושר") || lower.contains("ריצה") || lower.contains("workout") || lower.contains("gym") -> {
-                if (wantsHebrew) queries += listOf("נועה קירל", "טונה", "סטטיק", "אודיה")
-                queries += listOf("Eminem Lose Yourself", "Kanye West Stronger", "Travis Scott FEIN", "The Weeknd Blinding Lights", "Imagine Dragons Believer")
+                if (isHeb) queries += listOf("נועה קירל", "טונה", "סטטיק", "אודיה", "רביד פלוטניק", "עומר אדם קצבי")
+                if (isEng) queries += listOf("Eminem workout", "Kanye West Stronger", "Travis Scott FEIN", "The Weeknd Blinding Lights", "Imagine Dragons Believer", "David Guetta workout", "Linkin Park workout")
             }
             lower.contains("לילה") || lower.contains("רגוע") || lower.contains("שינה") || lower.contains("צ'יל") || lower.contains("chill") -> {
-                if (wantsHebrew) queries += listOf("עידן רייכל", "ישי ריבו", "נתן גושן")
-                queries += listOf("Billie Eilish Birds of a Feather", "Frank Ocean Pink White", "The Weeknd Die For You", "Lana Del Rey Cinnamon Girl")
+                if (isHeb) queries += listOf("עידן רייכל", "ישי ריבו", "נתן גושן", "אביתר בנאי", "יסמין מועלם")
+                if (isEng) queries += listOf("Billie Eilish chill", "Frank Ocean", "The Weeknd slow", "Lana Del Rey", "Cigarettes After Sex", "Radiohead calm")
             }
             lower.contains("מסיבה") || lower.contains("קלאב") || lower.contains("ריקוד") || lower.contains("party") || lower.contains("dance") -> {
-                if (wantsHebrew) queries += listOf("עומר אדם", "עדן בן זקן", "אנה זק")
-                queries += listOf("Dua Lipa Houdini", "David Guetta Titanium", "Calvin Harris Summer", "Pitbull Give Me Everything")
+                if (isHeb) queries += listOf("עומר אדם", "עדן בן זקן", "אנה זק", "אושר כהן", "פאר טסי")
+                if (isEng) queries += listOf("Dua Lipa dance", "Calvin Harris hits", "David Guetta hits", "Pitbull party", "Rihanna club", "Lady Gaga dance")
             }
             lower.contains("עצוב") || lower.contains("שבור") || lower.contains("בלד") || lower.contains("sad") -> {
-                if (wantsHebrew) queries += listOf("אביב גפן", "חנן בן ארי", "עדן חסון")
-                queries += listOf("Adele Someone Like You", "Lewis Capaldi Someone You Loved", "Olivia Rodrigo Drivers License")
+                if (isHeb) queries += listOf("אביב גפן", "חנן בן ארי", "עדן חסון", "אייל גולן בלדות", "שלמה ארצי")
+                if (isEng) queries += listOf("Adele ballads", "Lewis Capaldi", "Olivia Rodrigo sad", "Coldplay Fix You", "Sam Smith sad")
             }
             lower.contains("רוק") || lower.contains("rock") || lower.contains("מטאל") -> {
-                if (wantsHebrew) queries += listOf("היהודים", "משינה", "מרסדס בנד")
-                queries += listOf("Linkin Park Numb", "Arctic Monkeys Do I Wanna Know", "Queen Bohemian Rhapsody", "Nirvana Smells Like Teen Spirit")
+                if (isHeb) queries += listOf("היהודים", "משינה", "מרסדס בנד", "מוניקה סקס", "ברי סחרוף")
+                if (isEng) queries += listOf("Linkin Park", "Arctic Monkeys", "Queen greatest hits", "Nirvana", "Red Hot Chili Peppers", "Green Day", "Radiohead")
             }
             lower.contains("ראפ") || lower.contains("היפ") || lower.contains("rap") || lower.contains("hip hop") -> {
-                if (wantsHebrew) queries += listOf("רביד פלוטניק", "טונה", "ג'ימבו ג'יי", "שחר סאול")
-                queries += listOf("Kendrick Lamar Not Like Us", "Drake God's Plan", "Travis Scott Sicko Mode", "21 Savage Redrum")
+                if (isHeb) queries += listOf("רביד פלוטניק", "טונה", "ג'ימבו ג'יי", "שחר סאול", "נורוז", "פלד")
+                if (isEng) queries += listOf("Kendrick Lamar", "Drake hits", "Travis Scott", "21 Savage", "Metro Boomin", "Future rap", "Eminem")
             }
             lower.contains("מזרחית") || lower.contains("ים תיכוני") -> {
-                queries += listOf("עומר אדם", "עדן חסון", "פאר טסי", "אושר כהן", "אייל גולן")
+                queries += listOf("עומר אדם", "עדן חסון", "פאר טסי", "אושר כהן", "אייל גולן", "איתי לוי", "שרית חדד", "משה פרץ")
             }
             lower.contains("אנימה") || lower.contains("anime") || lower.contains("גיימינג") || lower.contains("gaming") -> {
-                queries += listOf("Arcane Goodbye Ramsey", "Enemy Imagine Dragons", "YOASOBI Idol", "Cyberpunk I Really Want to Stay at Your House")
+                queries += listOf("Arcane soundtrack", "YOASOBI anime", "LiSA anime", "Cyberpunk Edgerunners soundtrack", "Imagine Dragons Enemy", "phonk gaming")
             }
-            else -> queries += listOf(prompt, "$prompt hits", "$prompt top songs")
+            else -> {
+                queries += listOf(
+                    "$prompt$eraSuffix$energySuffix",
+                    "$prompt best songs",
+                    "$prompt top hits",
+                    "$prompt similar artists",
+                    "$prompt essentials"
+                )
+            }
         }
         return "AI • ${prompt.take(26)}" to queries.distinct()
     }
 
-    private fun requestGeminiSongList(prompt: String, apiKey: String): Pair<String, List<String>>? {
-        val sysPrompt = """Build a 12-song music playlist for: "$prompt". Reply ONLY with valid JSON: {"title": "Short title", "songs": ["Artist - Song", ...]}"""
+    private fun requestGeminiSongList(config: AiPlaylistConfig, apiKey: String): Pair<String, List<String>>? {
+        val sysPrompt = """
+            Build a ${config.targetCount}-song playlist for: "${config.prompt}".
+            Preferences: language=${config.languagePref}, energy=${config.energyPref}, era=${config.eraPref}.
+            Reply ONLY with valid JSON: {"title": "Short catchy title", "songs": ["Artist - Song", ...]}
+        """.trimIndent()
         val payload = JSONObject().apply {
             put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sysPrompt)))))
         }
@@ -1013,13 +1079,177 @@ class StreamRepository(private val context: Context) {
                 .optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")
                 ?.optJSONArray("parts")?.optJSONObject(0)?.optString("text") ?: return null
             val parsed = JSONObject("{${text.substringAfter("{").substringBeforeLast("}")}}")
-            val title = parsed.optString("title", "AI • ${prompt.take(24)}")
+            val title = parsed.optString("title", "AI • ${config.prompt.take(24)}")
             val songsArr = parsed.optJSONArray("songs") ?: return null
             title to buildList { for (i in 0 until songsArr.length()) songsArr.optString(i).takeIf { it.isNotBlank() }?.let { add(it) } }
         }
     }
 
-    // ---------- OpenSubsonic / Local / Lyrics ----------
+    // ---------- 6. 4-Layer Synced Lyrics Engine (LRCLIB Exact -> LRCLIB Search -> YouTube Captions -> Lyrics.ovh) ----------
+    private fun cleanSongTitle(title: String): String {
+        return title
+            .replace(Regex("\\([^)]*(official|video|audio|lyric|prod|remaster|feat|ft\\.|קליפ|מילים|רשמי)[^)]*\\)", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\[[^]]*]"), "")
+            .replace(Regex("\\s*-\\s*(official|audio|video|קליפ).*", RegexOption.IGNORE_CASE), "")
+            .replace("Official Music Video", "", true)
+            .replace("Official Video", "", true)
+            .replace("Official Audio", "", true)
+            .replace("קליפ רשמי", "")
+            .replace("|", " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun cleanArtistName(artist: String): String {
+        return artist
+            .replace("- Topic", "", true)
+            .replace("VEVO", "", true)
+            .replace("Official", "", true)
+            .substringBefore(",")
+            .substringBefore("&")
+            .trim()
+    }
+
+    suspend fun fetchSyncedLyrics(track: Track, manualOverrideQuery: String? = null): List<LyricLine> = withContext(Dispatchers.IO) {
+        val cleanTitle = if (!manualOverrideQuery.isNullOrBlank()) manualOverrideQuery.trim() else cleanSongTitle(track.title)
+        val cleanArtist = if (!manualOverrideQuery.isNullOrBlank()) "" else cleanArtistName(track.artist)
+
+        // Layer 1: LRCLIB Exact Match
+        if (cleanArtist.isNotBlank()) {
+            val exact = runCatching {
+                val url = "https://lrclib.net/api/get?artist_name=${URLEncoder.encode(cleanArtist, "UTF-8")}&track_name=${URLEncoder.encode(cleanTitle, "UTF-8")}"
+                client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/7.0").build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use emptyList()
+                    parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
+                }
+            }.getOrDefault(emptyList())
+            if (exact.isNotEmpty()) return@withContext exact
+        }
+
+        // Layer 2: LRCLIB Broad Search (Artist+Title, then Title-only for Hebrew/translated titles)
+        val searchQueries = listOfNotNull(
+            "$cleanArtist $cleanTitle".trim().takeIf { it.isNotBlank() },
+            cleanTitle.takeIf { it.isNotBlank() && cleanArtist.isNotBlank() }
+        ).distinct()
+
+        for (sq in searchQueries) {
+            val found = runCatching {
+                val q = URLEncoder.encode(sq, "UTF-8")
+                client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/7.0").build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use emptyList()
+                    val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
+                    // Prefer synced lyrics first
+                    for (i in 0 until arr.length().coerceAtMost(8)) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        if (obj.optString("syncedLyrics").isNotBlank()) {
+                            val parsed = parseLyricsJson(obj)
+                            if (parsed.isNotEmpty()) return@use parsed
+                        }
+                    }
+                    for (i in 0 until arr.length().coerceAtMost(8)) {
+                        val parsed = parseLyricsJson(arr.optJSONObject(i) ?: continue)
+                        if (parsed.isNotEmpty()) return@use parsed
+                    }
+                    emptyList()
+                }
+            }.getOrDefault(emptyList())
+            if (found.isNotEmpty()) return@withContext found
+        }
+
+        // Layer 3: YouTube Caption Tracks (Synced timedtext directly from YouTube - huge win for Hebrew!)
+        if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
+            val ytCaptions = runCatching { fetchYouTubeCaptions(track.id) }.getOrDefault(emptyList())
+            if (ytCaptions.isNotEmpty()) return@withContext ytCaptions
+        }
+
+        // Layer 4: Lyrics.ovh fallback (plain lyrics)
+        if (cleanArtist.isNotBlank() && cleanTitle.isNotBlank()) {
+            val ovh = runCatching {
+                val url = "https://api.lyrics.ovh/v1/${URLEncoder.encode(cleanArtist, "UTF-8")}/${URLEncoder.encode(cleanTitle, "UTF-8")}"
+                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/7.0").build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use emptyList()
+                    val plain = JSONObject(resp.body?.string() ?: return@use emptyList()).optString("lyrics")
+                    plain.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("Paroles de", true) }
+                        .mapIndexed { idx, line -> LyricLine(idx * 3200L, line) }
+                }
+            }.getOrDefault(emptyList())
+            if (ovh.isNotEmpty()) return@withContext ovh
+        }
+
+        emptyList()
+    }
+
+    private fun fetchYouTubeCaptions(videoId: String): List<LyricLine> {
+        val body = JSONObject().apply {
+            put("videoId", videoId)
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB"); put("clientVersion", "2.20250219.01.00"); put("hl", "he"); put("gl", "IL")
+                })
+            })
+        }
+        val req = Request.Builder()
+            .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .build()
+
+        val captionUrl = client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return emptyList()
+            val root = JSONObject(resp.body?.string() ?: return emptyList())
+            val tracks = root.optJSONObject("captions")
+                ?.optJSONObject("playerCaptionsTracklistRenderer")
+                ?.optJSONArray("captionTracks") ?: return emptyList()
+            var bestUrl: String? = null
+            for (i in 0 until tracks.length()) {
+                val ct = tracks.optJSONObject(i) ?: continue
+                val base = ct.optString("baseUrl")
+                val lang = ct.optString("languageCode")
+                val kind = ct.optString("kind") // empty = manual lyrics/subtitles (much better than asr)
+                if (base.startsWith("http")) {
+                    if (kind.isBlank() && (lang.startsWith("he") || lang.startsWith("iw") || lang.startsWith("en"))) {
+                        bestUrl = base; break
+                    }
+                    if (bestUrl == null) bestUrl = base
+                }
+            }
+            bestUrl
+        } ?: return emptyList()
+
+        val xml = client.newCall(Request.Builder().url(captionUrl).header("User-Agent", "Mozilla/5.0").build()).execute().use { r ->
+            if (!r.isSuccessful) return emptyList()
+            r.body?.string().orEmpty()
+        }
+        val regex = Regex("<text[^>]*start=\"([0-9.]+)\"[^>]*>(.*?)</text>", RegexOption.DOT_MATCHES_ALL)
+        return regex.findAll(xml).mapNotNull { m ->
+            val startSec = m.groupValues[1].toDoubleOrNull() ?: return@mapNotNull null
+            val rawText = Html.fromHtml(m.groupValues[2], Html.FROM_HTML_MODE_LEGACY).toString().replace("\n", " ").trim()
+            if (rawText.isBlank() || rawText == "[Music]" || rawText == "[מוזיקה]") null
+            else LyricLine((startSec * 1000).toLong(), rawText)
+        }.toList().sortedBy { it.timeMs }
+    }
+
+    private fun parseLyricsJson(json: JSONObject): List<LyricLine> {
+        val synced = json.optString("syncedLyrics")
+        if (synced.isNotBlank()) return parseLrc(synced)
+        val plain = json.optString("plainLyrics")
+        if (plain.isNotBlank()) return plain.lines().filter { it.isNotBlank() }.mapIndexed { idx, line -> LyricLine(idx * 3500L, line.trim()) }
+        return emptyList()
+    }
+
+    private fun parseLrc(lrc: String): List<LyricLine> {
+        val regex = Regex("\\[(\\d{1,2}):(\\d{2})(?:\\.(\\d{1,3}))?](.*)")
+        return lrc.lines().mapNotNull { line ->
+            val m = regex.find(line.trim()) ?: return@mapNotNull null
+            val min = m.groupValues[1].toLongOrNull() ?: 0L
+            val sec = m.groupValues[2].toLongOrNull() ?: 0L
+            val ms = m.groupValues[3].padEnd(3, '0').take(3).toLongOrNull() ?: 0L
+            val text = m.groupValues[4].trim()
+            if (text.isBlank()) null else LyricLine(min * 60_000L + sec * 1000L + ms, text)
+        }.sortedBy { it.timeMs }
+    }
+
+    // ---------- OpenSubsonic & Local Audio ----------
     suspend fun testSubsonicConnection(settings: AppSettings): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         if (settings.subsonicUrl.isBlank()) return@withContext false to "יש להזין כתובת שרת"
         runCatching {
@@ -1039,7 +1269,7 @@ class StreamRepository(private val context: Context) {
             val base = settings.subsonicUrl.trimEnd('/')
             val auth = buildSubsonicAuth(settings.subsonicUser, settings.subsonicPass)
             val q = URLEncoder.encode(query.ifBlank { "" }, "UTF-8")
-            client.newCall(Request.Builder().url("$base/rest/search3.view?query=$q&songCount=30&$auth").build()).execute().use { resp ->
+            client.newCall(Request.Builder().url("$base/rest/search3.view?query=$q&songCount=40&$auth").build()).execute().use { resp ->
                 if (!resp.isSuccessful) return emptyList()
                 val songs = JSONObject(resp.body?.string() ?: return emptyList()).optJSONObject("subsonic-response")?.optJSONObject("searchResult3")?.optJSONArray("song") ?: return emptyList()
                 buildList {
@@ -1082,51 +1312,5 @@ class StreamRepository(private val context: Context) {
         }
         return list
     }
-
-    suspend fun fetchSyncedLyrics(artist: String, title: String): List<LyricLine> = withContext(Dispatchers.IO) {
-        val cleanTitle = title.replace(Regex("\\(.*?\\)|\\[.*?]"), "").replace("Official Video", "", true).replace("Official Audio", "", true).trim()
-        val cleanArtist = artist.replace("- Topic", "", true).replace("VEVO", "", true).trim()
-
-        val exact = runCatching {
-            val url = "https://lrclib.net/api/get?artist_name=${URLEncoder.encode(cleanArtist, "UTF-8")}&track_name=${URLEncoder.encode(cleanTitle, "UTF-8")}"
-            client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/6.1").build()).execute().use { resp ->
-                if (!resp.isSuccessful) return@use emptyList()
-                parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
-            }
-        }.getOrDefault(emptyList())
-        if (exact.isNotEmpty()) return@withContext exact
-
-        runCatching {
-            val q = URLEncoder.encode("$cleanArtist $cleanTitle".trim(), "UTF-8")
-            client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/6.1").build()).execute().use { resp ->
-                if (!resp.isSuccessful) return@use emptyList()
-                val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
-                for (i in 0 until arr.length().coerceAtMost(5)) {
-                    val parsed = parseLyricsJson(arr.optJSONObject(i) ?: continue)
-                    if (parsed.isNotEmpty()) return@use parsed
-                }
-                emptyList()
-            }
-        }.getOrDefault(emptyList())
-    }
-
-    private fun parseLyricsJson(json: JSONObject): List<LyricLine> {
-        val synced = json.optString("syncedLyrics")
-        if (synced.isNotBlank()) return parseLrc(synced)
-        val plain = json.optString("plainLyrics")
-        if (plain.isNotBlank()) return plain.lines().filter { it.isNotBlank() }.mapIndexed { idx, line -> LyricLine(idx * 3500L, line.trim()) }
-        return emptyList()
-    }
-
-    private fun parseLrc(lrc: String): List<LyricLine> {
-        val regex = Regex("\\[(\\d{1,2}):(\\d{2})(?:\\.(\\d{1,3}))?](.*)")
-        return lrc.lines().mapNotNull { line ->
-            val m = regex.find(line.trim()) ?: return@mapNotNull null
-            val min = m.groupValues[1].toLongOrNull() ?: 0L
-            val sec = m.groupValues[2].toLongOrNull() ?: 0L
-            val ms = m.groupValues[3].padEnd(3, '0').take(3).toLongOrNull() ?: 0L
-            val text = m.groupValues[4].trim()
-            if (text.isBlank()) null else LyricLine(min * 60_000L + sec * 1000L + ms, text)
-        }.sortedBy { it.timeMs }
-    }
 }
+0
