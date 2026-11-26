@@ -6,6 +6,8 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.provider.MediaStore
 import android.text.Html
+import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -32,7 +34,6 @@ class StreamRepository(private val context: Context) {
         .followRedirects(true)
         .build()
 
-    // Fast fail client for third-party proxies (prevents 60s stalls on dead public instances!)
     private val fastProxyClient = OkHttpClient.Builder()
         .connectTimeout(4, TimeUnit.SECONDS)
         .readTimeout(6, TimeUnit.SECONDS)
@@ -71,6 +72,10 @@ class StreamRepository(private val context: Context) {
         "https://api.cobalt.tools",
         "https://cobalt-api.kwiatekmiki.com"
     )
+
+    private val ytDlpInitLock = Any()
+    @Volatile private var ytDlpInitialized = false
+    @Volatile private var ytDlpUpdated = false
 
     private val offlineDir: File
         get() = File(context.filesDir, "offline_tracks").apply { if (!exists()) mkdirs() }
@@ -785,7 +790,106 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 4. Fast & Reliable Offline Downloader (Preserves `sparams` + Fast Failover!) ----------
+    // ---------- 4. NEW Real Embedded yt-dlp Engine (with Fallback Chain) ----------
+    private suspend fun ensureYtDlpReady(onProgress: (Int) -> Unit): Boolean {
+        if (!ytDlpInitialized) {
+            onProgress(5)
+            synchronized(ytDlpInitLock) {
+                if (!ytDlpInitialized) {
+                    ytDlpInitialized = runCatching {
+                        YoutubeDL.getInstance().init(context.applicationContext)
+                        true
+                    }.getOrDefault(false)
+                }
+            }
+        }
+        if (!ytDlpInitialized) return false
+
+        if (!ytDlpUpdated) {
+            onProgress(9)
+            withTimeoutOrNull(18_000L) {
+                runCatching {
+                    YoutubeDL.getInstance().updateYoutubeDL(
+                        context.applicationContext,
+                        YoutubeDL.UpdateChannel.NIGHTLY
+                    )
+                }
+            }
+            ytDlpUpdated = true
+        }
+        return true
+    }
+
+    private suspend fun downloadViaYtDlp(
+        videoId: String,
+        quality: AudioQuality,
+        target: File,
+        onProgress: (Int) -> Unit
+    ): Boolean {
+        if (!ensureYtDlpReady(onProgress)) return false
+        onProgress(12)
+
+        val qualityFormat = when (quality) {
+            AudioQuality.LOW -> "worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio/18"
+            AudioQuality.NORMAL -> "bestaudio[abr<=100][ext=m4a]/bestaudio[abr<=100]/bestaudio[ext=m4a]/18"
+            AudioQuality.HIGH -> "bestaudio[abr<=160][ext=m4a]/bestaudio[abr<=160]/bestaudio[ext=m4a]/18"
+            AudioQuality.VERY_HIGH, AudioQuality.LOSSLESS -> "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/18"
+        }
+
+        val attempts = listOf(
+            qualityFormat to "youtube:player_client=android_vr,ios,tv_downgraded,web",
+            "bestaudio/18" to "youtube:player_client=tv_downgraded,android_vr,mweb",
+            "18/best[ext=mp4]/best" to null
+        )
+
+        val tmpPrefix = "${target.nameWithoutExtension}_ytdlp"
+        val tmpFile = File(target.parentFile, "$tmpPrefix.tmp")
+
+        for ((fmt, extractorArgs) in attempts) {
+            // Clean any leftover temp files for this track
+            target.parentFile?.listFiles()?.filter { it.name.startsWith(tmpPrefix) }?.forEach { it.delete() }
+
+            val request = YoutubeDLRequest("https://www.youtube.com/watch?v=$videoId").apply {
+                addOption("--no-playlist")
+                addOption("--no-part")
+                addOption("--no-mtime")
+                addOption("--force-overwrites")
+                addOption("--retries", "2")
+                addOption("--socket-timeout", "12")
+                addOption("-f", fmt)
+                if (!extractorArgs.isNullOrBlank()) {
+                    addOption("--extractor-args", extractorArgs)
+                }
+                addOption("-o", tmpFile.absolutePath)
+            }
+
+            val ok = runCatching {
+                YoutubeDL.getInstance().execute(request, "sonify_dl_$videoId") { progress: Float, _: Long, _: String ->
+                    if (progress >= 0f) {
+                        val mapped = (14 + (progress * 0.84f).toInt()).coerceIn(14, 98)
+                        onProgress(mapped)
+                    }
+                }
+                val produced = if (tmpFile.exists() && tmpFile.length() > 16_384) {
+                    tmpFile
+                } else {
+                    target.parentFile?.listFiles()?.firstOrNull { it.name.startsWith(tmpPrefix) && it.length() > 16_384 }
+                }
+                if (produced != null) {
+                    if (target.exists()) target.delete()
+                    produced.renameTo(target)
+                    onProgress(100)
+                    true
+                } else false
+            }.getOrDefault(false)
+
+            if (ok) return true
+        }
+
+        target.parentFile?.listFiles()?.filter { it.name.startsWith(tmpPrefix) }?.forEach { it.delete() }
+        return false
+    }
+
     suspend fun downloadTrackOffline(
         track: Track,
         settings: AppSettings,
@@ -800,8 +904,8 @@ class StreamRepository(private val context: Context) {
 
         val target = getOfflineFile(track.id)
 
-        val result = withTimeoutOrNull(75_000L) {
-            onProgress(2)
+        val result = withTimeoutOrNull(120_000L) {
+            onProgress(3)
 
             if (track.source != StreamSource.YOUTUBE) {
                 val res = resolveStreams(track, settings, forDownload = true)
@@ -811,23 +915,19 @@ class StreamRepository(private val context: Context) {
                 return@withTimeoutOrNull false to "שגיאה בהורדה מהמקור שנבחר"
             }
 
-            // Priority 1: Direct in-WebView JS fetch() (now CORS-clean + sparams-safe!)
+            // Priority 1: Embedded yt-dlp engine (handles YouTube signatures, clients & progressive fallback!)
+            val quality = effectiveQuality(settings, forDownload = true)
+            if (downloadViaYtDlp(track.id, quality, target, onProgress)) {
+                return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
+            }
+
+            // Priority 2: Direct in-WebView JS fetch fallback
             if (webViewDownloadFn != null && capturedStreams.isNotEmpty()) {
-                onProgress(4)
                 val wvOk = runCatching { webViewDownloadFn(target, onProgress) }.getOrDefault(false)
                 if (wvOk) return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
             }
 
-            // Priority 2: OkHttp using captured streams with intact sparams & captured headers
-            for (cap in capturedStreams.sortedByDescending { it.isAudioOnly }.take(3)) {
-                val cleanBase = sanitizeYouTubePlaybackUrl(cap.url)
-                if (downloadSmart(cleanBase, cap.userAgent, cap.cookie, cap.headers, target, true, onProgress)) {
-                    return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
-                }
-            }
-
-            // Priority 3: Fast single-pass YouTube strategies
-            val quality = effectiveQuality(settings, forDownload = true)
+            // Priority 3: Fast InnerTube / Proxy fallback
             for (strategy in youtubeStrategies(track.id, quality)) {
                 val resolved = runCatching { strategy() }.getOrNull() ?: continue
                 if (downloadSmart(resolved.audioUrl, resolved.userAgent, resolved.cookie, emptyMap(), target, false, onProgress)) {
@@ -835,13 +935,12 @@ class StreamRepository(private val context: Context) {
                 }
             }
 
-            false to "לא ניתן להוריד כרגע — נגן את השיר 3 שניות ולחץ שוב הורדה"
+            false to "לא ניתן להוריד שיר זה כרגע — נסה שוב בעוד רגע"
         }
 
         result ?: (false to "ההורדה לקחה יותר מדי זמן — נסה שוב")
     }
 
-    // FIXED: Never strips parameters signed inside `sparams` (fixes instant 403 on chunk 1!)
     private fun sanitizeYouTubePlaybackUrl(url: String): String {
         val sparamsRaw = Regex("[?&]sparams=([^&]+)").find(url)?.groupValues?.get(1).orEmpty()
         val signedParams = runCatching { URLDecoder.decode(sparamsRaw, "UTF-8") }
@@ -1140,7 +1239,7 @@ class StreamRepository(private val context: Context) {
         if (cleanArtist.isNotBlank()) {
             val exact = runCatching {
                 val url = "https://lrclib.net/api/get?artist_name=${URLEncoder.encode(cleanArtist, "UTF-8")}&track_name=${URLEncoder.encode(cleanTitle, "UTF-8")}"
-                client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/8.0").build()).execute().use { resp ->
+                client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/9.0").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
                 }
@@ -1156,7 +1255,7 @@ class StreamRepository(private val context: Context) {
         for (sq in searchQueries) {
             val found = runCatching {
                 val q = URLEncoder.encode(sq, "UTF-8")
-                client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/8.0").build()).execute().use { resp ->
+                client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/9.0").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
                     for (i in 0 until arr.length().coerceAtMost(8)) {
@@ -1184,7 +1283,7 @@ class StreamRepository(private val context: Context) {
         if (cleanArtist.isNotBlank() && cleanTitle.isNotBlank()) {
             val ovh = runCatching {
                 val url = "https://api.lyrics.ovh/v1/${URLEncoder.encode(cleanArtist, "UTF-8")}/${URLEncoder.encode(cleanTitle, "UTF-8")}"
-                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/8.0").build()).execute().use { resp ->
+                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/9.0").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val plain = JSONObject(resp.body?.string() ?: return@use emptyList()).optString("lyrics")
                     plain.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("Paroles de", true) }
