@@ -43,12 +43,13 @@
         <receiver
             android:name=".SonifyWidget"
             android:exported="true"
-            android:label="נגן Sonify">
+            android:label="Sonify Player">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
                 <action android:name="com.sonify.app.WIDGET_PREV" />
                 <action android:name="com.sonify.app.WIDGET_PLAY_PAUSE" />
                 <action android:name="com.sonify.app.WIDGET_NEXT" />
+                <action android:name="com.sonify.app.WIDGET_LIKE" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
