@@ -31,6 +31,12 @@ enum class StreamSource(val label: String, val subtitle: String) {
     LOCAL("קובצי המכשיר (FLAC / MP3)", "ניגון ישיר מהאחסון המקומי ללא אינטרנט")
 }
 
+enum class YouTubeEngineMode(val label: String, val subtitle: String) {
+    AUTO("אוטומטי (ExoPlayer + גיבוי Web)", "מנסה אודיו ישיר עם אקולייזר, ועובר לגיבוי מובנה אם הרשת חוסמת"),
+    WEB_DIRECT("נגן YouTube מובנה (מהיר וללא 403)", "ניגון מיידי וחלק ללא חסימות סלולר + מעבר מיידי לקליפ"),
+    EXOPLAYER_ONLY("ExoPlayer בלבד", "הזרמה ישירה בלבד (לאקולייזר וניגון רקע מקומי)")
+}
+
 enum class AudioQuality(val label: String, val kbps: Int) {
     LOW("חסכוני (24-64kbps)", 64),
     NORMAL("רגיל (128kbps)", 128),
@@ -64,7 +70,7 @@ data class ResolvedStreams(
     val audioUrl: String,
     val videoUrl: String? = null,
     val videoOnlyUrl: String? = null,
-    val userAgent: String = "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+    val userAgent: String = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
     val isLossless: Boolean = false,
     val isOffline: Boolean = false,
     val codecLabel: String = "AAC"
@@ -92,6 +98,7 @@ data class Playlist(
 
 data class AppSettings(
     val streamSource: StreamSource = StreamSource.YOUTUBE,
+    val ytEngineMode: YouTubeEngineMode = YouTubeEngineMode.AUTO,
     val quality: AudioQuality = AudioQuality.HIGH,
     val subsonicUrl: String = "",
     val subsonicUser: String = "",
