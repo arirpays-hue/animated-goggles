@@ -24,11 +24,13 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -51,9 +53,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
@@ -65,14 +71,120 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
+
+/**
+ * Spotify-style circular download progress ring:
+ * - Idle: subtle circular outline with down arrow
+ * - Downloading: smooth animated circular green arc filling from 0% to 100%
+ * - Downloaded: solid SpotifyGreen circle with dark arrow-down icon
+ */
+@Composable
+fun SpotifyDownloadRingButton(
+    isOffline: Boolean,
+    isDownloading: Boolean,
+    progressPct: Int?,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    size: Dp = 26.dp,
+    idleTint: Color = SpotifySubtle
+) {
+    val targetFrac = when {
+        isOffline -> 1f
+        isDownloading -> ((progressPct ?: 5).coerceIn(4, 100)) / 100f
+        else -> 0f
+    }
+    val animatedSweep by animateFloatAsState(
+        targetValue = targetFrac * 360f,
+        animationSpec = tween(durationMillis = 260, easing = FastOutSlowInEasing),
+        label = "dl_ring_sweep"
+    )
+
+    Box(
+        modifier = modifier
+            .size(size + 10.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        when {
+            isOffline -> {
+                Box(
+                    modifier = Modifier.size(size).clip(CircleShape).background(SpotifyGreen),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.ArrowDownward,
+                        contentDescription = "Downloaded",
+                        tint = Color.Black,
+                        modifier = Modifier.size(size * 0.62f)
+                    )
+                }
+            }
+            isDownloading -> {
+                Box(modifier = Modifier.size(size), contentAlignment = Alignment.Center) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val strokePx = 2.4.dp.toPx()
+                        val inset = strokePx / 2f
+                        val arcSize = Size(this.size.width - strokePx, this.size.height - strokePx)
+                        drawArc(
+                            color = SpotifyWhite.copy(alpha = 0.22f),
+                            startAngle = 0f,
+                            sweepAngle = 360f,
+                            useCenter = false,
+                            topLeft = Offset(inset, inset),
+                            size = arcSize,
+                            style = Stroke(width = strokePx)
+                        )
+                        drawArc(
+                            color = SpotifyGreen,
+                            startAngle = -90f,
+                            sweepAngle = animatedSweep.coerceAtLeast(18f),
+                            useCenter = false,
+                            topLeft = Offset(inset, inset),
+                            size = arcSize,
+                            style = Stroke(width = strokePx, cap = StrokeCap.Round)
+                        )
+                    }
+                    Icon(
+                        imageVector = Icons.Rounded.ArrowDownward,
+                        contentDescription = "Downloading",
+                        tint = SpotifyGreen,
+                        modifier = Modifier.size(size * 0.48f)
+                    )
+                }
+            }
+            else -> {
+                Box(modifier = Modifier.size(size), contentAlignment = Alignment.Center) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val strokePx = 1.6.dp.toPx()
+                        drawCircle(
+                            color = idleTint.copy(alpha = 0.72f),
+                            radius = (this.size.minDimension - strokePx) / 2f,
+                            style = Stroke(width = strokePx)
+                        )
+                    }
+                    Icon(
+                        imageVector = Icons.Rounded.ArrowDownward,
+                        contentDescription = "Download",
+                        tint = idleTint,
+                        modifier = Modifier.size(size * 0.54f)
+                    )
+                }
+            }
+        }
+    }
+}
 
 @Composable
 fun FloatingMiniPlayer(state: UiState, vm: AppViewModel, modifier: Modifier = Modifier) {
@@ -428,15 +540,54 @@ private fun LyricsTranslateErrorBanner(errorMsg: String, str: AppStrings, onOpen
 }
 
 @Composable
+private fun ExploreMiniCard(
+    title: String,
+    artworkUrl: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .height(148.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(SpotifyCard)
+            .spotifyPressClickable(pressedScale = 0.96f, onClick = onClick)
+    ) {
+        ArtworkImage(artworkUrl, title, Modifier.fillMaxSize())
+        Box(
+            modifier = Modifier.fillMaxSize().background(
+                Brush.verticalGradient(
+                    0f to Color.Transparent,
+                    0.45f to Color.Black.copy(alpha = 0.25f),
+                    1f to Color.Black.copy(alpha = 0.88f)
+                )
+            )
+        )
+        Text(
+            text = title,
+            color = SpotifyWhite,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.ExtraBold,
+            lineHeight = 15.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.align(Alignment.BottomStart).padding(9.dp)
+        )
+    }
+}
+
+@Composable
 fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
     val track = state.currentTrack ?: return
     val str = state.strings
     val context = LocalContext.current
     val activity = context as? Activity
+    val extras = state.nowPlayingExtras?.takeIf { it.trackId == track.id }
     val isLiked = state.likedTracks.any { it.id == track.id }
     val isFollowedArtist = state.followedArtists.contains(track.artist)
     val isLocalTrack = track.source == StreamSource.LOCAL
     val isOffline = state.offlineTrackIds.contains(track.id)
+    val isDownloading = state.downloadingIds.contains(track.id)
     val dlPct = state.downloadProgress[track.id]
     val accent by animateColorAsState(Color(state.dynamicAccentColor), animationSpec = tween(550), label = "now_accent")
 
@@ -469,6 +620,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
     var showSleepSheet by remember { mutableStateOf(false) }
     var showSpeedSheet by remember { mutableStateOf(false) }
     var showFullLyrics by remember { mutableStateOf(false) }
+    var showAllCreditsSheet by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.isVideoMode) {
         if (state.isVideoMode) showFullLyrics = false
@@ -488,9 +640,10 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
         state.resolvedStreams != null -> state.resolvedStreams.codecLabel
         else -> state.settings.streamSource.label(str.isEn).substringBefore(" (")
     }
-    val canSwitchVideo = track.source == StreamSource.YOUTUBE
+    // Strictly blocks video clip button in Offline Mode!
+    val canSwitchVideo = track.source == StreamSource.YOUTUBE && !state.settings.offlineMode
 
-    if (isFullscreenVideo && state.isVideoMode) {
+    if (isFullscreenVideo && state.isVideoMode && !state.settings.offlineMode) {
         Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
             if (state.isUsingWebEngine) {
                 Box(modifier = Modifier.fillMaxHeight().aspectRatio(16f / 9f).clip(RoundedCornerShape(0.dp))) {
@@ -524,6 +677,9 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
     }
 
     val lyricDisplayRows = remember(state.lyrics) { buildLyricDisplayRows(state.lyrics) }
+    val realArtistPhoto = extras?.artistPhotoUrl?.takeIf { it.isNotBlank() } ?: track.artworkUrl
+    val creditsList = extras?.credits?.takeIf { it.isNotEmpty() }
+        ?: listOf(TrackCreditEntry(track.artist, str.t("האמן/ית הראשי/ת", "Main Artist"), isMainArtist = true))
 
     Box(
         modifier = Modifier.fillMaxSize()
@@ -531,6 +687,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
             .statusBarsPadding().navigationBarsPadding()
     ) {
         Column(modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(horizontal = 22.dp, vertical = 8.dp)) {
+            // Top Bar
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                 IconButton(onClick = { vm.setShowNowPlaying(false) }) { Icon(Icons.Rounded.KeyboardArrowDown, "Minimize", tint = SpotifyWhite, modifier = Modifier.size(30.dp)) }
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -544,8 +701,12 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        if (state.isWeakNetworkActive) "$qualityLabel • ${str.t("הגנת רשת חלשה", "Weak-Net Shield")}" else qualityLabel,
-                        color = if (state.resolvedStreams?.isLossless == true || state.resolvedStreams?.codecLabel == "INSTANT CACHE") SpotifyGreen else SpotifyWhite,
+                        when {
+                            state.settings.offlineMode -> str.t("אופליין • אודיו מקומי", "OFFLINE • Local Audio")
+                            state.isWeakNetworkActive -> "$qualityLabel • ${str.t("הגנת רשת חלשה", "Weak-Net Shield")}"
+                            else -> qualityLabel
+                        },
+                        color = if (state.settings.offlineMode || state.resolvedStreams?.isLossless == true || state.resolvedStreams?.codecLabel == "INSTANT CACHE") SpotifyGreen else SpotifyWhite,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -563,12 +724,13 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(10.dp))
 
+            // Cover Art / Official Video Box
             Box(
                 modifier = Modifier.fillMaxWidth().aspectRatio(if (state.isVideoMode) 16f / 9f else 1f)
                     .clip(RoundedCornerShape(12.dp)).background(Color.Black),
                 contentAlignment = Alignment.Center
             ) {
-                if (state.isVideoMode) {
+                if (state.isVideoMode && !state.settings.offlineMode) {
                     if (state.isUsingWebEngine) {
                         AndroidView(
                             factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
@@ -632,7 +794,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
 
-                if (state.isVideoMode) {
+                if (state.isVideoMode && !state.settings.offlineMode) {
                     IconButton(
                         onClick = { isFullscreenVideo = true },
                         modifier = Modifier.align(Alignment.BottomEnd).padding(10.dp).size(36.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.78f))
@@ -642,11 +804,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             if (state.isAiDjActive) {
                 Spacer(Modifier.height(10.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Row(
                         modifier = Modifier.weight(1f).clip(RoundedCornerShape(50)).background(SpotifyGreen.copy(alpha = 0.2f))
                             .clickable { vm.switchAiDjVibe() }.padding(horizontal = 12.dp, vertical = 8.dp),
@@ -660,14 +818,13 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                         modifier = Modifier.clip(RoundedCornerShape(50)).background(SpotifyCard)
                             .clickable { vm.setShowDjStudioSheet(true) }
                             .padding(horizontal = 12.dp, vertical = 8.dp)
-                    ) {
-                        Icon(Icons.Rounded.Tune, "DJ Studio", tint = SpotifyWhite, modifier = Modifier.size(18.dp))
-                    }
+                    ) { Icon(Icons.Rounded.Tune, "DJ Studio", tint = SpotifyWhite, modifier = Modifier.size(18.dp)) }
                 }
             }
 
             Spacer(Modifier.height(20.dp))
 
+            // Track Title, Artist, Spotify Filling Download Ring & Like Button
             val likeScale by animateFloatAsState(if (isLiked) 1.12f else 1f, spring(dampingRatio = Spring.DampingRatioMediumBouncy), label = "like_btn")
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
@@ -684,7 +841,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                     Spacer(Modifier.height(2.dp))
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.clickable { vm.openArtistPage(track.artist, track.artworkUrl) }
+                        modifier = Modifier.clickable { vm.openArtistPage(track.artist, realArtistPhoto) }
                     ) {
                         if (track.isExplicit) {
                             Box(
@@ -703,14 +860,14 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
                 if (!isLocalTrack) {
-                    IconButton(onClick = { vm.downloadOffline(track) }) {
-                        if (state.downloadingIds.contains(track.id)) {
-                            if (dlPct != null && dlPct > 1) Text("$dlPct%", color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            else CircularProgressIndicator(color = SpotifyGreen, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
-                        } else {
-                            Icon(if (isOffline) Icons.Rounded.DownloadDone else Icons.Rounded.Download, "Offline", tint = if (isOffline) SpotifyGreen else SpotifyWhite.copy(alpha = 0.82f))
-                        }
-                    }
+                    SpotifyDownloadRingButton(
+                        isOffline = isOffline,
+                        isDownloading = isDownloading,
+                        progressPct = dlPct,
+                        onClick = { vm.downloadOffline(track) },
+                        size = 25.dp,
+                        idleTint = SpotifyWhite.copy(alpha = 0.85f)
+                    )
                 }
                 IconButton(onClick = { vm.toggleLike(track) }, modifier = Modifier.graphicsLayer { scaleX = likeScale; scaleY = likeScale }) {
                     Icon(if (isLiked) Icons.Rounded.CheckCircle else Icons.Rounded.AddCircleOutline, "Save", tint = if (isLiked) SpotifyGreen else SpotifyWhite, modifier = Modifier.size(28.dp))
@@ -719,6 +876,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(14.dp))
 
+            // Seek Bar & Transport Controls
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 val duration = state.durationMs.coerceAtLeast(1L)
                 val progressFrac = if (isScrubbing) scrubFraction else (state.positionMs.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
@@ -764,6 +922,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(14.dp))
 
+            // Devices, QR, Real Clickable Share Link & Drag Queue Row
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Row(
                     modifier = Modifier.clip(RoundedCornerShape(50))
@@ -781,31 +940,27 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                         Spacer(Modifier.width(7.dp))
                         Text(
                             text = if (state.jamState.active) "Jam • ${state.jamState.code}" else activeExternal?.name.orEmpty(),
-                            color = SpotifyGreen,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.widthIn(max = 150.dp)
+                            color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 150.dp)
                         )
                     }
                 }
                 Row {
-                    IconButton(onClick = { vm.setShowCodeFor(track.title to SonifyLinkCodec.buildSmartTrackLink(track, state.positionMs)) }) {
+                    IconButton(onClick = { vm.setShowCodeFor(track.title to SonifyShareLinks.trackUrl(track, state.positionMs)) }) {
                         Icon(Icons.Rounded.QrCode2, "Code", tint = SpotifyWhite.copy(alpha = 0.85f))
                     }
                     IconButton(onClick = {
-                        val sec = (state.positionMs / 1000).toInt()
-                        val tsText = if (sec > 5) " (${formatTime(state.positionMs)})" else ""
-                        val link = if (track.source == StreamSource.YOUTUBE) "\nhttps://youtu.be/${track.id}${if (sec > 5) "?t=$sec" else ""}" else ""
+                        val shareLink = SonifyShareLinks.trackUrl(track, state.positionMs)
+                        val shareText = "${track.title} - ${track.artist}\n$shareLink"
                         context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                            type = "text/plain"; putExtra(Intent.EXTRA_TEXT, "${track.title} - ${track.artist}$tsText$link")
+                            type = "text/plain"; putExtra(Intent.EXTRA_TEXT, shareText)
                         }, str.t("שתף שיר", "Share")))
                     }) { Icon(Icons.Rounded.Share, "Share", tint = SpotifyWhite.copy(alpha = 0.85f)) }
                     IconButton(onClick = { showQueueSheet = true }) { Icon(Icons.Rounded.QueueMusic, str.queue, tint = SpotifyWhite.copy(alpha = 0.85f)) }
                 }
             }
 
+            // 1. Synced Lyrics Card
             if (!state.isVideoMode) {
                 Spacer(Modifier.height(18.dp))
                 val lyricsCardBg by animateColorAsState(
@@ -825,9 +980,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                 val density = LocalDensity.current
                 val inlineTopOffsetPx = remember(density) { with(density) { 46.dp.roundToPx() } }
 
-                LaunchedEffect(track.id) {
-                    runCatching { inlineLyricsState.scrollToItem(0) }
-                }
+                LaunchedEffect(track.id) { runCatching { inlineLyricsState.scrollToItem(0) } }
                 LaunchedEffect(activeRowIdx, lyricDisplayRows.size) {
                     if (lyricDisplayRows.isNotEmpty() && activeRowIdx in lyricDisplayRows.indices) {
                         runCatching { smoothGlideToLyric(inlineLyricsState, activeRowIdx, inlineTopOffsetPx) }
@@ -870,9 +1023,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                                         modifier = Modifier.size(30.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.30f))
                                             .clickable { showFullLyrics = true },
                                         contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(Icons.Rounded.OpenInFull, str.fullScreen, tint = SpotifyWhite, modifier = Modifier.size(15.dp))
-                                    }
+                                    ) { Icon(Icons.Rounded.OpenInFull, str.fullScreen, tint = SpotifyWhite, modifier = Modifier.size(15.dp)) }
                                 }
                             }
                         }
@@ -892,12 +1043,18 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 16.dp)) {
                                 SpotifyMelodyDots(isPlaying = true, tint = SpotifyWhite, dotSize = 9.dp)
                                 Spacer(Modifier.width(12.dp))
-                                Text(str.t("טוען מילים מסונכרנות...", "Loading synced lyrics..."), color = SpotifyWhite.copy(alpha = 0.85f), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                Text(str.t("מחפש מילים מ-6 מקורות...", "Searching lyrics across 6 sources..."), color = SpotifyWhite.copy(alpha = 0.85f), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                             }
                         } else if (lyricDisplayRows.isEmpty()) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                                Text(str.t("לא נמצאו מילים אוטומטית.", "Lyrics not found automatically."), color = SpotifyWhite.copy(alpha = 0.85f), fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                                TextButton(onClick = { showFullLyrics = true }) { Text(str.t("חיפוש ידני", "Manual Search"), color = SpotifyWhite, fontWeight = FontWeight.Bold) }
+                                Text(
+                                    if (state.settings.offlineMode) str.t("אין מילים שמורות באופליין לשיר זה.", "No cached offline lyrics for this track.")
+                                    else str.t("לא נמצאו מילים אוטומטית.", "Lyrics not found automatically."),
+                                    color = SpotifyWhite.copy(alpha = 0.85f), fontSize = 14.sp, fontWeight = FontWeight.Medium
+                                )
+                                if (!state.settings.offlineMode) {
+                                    TextButton(onClick = { showFullLyrics = true }) { Text(str.t("חיפוש ידני", "Manual Search"), color = SpotifyWhite, fontWeight = FontWeight.Bold) }
+                                }
                             }
                         } else {
                             Box(modifier = Modifier.fillMaxWidth().height(242.dp)) {
@@ -911,39 +1068,13 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                                         val isCurrent = idx == activeRowIdx && state.positionMs >= row.timeMs
                                         val isPast = idx < activeRowIdx
                                         when (row) {
-                                            is LyricDisplayRow.MelodyRow -> {
-                                                SpotifyMelodyRowItem(
-                                                    isCurrent = isCurrent,
-                                                    isPast = isPast,
-                                                    isPlaying = state.isPlaying,
-                                                    isFullScreen = false,
-                                                    onClick = { vm.seekTo(row.timeMs) }
-                                                )
-                                            }
-                                            is LyricDisplayRow.TextLine -> {
-                                                SpotifyAnimatedLyricLine(
-                                                    line = row.line,
-                                                    isCurrent = isCurrent,
-                                                    isPast = isPast,
-                                                    showTranslation = state.showTranslatedLyrics,
-                                                    fontScale = state.lyricsFontScale,
-                                                    baseFontSp = 18.5f,
-                                                    activeFontSp = 20.5f,
-                                                    translationFontSp = 12.5f,
-                                                    onClick = { vm.seekTo(row.timeMs) }
-                                                )
-                                            }
+                                            is LyricDisplayRow.MelodyRow -> SpotifyMelodyRowItem(isCurrent, isPast, state.isPlaying, false) { vm.seekTo(row.timeMs) }
+                                            is LyricDisplayRow.TextLine -> SpotifyAnimatedLyricLine(row.line, isCurrent, isPast, state.showTranslatedLyrics, state.lyricsFontScale, 18.5f, 20.5f, 12.5f) { vm.seekTo(row.timeMs) }
                                         }
                                     }
                                 }
-                                Box(
-                                    modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(20.dp)
-                                        .background(Brush.verticalGradient(listOf(lyricsCardBg, Color.Transparent)))
-                                )
-                                Box(
-                                    modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(34.dp)
-                                        .background(Brush.verticalGradient(listOf(Color.Transparent, lyricsCardBg)))
-                                )
+                                Box(modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(20.dp).background(Brush.verticalGradient(listOf(lyricsCardBg, Color.Transparent))))
+                                Box(modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(34.dp).background(Brush.verticalGradient(listOf(Color.Transparent, lyricsCardBg))))
                             }
                         }
                     }
@@ -952,14 +1083,67 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(16.dp))
 
+            // 2. Spotify-Style "מידע נוסף על [אמן]" (3 Visual Exploration Cards)
+            if (!state.settings.offlineMode && !isLocalTrack) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            text = str.t("מידע נוסף על ${track.artist}", "Explore ${track.artist}"),
+                            color = SpotifyWhite,
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 16.sp
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            ExploreMiniCard(
+                                title = str.t("שירים של ${track.artist}", "Songs by ${track.artist}"),
+                                artworkUrl = extras?.artistTopTrack?.artworkUrl?.takeIf { it.isNotBlank() } ?: realArtistPhoto,
+                                onClick = {
+                                    val top = extras?.artistTopTrack
+                                    if (top != null) vm.playTrack(top, listOf(top, track))
+                                    else vm.openArtistPage(track.artist, realArtistPhoto)
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                            ExploreMiniCard(
+                                title = str.t("דומה ל-${track.artist}", "Similar to ${track.artist}"),
+                                artworkUrl = extras?.similarArtistTrack?.artworkUrl?.takeIf { it.isNotBlank() } ?: track.artworkUrl,
+                                onClick = {
+                                    val simA = extras?.similarArtistTrack
+                                    if (simA != null) vm.playTrack(simA, listOf(simA, track))
+                                    else vm.startSongOrArtistRadio(track)
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                            ExploreMiniCard(
+                                title = str.t("דומה ל-${track.title}", "Similar to ${track.title}"),
+                                artworkUrl = extras?.similarSongTrack?.artworkUrl?.takeIf { it.isNotBlank() } ?: track.artworkUrl,
+                                onClick = {
+                                    val simS = extras?.similarSongTrack
+                                    if (simS != null) vm.playTrack(simS, listOf(simS, track))
+                                    else vm.startSongOrArtistRadio(track)
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(14.dp))
+            }
+
+            // 3. Spotify-Style "אודות האמן" Card with REAL Artist Photo!
             Card(
-                modifier = Modifier.fillMaxWidth().spotifyPressClickable { vm.openArtistPage(track.artist, track.artworkUrl) },
+                modifier = Modifier.fillMaxWidth().spotifyPressClickable { vm.openArtistPage(track.artist, realArtistPhoto) },
                 shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface)
             ) {
                 Column {
-                    Box(modifier = Modifier.fillMaxWidth().height(190.dp)) {
-                        ArtworkImage(track.artworkUrl, track.artist, Modifier.fillMaxSize())
+                    Box(modifier = Modifier.fillMaxWidth().height(205.dp)) {
+                        ArtworkImage(realArtistPhoto, track.artist, Modifier.fillMaxSize())
                         Box(
                             modifier = Modifier.fillMaxSize().background(
                                 Brush.verticalGradient(
@@ -984,14 +1168,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = track.artist,
-                                    color = SpotifyWhite,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    fontSize = 20.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                Text(track.artist, color = SpotifyWhite, fontWeight = FontWeight.ExtraBold, fontSize = 20.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Spacer(Modifier.width(6.dp))
                                 SpotifyVerifiedBadge(size = 18.dp)
                             }
@@ -1002,22 +1179,18 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
                                 modifier = Modifier.height(34.dp)
                             ) {
-                                Text(
-                                    if (isFollowedArtist) str.following else str.follow,
-                                    color = if (isFollowedArtist) SpotifyGreen else SpotifyWhite,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                Text(if (isFollowedArtist) str.following else str.follow, color = if (isFollowedArtist) SpotifyGreen else SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                             }
+                        }
+                        if (!extras?.artistSubscribers.isNullOrBlank()) {
+                            Spacer(Modifier.height(3.dp))
+                            Text(extras!!.artistSubscribers, color = SpotifySubtle, fontSize = 12.5.sp, fontWeight = FontWeight.Medium)
                         }
                         Spacer(Modifier.height(6.dp))
                         val playsCount = state.stats.artistPlayCounts[track.artist] ?: 1
-                        Text(
-                            text = str.t("לחץ לצפייה באלבומים, שירים אחרונים ודיסקוגרפיה מלאה • $playsCount השמעות אצלך", "Tap for full albums, latest releases & discography • $playsCount plays by you"),
-                            color = SpotifySubtle,
-                            fontSize = 12.sp,
-                            lineHeight = 17.sp
-                        )
+                        val bioText = extras?.artistBio?.takeIf { it.isNotBlank() }
+                            ?: str.t("לחץ לצפייה באלבומים, שירים אחרונים ודיסקוגרפיה מלאה • $playsCount השמעות אצלך", "Tap for full albums, latest releases & discography • $playsCount plays by you")
+                        Text(bioText, color = SpotifySubtle, fontSize = 12.5.sp, lineHeight = 18.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
                         Spacer(Modifier.height(12.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(onClick = { runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=${Uri.encode("${track.artist} concerts tickets")}"))) } }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(50)) {
@@ -1027,9 +1200,11 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                                 Icon(Icons.Rounded.ShoppingBag, null, tint = SpotifyGreen, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(5.dp)); Text(str.merch, color = SpotifyWhite, fontSize = 12.sp)
                             }
                         }
-                        Spacer(Modifier.height(8.dp))
-                        Button(onClick = { vm.startSongOrArtistRadio(track) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyCard, contentColor = SpotifyWhite), shape = RoundedCornerShape(50), modifier = Modifier.fillMaxWidth()) {
-                            Icon(Icons.Rounded.Radio, null, tint = SpotifyGreen, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("${str.startRadio} • ${track.artist}", fontWeight = FontWeight.Bold)
+                        if (!state.settings.offlineMode) {
+                            Spacer(Modifier.height(8.dp))
+                            Button(onClick = { vm.startSongOrArtistRadio(track) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyCard, contentColor = SpotifyWhite), shape = RoundedCornerShape(50), modifier = Modifier.fillMaxWidth()) {
+                                Icon(Icons.Rounded.Radio, null, tint = SpotifyGreen, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("${str.startRadio} • ${track.artist}", fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 }
@@ -1037,16 +1212,124 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(14.dp))
 
+            // 4. Spotify-Style "קרדיטים" Card (Main Artist + Follow + Composers/Writers/Producers + Show All!)
             Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface)) {
-                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                    Text(str.t("קרדיטים ואיכות שמע", "Credits & Audio Specs"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    Text("${str.t("אמן מבצע", "Artist")}: ${track.artist}", color = SpotifySubtle, fontSize = 13.sp)
-                    if (track.album.isNotBlank()) Text("${str.t("אלבום", "Album")}: ${track.album}", color = SpotifySubtle, fontSize = 13.sp)
-                    Text("${str.t("מנוע", "Engine")}: $qualityLabel • ${state.settings.playbackSpeed}x", color = SpotifyGreen, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text(str.t("קרדיטים", "Credits"), color = SpotifyWhite, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
+                        Text(
+                            text = str.t("הצגת כל האפשרויות", "Show all"),
+                            color = SpotifyGreen,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clickable { showAllCreditsSheet = true }
+                        )
+                    }
+                    creditsList.take(3).forEach { entry ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth()
+                                .clickable { if (entry.isMainArtist) vm.openArtistPage(entry.name, realArtistPhoto) },
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                                Text(entry.name, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(entry.roles, color = SpotifySubtle, fontSize = 12.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            if (entry.isMainArtist) {
+                                val followedThis = state.followedArtists.contains(entry.name) || isFollowedArtist
+                                OutlinedButton(
+                                    onClick = { vm.toggleFollowArtist(entry.name) },
+                                    shape = RoundedCornerShape(50),
+                                    border = BorderStroke(1.dp, if (followedThis) SpotifyGreen else SpotifyWhite.copy(alpha = 0.55f)),
+                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(32.dp)
+                                ) {
+                                    Text(if (followedThis) str.following else str.t("מעקב", "Follow"), color = if (followedThis) SpotifyGreen else SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                    HorizontalDivider(color = SpotifyCard)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        val sizeInfo = if (isOffline) " • ${String.format("%.1f", vm.repo.getOfflineFileSizeMb(track.id))} MB" else ""
+                        Text("${str.t("מנוע שמע", "Audio")}: $qualityLabel$sizeInfo", color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Text("${state.settings.playbackSpeed}x", color = SpotifySubtle, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            // 5. Spotify-Style "עוד מידע על [אמן]" (Related Interviews & Podcast Episodes)
+            if (!extras?.artistEpisodes.isNullOrEmpty() && !state.settings.offlineMode) {
+                Spacer(Modifier.height(14.dp))
+                Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface)) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(str.t("עוד מידע על ${track.artist}", "More about ${track.artist}"), color = SpotifyWhite, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
+                        extras!!.artistEpisodes.forEach { ep ->
+                            val epLiked = state.likedTracks.any { it.id == ep.id }
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                                    .clickable { vm.playTrack(ep, extras.artistEpisodes) }.padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                ArtworkImage(ep.artworkUrl, ep.title, Modifier.size(54.dp))
+                                Spacer(Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(ep.title, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text("${str.t("פרק", "Episode")} • ${ep.artist}", color = SpotifySubtle, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                IconButton(onClick = { vm.toggleLike(ep) }, modifier = Modifier.size(34.dp)) {
+                                    Icon(
+                                        if (epLiked) Icons.Rounded.CheckCircle else Icons.Rounded.AddCircleOutline,
+                                        "Save Episode",
+                                        tint = if (epLiked) SpotifyGreen else SpotifySubtle,
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
             Spacer(Modifier.height(42.dp))
+        }
+    }
+
+    // Full Credits & Specs Modal Sheet
+    if (showAllCreditsSheet) {
+        ModalBottomSheet(onDismissRequest = { showAllCreditsSheet = false }, containerColor = SpotifyDarkSurface, contentColor = SpotifyWhite) {
+            Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp)) {
+                Text(str.t("קרדיטים מלאים", "Full Song Credits"), fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                Spacer(Modifier.height(4.dp))
+                Text(track.title, color = SpotifyGreen, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                if (track.album.isNotBlank()) Text("${str.t("אלבום", "Album")}: ${track.album}", color = SpotifySubtle, fontSize = 12.sp)
+                HorizontalDivider(color = SpotifyCard, modifier = Modifier.padding(vertical = 12.dp))
+                creditsList.forEach { c ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(c.name, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                            Text(c.roles, color = SpotifySubtle, fontSize = 12.5.sp)
+                        }
+                        if (c.isMainArtist) {
+                            TextButton(onClick = { showAllCreditsSheet = false; vm.openArtistPage(c.name, realArtistPhoto) }) {
+                                Text(str.t("לפרופיל", "Profile"), color = SpotifyGreen, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider(color = SpotifyCard, modifier = Modifier.padding(vertical = 10.dp))
+                Text("${str.t("מקור", "Source")}: ${track.source.label(str.isEn)}", color = SpotifySubtle, fontSize = 12.sp)
+                Text("${str.t("איכות פעילה", "Stream")}: $qualityLabel • ${state.settings.playbackSpeed}x", color = SpotifySubtle, fontSize = 12.sp)
+                if (isOffline) {
+                    Text("${str.t("גודל קובץ אופליין", "Offline File Size")}: ${String.format("%.2f", vm.repo.getOfflineFileSizeMb(track.id))} MB", color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.height(20.dp))
+            }
         }
     }
 
@@ -1071,25 +1354,100 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
         }
     }
 
+    // Spotify-Style Drag-Handle Reorderable Queue Bottom Sheet!
     if (showQueueSheet) {
+        val density = LocalDensity.current
+        val rowHeightPx = remember(density) { with(density) { 60.dp.toPx() } }
+        var draggedTrackId by remember { mutableStateOf<String?>(null) }
+        var dragOffsetY by remember { mutableFloatStateOf(0f) }
+        val latestQueue by rememberUpdatedState(state.queue)
+
         ModalBottomSheet(onDismissRequest = { showQueueSheet = false }, containerColor = SpotifyDarkSurface, contentColor = SpotifyWhite) {
             Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
-                Text("${str.queue} (${state.queue.size})", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text("${str.queue} (${state.queue.size})", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text(str.t("החזק ≡ וגרור לסידור", "Drag ≡ to reorder"), color = SpotifySubtle, fontSize = 11.5.sp)
+                }
                 Spacer(Modifier.height(10.dp))
-                LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
-                    itemsIndexed(state.queue) { idx, item ->
-                        Row(modifier = Modifier.fillMaxWidth().clickable { vm.playTrack(item, state.queue) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Box(Modifier.width(26.dp), contentAlignment = Alignment.Center) {
+                LazyColumn(modifier = Modifier.heightIn(max = 460.dp)) {
+                    itemsIndexed(state.queue, key = { idx, item -> "q_${item.id}_$idx" }) { idx, item ->
+                        val isBeingDragged = draggedTrackId == item.id
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .zIndex(if (isBeingDragged) 10f else 0f)
+                                .graphicsLayer {
+                                    translationY = if (isBeingDragged) dragOffsetY else 0f
+                                    scaleX = if (isBeingDragged) 1.02f else 1f
+                                    scaleY = if (isBeingDragged) 1.02f else 1f
+                                }
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (isBeingDragged) SpotifyCard else Color.Transparent)
+                                .clickable { vm.playTrack(item, state.queue) }
+                                .padding(vertical = 8.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // Drag Handle on the side (just like Spotify!)
+                            Box(
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .pointerInput(item.id) {
+                                        detectDragGestures(
+                                            onDragStart = {
+                                                draggedTrackId = item.id
+                                                dragOffsetY = 0f
+                                            },
+                                            onDragEnd = {
+                                                draggedTrackId = null
+                                                dragOffsetY = 0f
+                                            },
+                                            onDragCancel = {
+                                                draggedTrackId = null
+                                                dragOffsetY = 0f
+                                            },
+                                            onDrag = { change, dragAmount ->
+                                                change.consume()
+                                                dragOffsetY += dragAmount.y
+                                                val steps = (dragOffsetY / rowHeightPx).roundToInt()
+                                                if (steps != 0) {
+                                                    val curIdx = latestQueue.indexOfFirst { it.id == item.id }
+                                                    if (curIdx >= 0) {
+                                                        val targetIdx = (curIdx + steps).coerceIn(0, latestQueue.lastIndex)
+                                                        if (targetIdx != curIdx) {
+                                                            vm.moveQueueItem(curIdx, targetIdx)
+                                                            dragOffsetY -= (targetIdx - curIdx) * rowHeightPx
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        )
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    Icons.Rounded.DragHandle,
+                                    contentDescription = "Drag to reorder",
+                                    tint = if (isBeingDragged) SpotifyGreen else SpotifySubtle,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+                            Spacer(Modifier.width(4.dp))
+                            Box(Modifier.width(22.dp), contentAlignment = Alignment.Center) {
                                 if (idx == state.currentIndex) SpotifyPlayingBars(isPlaying = state.isPlaying, size = 14.dp)
                                 else Text("${idx + 1}", color = SpotifySubtle, fontSize = 12.sp)
                             }
+                            Spacer(Modifier.width(6.dp))
+                            ArtworkImage(item.artworkUrl, item.title, Modifier.size(40.dp))
+                            Spacer(Modifier.width(10.dp))
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(item.title, color = if (idx == state.currentIndex) SpotifyGreen else SpotifyWhite, fontWeight = if (idx == state.currentIndex) FontWeight.Bold else FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(item.title, color = if (idx == state.currentIndex) SpotifyGreen else SpotifyWhite, fontWeight = if (idx == state.currentIndex) FontWeight.Bold else FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 14.sp)
                                 Text(if (item.isSmartInjected) "${item.artist} • Smart Shuffle" else item.artist, color = SpotifySubtle, fontSize = 12.sp, maxLines = 1)
                             }
-                            IconButton(onClick = { vm.moveQueueItem(idx, idx - 1) }, enabled = idx > 0) { Icon(Icons.Rounded.ArrowUpward, "Up", tint = SpotifySubtle, modifier = Modifier.size(18.dp)) }
-                            IconButton(onClick = { vm.moveQueueItem(idx, idx + 1) }, enabled = idx < state.queue.lastIndex) { Icon(Icons.Rounded.ArrowDownward, "Down", tint = SpotifySubtle, modifier = Modifier.size(18.dp)) }
-                            if (idx != state.currentIndex) { IconButton(onClick = { vm.removeFromQueue(idx) }) { Icon(Icons.Rounded.Delete, "Remove", tint = SpotifySubtle, modifier = Modifier.size(18.dp)) } }
+                            if (idx != state.currentIndex) {
+                                IconButton(onClick = { vm.removeFromQueue(idx) }, modifier = Modifier.size(34.dp)) {
+                                    Icon(Icons.Rounded.Close, "Remove", tint = SpotifySubtle, modifier = Modifier.size(18.dp))
+                                }
+                            }
                         }
                     }
                 }
@@ -1115,7 +1473,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
         }
     }
 
-    // Full-Screen Spotify Synced Lyrics Sheet with Visible Error Banner + Smooth Glide + Melody Rows
     if (showFullLyrics && !state.isVideoMode) {
         var manualQuery by remember(track.id) { mutableStateOf("${track.artist} ${track.title}") }
         val activeRowIdx = remember(lyricDisplayRows, state.positionMs) {
@@ -1182,9 +1539,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                                     .background(if (sel) SpotifyGreen else Color.Black.copy(alpha = 0.25f))
                                     .clickable { vm.toggleTranslateLyrics(forceTargetLang = lang) }
                                     .padding(horizontal = 11.dp, vertical = 6.dp)
-                            ) {
-                                Text(lang.label(str.isEn), color = if (sel) Color.Black else SpotifyWhite, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                            }
+                            ) { Text(lang.label(str.isEn), color = if (sel) Color.Black else SpotifyWhite, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
                         }
                     }
                 }
@@ -1218,39 +1573,13 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                                 val isCurrent = idx == activeRowIdx && state.positionMs >= row.timeMs
                                 val isPast = idx < activeRowIdx
                                 when (row) {
-                                    is LyricDisplayRow.MelodyRow -> {
-                                        SpotifyMelodyRowItem(
-                                            isCurrent = isCurrent,
-                                            isPast = isPast,
-                                            isPlaying = state.isPlaying,
-                                            isFullScreen = true,
-                                            onClick = { vm.seekTo(row.timeMs) }
-                                        )
-                                    }
-                                    is LyricDisplayRow.TextLine -> {
-                                        SpotifyAnimatedLyricLine(
-                                            line = row.line,
-                                            isCurrent = isCurrent,
-                                            isPast = isPast,
-                                            showTranslation = state.showTranslatedLyrics,
-                                            fontScale = state.lyricsFontScale,
-                                            baseFontSp = 22f,
-                                            activeFontSp = 25.5f,
-                                            translationFontSp = 14.5f,
-                                            onClick = { vm.seekTo(row.timeMs) }
-                                        )
-                                    }
+                                    is LyricDisplayRow.MelodyRow -> SpotifyMelodyRowItem(isCurrent, isPast, state.isPlaying, true) { vm.seekTo(row.timeMs) }
+                                    is LyricDisplayRow.TextLine -> SpotifyAnimatedLyricLine(row.line, isCurrent, isPast, state.showTranslatedLyrics, state.lyricsFontScale, 22f, 25.5f, 14.5f) { vm.seekTo(row.timeMs) }
                                 }
                             }
                         }
-                        Box(
-                            modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(22.dp)
-                                .background(Brush.verticalGradient(listOf(fullBg, Color.Transparent)))
-                        )
-                        Box(
-                            modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(42.dp)
-                                .background(Brush.verticalGradient(listOf(Color.Transparent, fullBg)))
-                        )
+                        Box(modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(22.dp).background(Brush.verticalGradient(listOf(fullBg, Color.Transparent))))
+                        Box(modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(42.dp).background(Brush.verticalGradient(listOf(Color.Transparent, fullBg))))
                     }
                 }
             }
@@ -1289,20 +1618,14 @@ fun DevicesBottomSheet(state: UiState, vm: AppViewModel) {
                             .background(if (d.isActive) SpotifyGreen.copy(alpha = 0.16f) else SpotifyDarkSurface),
                         contentAlignment = Alignment.Center
                     ) {
-                        ConnectedDeviceVectorIcon(
-                            device = d,
-                            tint = if (d.isActive) SpotifyGreen else SpotifySubtle,
-                            size = 26.dp
-                        )
+                        ConnectedDeviceVectorIcon(device = d, tint = if (d.isActive) SpotifyGreen else SpotifySubtle, size = 26.dp)
                     }
                     Spacer(Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(d.name, color = if (d.isActive) SpotifyGreen else SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                         Text(d.typeLabel(str.isEn), color = SpotifySubtle, fontSize = 12.sp)
                     }
-                    if (d.isActive) {
-                        SpotifyPlayingBars(isPlaying = state.isPlaying, color = SpotifyGreen, size = 16.dp)
-                    }
+                    if (d.isActive) SpotifyPlayingBars(isPlaying = state.isPlaying, color = SpotifyGreen, size = 16.dp)
                 }
                 Spacer(Modifier.height(8.dp))
             }
@@ -1340,7 +1663,7 @@ fun DevicesBottomSheet(state: UiState, vm: AppViewModel) {
             Spacer(Modifier.height(8.dp))
 
             if (state.jamState.active) {
-                val smartLink = SonifyLinkCodec.buildSmartJamLink(state.jamState.code, state.currentTrack, state.positionMs)
+                val smartLink = SonifyShareLinks.jamUrl(state.jamState.code, state.currentTrack, state.positionMs)
                 Card(colors = CardDefaults.cardColors(containerColor = SpotifyCard), shape = RoundedCornerShape(14.dp)) {
                     Column(modifier = Modifier.padding(14.dp)) {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -1360,7 +1683,7 @@ fun DevicesBottomSheet(state: UiState, vm: AppViewModel) {
                             OutlinedButton(
                                 onClick = {
                                     context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                                        type = "text/plain"; putExtra(Intent.EXTRA_TEXT, "Join my Live Sonify Jam! Code: ${state.jamState.code}\n$smartLink")
+                                        type = "text/plain"; putExtra(Intent.EXTRA_TEXT, "הצטרף לחדר ה-Jam החי שלי ב-Sonify! קוד: ${state.jamState.code}\n$smartLink")
                                     }, "Share Jam"))
                                 },
                                 modifier = Modifier.weight(1f)
