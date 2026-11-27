@@ -222,6 +222,9 @@ data class UiState(
     val isBuildingAiPlaylist: Boolean = false,
     val isTestingAiApi: Boolean = false,
     val aiTestResult: Pair<Boolean, String>? = null,
+    val liveAiModels: List<String> = emptyList(),
+    val isFetchingAiModels: Boolean = false,
+    val aiModelsError: String? = null,
     val isAiDjActive: Boolean = false,
     val activeDjStyleLabel: String = "",
     val djVibeIndex: Int = 0,
@@ -856,7 +859,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleLibraryGrid() = _uiState.update { it.copy(libraryGridView = !it.libraryGridView) }
     fun selectFolder(id: String?) = _uiState.update { it.copy(selectedFolderId = id) }
 
-    // ---------- AI API Connection Test ----------
+    // ---------- AI API Connection Test, Live Model Fetcher, Cache & Reset ----------
     fun testAiApiConnection() {
         if (_uiState.value.isTestingAiApi) return
         _uiState.update { it.copy(isTestingAiApi = true, aiTestResult = null) }
@@ -864,6 +867,44 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val res = repo.testAiConnection(_uiState.value.settings)
             _uiState.update { it.copy(isTestingAiApi = false, aiTestResult = res, statusMessage = res.second) }
         }
+    }
+
+    fun fetchLiveAiModels() {
+        if (_uiState.value.isFetchingAiModels) return
+        _uiState.update { it.copy(isFetchingAiModels = true, aiModelsError = null) }
+        viewModelScope.launch {
+            val (models, err) = repo.aiClient.fetchAvailableModels(_uiState.value.settings)
+            val s = _uiState.value.strings
+            _uiState.update {
+                it.copy(
+                    isFetchingAiModels = false,
+                    liveAiModels = models,
+                    aiModelsError = err,
+                    statusMessage = if (models.isNotEmpty()) s.t("נטענו ${models.size} מודלים חיים מה-API!", "Loaded ${models.size} live models!") else err
+                )
+            }
+        }
+    }
+
+    fun clearLyricsCache() {
+        repo.clearLyricsCache()
+        translatedLyricsCache.clear()
+        val s = _uiState.value.strings
+        _uiState.update { it.copy(statusMessage = s.t("מטמון מילות השירים נוקה", "Lyrics cache cleared")) }
+    }
+
+    fun resetSettingsToDefaults() {
+        val cur = _uiState.value.settings
+        val fresh = AppSettings(
+            language = cur.language,
+            aiProvider = cur.aiProvider,
+            aiModelId = cur.aiProvider.defaultModel,
+            aiCustomEndpoint = cur.aiCustomEndpoint,
+            geminiApiKey = cur.geminiApiKey,
+            jamUserDisplayName = cur.jamUserDisplayName
+        )
+        updateSettings(fresh)
+        _uiState.update { it.copy(statusMessage = it.strings.t("ההגדרות אופסו לברירת המחדל", "Settings reset to defaults")) }
     }
 
     // ---------- Spotify-Grade Full Artist Page & Album Opener ----------
@@ -1061,12 +1102,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             newSettings.language != prev.language ||
             newSettings.showYoutubePlaylistsHome != prev.showYoutubePlaylistsHome
 
-        // If Offline Mode was just enabled while watching a video clip, immediately exit video mode!
         if (newSettings.offlineMode && _uiState.value.isVideoMode) {
             _uiState.update { it.copy(isVideoMode = false, isFindingVideoClip = false) }
         }
 
-        _uiState.update { it.copy(settings = newSettings, aiTestResult = if (newSettings.aiProvider != prev.aiProvider || newSettings.aiModelId != prev.aiModelId || newSettings.geminiApiKey != prev.geminiApiKey) null else it.aiTestResult) }
+        val providerOrKeyChanged = newSettings.aiProvider != prev.aiProvider || newSettings.geminiApiKey != prev.geminiApiKey
+        _uiState.update {
+            it.copy(
+                settings = newSettings,
+                aiTestResult = if (providerOrKeyChanged || newSettings.aiModelId != prev.aiModelId) null else it.aiTestResult,
+                liveAiModels = if (providerOrKeyChanged) emptyList() else it.liveAiModels,
+                aiModelsError = if (providerOrKeyChanged) null else it.aiModelsError
+            )
+        }
         audioEngine.applySettings(newSettings)
         prefs.edit()
             .putString("lang", newSettings.language.name)
@@ -1202,7 +1250,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- Search (Includes Artists + Offline Local Search!) ----------
+    // ---------- Search (Includes Artists + Offline Local Search) ----------
     fun onSearchQueryChange(query: String) {
         _uiState.update { it.copy(searchQuery = query, hasSearched = false) }
     }
@@ -1224,7 +1272,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
             val st = _uiState.value
-            // Full Offline Search Support: searches downloaded tracks, playlists & local device files!
             if (st.settings.offlineMode) {
                 val offlinePool = (st.likedTracks + st.recentTracks + st.playlists.flatMap { it.tracks } + st.localAudioTracks)
                     .distinctBy { it.id }
@@ -1274,7 +1321,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val s = _uiState.value.strings
         val trimmed = raw.trim()
 
-        // 0. Quick Widget URI shortcuts
         if (trimmed.equals("sonify://liked", true)) {
             setShowCodeFor(null)
             openLikedSongsPlaylist()
@@ -1286,7 +1332,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 1. Live Cloudless Chat Invite Link (`https://sonify.link/chat/CODE?name=...` or `sonify://chat/CODE`)
         val chatMatch = Regex("(?:sonify\\.link/chat/|sonify://chat/|sonify:chat:)([A-Za-z0-9]+)", RegexOption.IGNORE_CASE).find(trimmed)
         if (chatMatch != null) {
             val roomCode = chatMatch.groupValues[1].uppercase()
@@ -1297,14 +1342,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 2. Cloudless Friend Blend Token (`sonify:blend:` or `https://sonify.link/blend/...`)
         if (trimmed.contains("sonify:blend:", true) || trimmed.contains("/blend/", true)) {
             setShowCodeFor(null)
             createBlendFromFriendCode(trimmed)
             return
         }
 
-        // 3. Cloudless Shared Playlist Token (`sonify:plshare:` or `https://sonify.link/plshare/...`)
         val sharedPl = BlendTasteCodec.decodeSharedPlaylist(trimmed)
         if (sharedPl != null) {
             setShowCodeFor(null)
@@ -1327,7 +1370,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 4. Real HTTPS / Custom Scheme Jam Link (`https://sonify.link/jam/CODE?v=...&t=...`)
         val jamMatch = Regex("(?:sonify\\.link/jam/|sonify://jam/)([A-Za-z0-9]+)", RegexOption.IGNORE_CASE).find(trimmed)
         if (jamMatch != null) {
             val code = jamMatch.groupValues[1].uppercase()
@@ -1339,7 +1381,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 5. Real HTTPS / Custom Scheme Track Link (`https://sonify.link/track/VID?t=...`, `sonify://track/VID`, `youtu.be/VID`)
         val trackMatch = Regex("(?:sonify\\.link/track/|sonify://track/|youtu\\.be/|watch\\?v=)([A-Za-z0-9_-]{11})", RegexOption.IGNORE_CASE).find(trimmed)
         if (trackMatch != null) {
             val vid = trackMatch.groupValues[1]
@@ -1354,7 +1395,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 6. Real HTTPS / Custom Scheme Playlist Link (`https://sonify.link/playlist/ID`, `sonify://playlist/ID`)
         val plMatch = Regex("(?:sonify\\.link/playlist/|sonify://playlist/)([^?&#\\s]+)", RegexOption.IGNORE_CASE).find(trimmed)
         if (plMatch != null) {
             val plId = plMatch.groupValues[1]
@@ -1365,14 +1405,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 7. Spotify Share Link -> auto import!
         if (trimmed.contains("open.spotify.com/", true)) {
             setShowCodeFor(null)
             importPlaylist("", trimmed)
             return
         }
 
-        // 8. Legacy SonifyLinkCodec fallback
         when (val parsed = SonifyLinkCodec.parse(trimmed)) {
             is ParsedSonifyLink.JamLink -> {
                 setShowCodeFor(null)
@@ -1559,12 +1597,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         prefetchNextTracksInQueue(finalQueue, idx)
 
-        // Never auto-open video clip in Offline Mode!
         if (!settings.offlineMode && (openVideoImmediately || (!settings.dataSaver && !(track.isPodcast && settings.audioOnlyPodcasts) && settings.autoVideoOnWifi && track.source == StreamSource.YOUTUBE))) {
             viewModelScope.launch { toggleVideoClipMode() }
         }
 
-        // Cancellable 6-source synced lyrics loader (eliminates stale race bugs!)
         lyricsJob?.cancel()
         lyricsJob = viewModelScope.launch {
             val lyrics = runCatching {
@@ -1578,7 +1614,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Cancellable Real Artist Photo + Credits + Interviews + Similar Cards loader
         extrasJob?.cancel()
         extrasJob = viewModelScope.launch {
             val extras = cachedExtras ?: runCatching { repo.fetchNowPlayingExtras(track, settings) }.getOrNull()
@@ -1672,7 +1707,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // Strict Offline Guard: Video Clip CANNOT be opened in Offline Mode!
+    // Strict Offline Guard: Video Clip CANNOT be opened in Offline Mode
     fun toggleVideoClipMode() {
         val state = _uiState.value
         val track = state.currentTrack ?: return
@@ -2310,7 +2345,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(deletedPlaylists = newDeleted, statusMessage = it.strings.t("\"${record.playlist.name}\" שוחזר!", "Restored \"${record.playlist.name}\"!")) }
     }
 
-    // Complete Import (YouTube + Spotify + Sonify Codes + Song Lists!)
     fun importPlaylist(name: String, rawInput: String) {
         val s = _uiState.value.strings
         val trimmed = rawInput.trim()
@@ -2338,7 +2372,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- AI Playlist Studio (With Auto Count!) & AI DJ ----------
+    // ---------- AI Playlist Studio (With Auto Count) & AI DJ ----------
     fun createAiPlaylist(config: AiPlaylistConfig) {
         val s = _uiState.value.strings
         if (config.prompt.isBlank()) { _uiState.update { it.copy(statusMessage = s.t("תאר איזה פלייליסט תרצה", "Describe your playlist")) }; return }
@@ -2858,7 +2892,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val updated = (_uiState.value.messages + msg).takeLast(120)
         prefs.edit().putString("messages", encodeMessages(updated)).apply()
 
-        // If this friend thread has a live room code, push real-time via cloudless ntfy relay!
         val friendObj = _uiState.value.friends.firstOrNull { it.name == friendThread }
         if (friendObj != null && friendObj.roomCode.length >= 4 && !_uiState.value.settings.offlineMode) {
             chatSync.send(viewModelScope, friendObj.roomCode, _uiState.value.settings.jamSyncServerUrl, msg)
