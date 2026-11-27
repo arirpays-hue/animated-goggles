@@ -48,7 +48,11 @@ import androidx.media3.common.Player
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.BaseAudioProcessor
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
@@ -83,6 +87,32 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
+
+// Persistent 180MB ExoPlayer Disk Cache for zero-stutter playback in weak-signal zones!
+object AudioCacheHolder {
+    @Volatile private var simpleCache: SimpleCache? = null
+
+    fun getOrCreate(context: Context): SimpleCache? {
+        return simpleCache ?: synchronized(this) {
+            simpleCache ?: runCatching {
+                val cacheDir = File(context.applicationContext.cacheDir, "exo_stream_cache")
+                if (!cacheDir.exists()) cacheDir.mkdirs()
+                val evictor = LeastRecentlyUsedCacheEvictor(180L * 1024L * 1024L)
+                val dbProvider = StandaloneDatabaseProvider(context.applicationContext)
+                SimpleCache(cacheDir, evictor, dbProvider)
+            }.getOrNull()?.also { simpleCache = it }
+        }
+    }
+
+    fun clearAllEntries() {
+        runCatching {
+            val cache = simpleCache ?: return
+            cache.keys.toList().forEach { key ->
+                runCatching { cache.removeResource(key) }
+            }
+        }
+    }
+}
 
 class ChannelBalanceMonoProcessor : BaseAudioProcessor() {
     @Volatile var monoEnabled: Boolean = false
@@ -146,9 +176,10 @@ object PlayerHolder {
                     }
                 }
 
+                // Weak-network shield: 60s-180s deep buffer + 20s back buffer + fast 650ms start!
                 val loadControl = DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(profile.minMs, profile.maxMs, 650, profile.rebufferMs)
-                    .setBackBuffer(10_000, true)
+                    .setBufferDurationsMs(profile.minMs, profile.maxMs, profile.playMs.coerceAtMost(750), profile.rebufferMs)
+                    .setBackBuffer(20_000, true)
                     .setPrioritizeTimeOverSizeThresholds(true)
                     .build()
 
@@ -351,7 +382,6 @@ class WebPlaybackEngine(private val context: Context) {
         val u = url.lowercase()
         if (adBlockedHostFragments.any { h.contains(it) }) return true
         if (adBlockedUrlFragments.any { u.contains(it) }) return true
-        // Block ad video playback streams (marked with adformat / oad / ctier=L on googlevideo)
         if (h.contains("googlevideo.com") && (u.contains("&oad=") || u.contains("?oad=") || u.contains("adformat="))) return true
         return false
     }
@@ -420,10 +450,7 @@ class WebPlaybackEngine(private val context: Context) {
                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                     val url = request?.url?.toString().orEmpty()
                     val host = request?.url?.host.orEmpty()
-                    // Layer 1 Ad Blocker: drop ad network & ad-break requests before they reach the player!
-                    if (isAdRequest(url, host)) {
-                        return emptyAdResponse()
-                    }
+                    if (isAdRequest(url, host)) return emptyAdResponse()
                     val vid = currentVideoId
                     if (vid.isNotBlank() && url.contains("googlevideo.com/videoplayback") && !url.contains("sabr=1", true)) {
                         val decoded = runCatching { URLDecoder.decode(url, "UTF-8") }.getOrDefault(url)
@@ -718,7 +745,7 @@ class WebPlaybackEngine(private val context: Context) {
 
             mainHandler.post { wv.evaluateJavascript(js, null) }
 
-            val ok = withTimeoutOrNull(28_000L) { deferred.await() } ?: false
+            val ok = withTimeoutOrNull(25_000L) { deferred.await() } ?: false
             if (ok) return true
             activeDownloads.remove(dlId)?.let { dl ->
                 runCatching { dl.outStream.close() }
@@ -761,7 +788,6 @@ class WebPlaybackEngine(private val context: Context) {
         mainHandler.post { webView?.evaluateJavascript(js, null) }
     }
 
-    // Layer 2 Ad Blocker inside m.youtube.com: instantly mutes, fast-forwards & clicks skip on any inline ad!
     private fun injectMobileWatchHook(startSec: Double) {
         val css = cleanMobileCssString()
         val js = """
@@ -950,8 +976,8 @@ class AudioEngine(private val context: Context) {
     val webEngine = WebPlaybackEngine(context)
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(16, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
         .connectionPool(ConnectionPool(10, 5, TimeUnit.MINUTES))
         .retryOnConnectionFailure(true)
         .followRedirects(true)
@@ -996,6 +1022,7 @@ class AudioEngine(private val context: Context) {
     private val eqCenterFreqs = floatArrayOf(31f, 62f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f)
 
     init {
+        AudioCacheHolder.getOrCreate(context)
         tts = TextToSpeech(context.applicationContext) { status ->
             ttsReady = (status == TextToSpeech.SUCCESS)
             if (ttsReady) {
@@ -1176,12 +1203,38 @@ class AudioEngine(private val context: Context) {
         }
     }
 
-    private fun buildSingleSource(url: String, metadata: MediaMetadata, userAgent: String, cookie: String? = null): MediaSource {
+    // Uses 180MB SimpleCache for remote HTTP/HTTPS streams (smooth playback even when signal drops!)
+    private fun buildSingleSource(
+        url: String,
+        metadata: MediaMetadata,
+        userAgent: String,
+        cookie: String? = null,
+        cacheKey: String? = null
+    ): MediaSource {
+        val isLocalUri = url.startsWith("file:", true) || url.startsWith("content:", true)
         val okHttpFactory = OkHttpDataSource.Factory(okHttpClient).setUserAgent(userAgent)
         if (!cookie.isNullOrBlank()) okHttpFactory.setDefaultRequestProperties(mapOf("Cookie" to cookie))
-        val dataSourceFactory = DefaultDataSource.Factory(context, okHttpFactory)
-        val item = MediaItem.Builder().setUri(url).setMediaMetadata(metadata).build()
-        return if (url.contains(".m3u8", true) || url.contains("manifest/hls", true)) {
+        val upstreamFactory = DefaultDataSource.Factory(context, okHttpFactory)
+
+        val isHls = url.contains(".m3u8", true) || url.contains("manifest/hls", true)
+        val cache = if (!isLocalUri && !isHls) AudioCacheHolder.getOrCreate(context) else null
+
+        val dataSourceFactory = if (cache != null) {
+            CacheDataSource.Factory()
+                .setCache(cache)
+                .setUpstreamDataSourceFactory(upstreamFactory)
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        } else {
+            upstreamFactory
+        }
+
+        val itemBuilder = MediaItem.Builder().setUri(url).setMediaMetadata(metadata)
+        if (!cacheKey.isNullOrBlank() && cache != null) {
+            itemBuilder.setCustomCacheKey(cacheKey)
+        }
+        val item = itemBuilder.build()
+
+        return if (isHls) {
             HlsMediaSource.Factory(dataSourceFactory).createMediaSource(item)
         } else {
             ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(item)
@@ -1194,16 +1247,17 @@ class AudioEngine(private val context: Context) {
         runCatching { context.startService(Intent(context, PlaybackService::class.java)) }
 
         val metadata = MediaMetadata.Builder().setTitle(track.title).setArtist(track.artist).setAlbumTitle(track.album).build()
+        val audioCacheKey = if (!videoMode && !resolved.isOffline) "sonify_a_${track.id}" else null
         val source: MediaSource = if (videoMode) {
             when {
                 !resolved.videoUrl.isNullOrBlank() -> buildSingleSource(resolved.videoUrl, metadata, resolved.userAgent, resolved.cookie)
                 !resolved.videoOnlyUrl.isNullOrBlank() -> MergingMediaSource(
                     buildSingleSource(resolved.videoOnlyUrl, metadata, resolved.userAgent, resolved.cookie),
-                    buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent, resolved.cookie)
+                    buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent, resolved.cookie, audioCacheKey)
                 )
-                else -> buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent, resolved.cookie)
+                else -> buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent, resolved.cookie, audioCacheKey)
             }
-        } else buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent, resolved.cookie)
+        } else buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent, resolved.cookie, audioCacheKey)
 
         player.setMediaSource(source, startPositionMs)
         player.prepare()
