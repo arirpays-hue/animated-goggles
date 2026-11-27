@@ -123,7 +123,7 @@ fun StatsWrappedSheet(state: UiState, vm: AppViewModel) {
             Spacer(Modifier.height(16.dp))
             Button(
                 onClick = {
-                    val topArtTxt = topArtists.take(3).joinToString(", ") { it.first }
+                    val topArtTxt = topArtists.take(3).joinToString(", ") { it.key }
                     val summary = "Sonify Wrapped: $totalMin ${str.t("דקות האזנה", "min listened")}! ${if (topArtTxt.isNotBlank()) "Top: $topArtTxt" else ""}"
                     context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
                         type = "text/plain"; putExtra(Intent.EXTRA_TEXT, summary)
