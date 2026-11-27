@@ -1,5 +1,8 @@
 package com.sonify.app
 
+import android.util.Base64
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.UUID
 
 fun upgradeArtworkUrlGlobal(url: String): String {
@@ -291,6 +294,79 @@ data class AiPlaylistConfig(
     val eraPref: String = "הכל"
 )
 
+data class AiDjConfig(
+    val styleName: String = "",
+    val customPrompt: String = "",
+    val speakAtStart: Boolean = true,
+    val speakBetweenTracks: Boolean = true
+)
+
+// Cloudless Friend Blend & Shared Playlist Token Codec (works via WhatsApp / Copy / QR without accounts!)
+data class FriendTasteProfile(
+    val name: String,
+    val artists: List<String>,
+    val trackIds: List<String> = emptyList()
+)
+
+data class SharedPlaylistToken(
+    val name: String,
+    val creator: String,
+    val trackIds: List<String>
+)
+
+object BlendTasteCodec {
+    fun encodeTaste(name: String, artists: List<String>, trackIds: List<String>): String {
+        val obj = JSONObject().apply {
+            put("n", name.trim().ifBlank { "חבר" }.take(20))
+            put("a", JSONArray().apply { artists.distinct().take(8).forEach { put(it.take(32)) } })
+            put("t", JSONArray().apply { trackIds.distinct().take(6).forEach { put(it) } })
+        }
+        val b64 = Base64.encodeToString(obj.toString().toByteArray(Charsets.UTF_8), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        return "sonify:blend:$b64"
+    }
+
+    fun decodeTaste(raw: String): FriendTasteProfile? {
+        val trimmed = raw.trim()
+        if (!trimmed.startsWith("sonify:blend:", ignoreCase = true)) return null
+        return runCatching {
+            val b64 = trimmed.substringAfter("sonify:blend:").trim()
+            val json = JSONObject(String(Base64.decode(b64, Base64.URL_SAFE), Charsets.UTF_8))
+            val name = json.optString("n", "חבר")
+            val artistsArr = json.optJSONArray("a") ?: JSONArray()
+            val tracksArr = json.optJSONArray("t") ?: JSONArray()
+            val artists = List(artistsArr.length()) { artistsArr.optString(it) }.filter { it.isNotBlank() }
+            val tracks = List(tracksArr.length()) { tracksArr.optString(it) }.filter { it.length == 11 }
+            FriendTasteProfile(name, artists, tracks)
+        }.getOrNull()
+    }
+
+    fun encodeSharedPlaylist(pl: Playlist): String {
+        val obj = JSONObject().apply {
+            put("n", pl.name.take(32))
+            put("c", pl.creator.take(20))
+            put("t", JSONArray().apply {
+                pl.tracks.filter { it.source == StreamSource.YOUTUBE && it.id.length == 11 }.take(25).forEach { put(it.id) }
+            })
+        }
+        val b64 = Base64.encodeToString(obj.toString().toByteArray(Charsets.UTF_8), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        return "sonify:plshare:$b64"
+    }
+
+    fun decodeSharedPlaylist(raw: String): SharedPlaylistToken? {
+        val trimmed = raw.trim()
+        if (!trimmed.startsWith("sonify:plshare:", ignoreCase = true)) return null
+        return runCatching {
+            val b64 = trimmed.substringAfter("sonify:plshare:").trim()
+            val json = JSONObject(String(Base64.decode(b64, Base64.URL_SAFE), Charsets.UTF_8))
+            val name = json.optString("n", "פלייליסט משותף")
+            val creator = json.optString("c", "חבר")
+            val arr = json.optJSONArray("t") ?: JSONArray()
+            val ids = List(arr.length()) { arr.optString(it) }.filter { it.length == 11 }
+            if (ids.isEmpty()) null else SharedPlaylistToken(name, creator, ids)
+        }.getOrNull()
+    }
+}
+
 data class AppSettings(
     val language: AppLanguage = AppLanguage.HEBREW,
     val showCreateNavButton: Boolean = true,
@@ -306,6 +382,8 @@ data class AppSettings(
     val subsonicPass: String = "",
     val geminiApiKey: String = "",
     val djVoiceEnabled: Boolean = true,
+    val djIntroVoice: Boolean = true,
+    val djBetweenTracksVoice: Boolean = true,
     val normalizeVolume: Boolean = true,
     val normalizationLevel: NormalizationLevel = NormalizationLevel.NORMAL,
     val gaplessPlayback: Boolean = true,
@@ -332,7 +410,6 @@ data class AppSettings(
     val notifyConcerts: Boolean = true,
     val notifyPodcasts: Boolean = true,
     val carModeOptimized: Boolean = false,
-    // v10.0.0 Customization Settings
     val infiniteAiHome: Boolean = true,
     val showYoutubePlaylistsHome: Boolean = true,
     val aiUniqueCovers: Boolean = true,
