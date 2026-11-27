@@ -619,7 +619,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         viewModelScope.launch {
-            val tracks = repo.fetchPlaylistTracks(release.id, maxTracks = 60, fallbackCoverUrl = release.artworkUrl)
+            val tracks = repo.fetchPlaylistTracks(
+                playlistId = release.id,
+                maxTracks = 60,
+                fallbackCoverUrl = release.artworkUrl,
+                fallbackArtist = artistName
+            )
             _uiState.update { state ->
                 val cur = state.openedPlaylist
                 if (cur != null && cur.id == release.id) state.copy(isLoadingPlaylist = false, openedPlaylist = cur.copy(tracks = tracks))
@@ -852,7 +857,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- Smart Sonify Code / QR / Deep Link Opener ----------
+    // ---------- Smart Sonify Code / QR / Deep Link Opener (Fetches Real Song Title & Artist!) ----------
     fun openSonifyCodeOrLink(raw: String) {
         val s = _uiState.value.strings
         when (val parsed = SonifyLinkCodec.parse(raw)) {
@@ -862,9 +867,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             is ParsedSonifyLink.TrackLink -> {
                 setShowCodeFor(null)
-                val track = Track(parsed.videoId, s.t("שיר משותף", "Shared Track"), "YouTube", artworkUrl = "https://i.ytimg.com/vi/${parsed.videoId}/maxresdefault.jpg")
-                playTrack(track, listOf(track), startAtMs = parsed.startSec * 1000L)
-                setShowNowPlaying(true)
+                _uiState.update { it.copy(statusMessage = s.t("טוען פרטי שיר...", "Loading track info...")) }
+                viewModelScope.launch {
+                    val realTrack = repo.fetchTrackMetadataById(parsed.videoId)
+                    playTrack(realTrack, listOf(realTrack), startAtMs = parsed.startSec * 1000L)
+                    setShowNowPlaying(true)
+                }
             }
             is ParsedSonifyLink.PlaylistLink -> {
                 val localPl = _uiState.value.playlists.firstOrNull { it.id.startsWith(parsed.playlistId) }
@@ -1229,7 +1237,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- RESTORED: Smart Shuffle Inside Playlists! ----------
+    // ---------- Smart Shuffle Inside Playlists ----------
     fun toggleSmartShuffleForPlaylist(playlist: Playlist) {
         val st = _uiState.value
         val s = st.strings
@@ -1585,6 +1593,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadMoreTracksForPlaylist(pl: Playlist) {
+        // Never inject unrelated songs into an album or single!
+        if (pl.id.startsWith("MPRE") || pl.id.startsWith("OLAK")) return
         if (_uiState.value.isExpandingPlaylist) return
         val s = _uiState.value.strings
         _uiState.update { it.copy(isExpandingPlaylist = true, statusMessage = s.t("מוסיף שירים דומים לפלייליסט...", "Adding more tracks...")) }
@@ -1852,8 +1862,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (!vid.isNullOrBlank() && vid.length == 11) {
-            val snapTrack = Track(vid, s.t("שיר מתוך Jam", "Jam Track"), "Jam • $code", artworkUrl = "https://i.ytimg.com/vi/$vid/maxresdefault.jpg")
-            playTrack(snapTrack, listOf(snapTrack), startAtMs = sec * 1000L, fromRemoteJam = true)
+            viewModelScope.launch {
+                val realTrack = repo.fetchTrackMetadataById(vid)
+                playTrack(realTrack, listOf(realTrack), startAtMs = sec * 1000L, fromRemoteJam = true)
+            }
         }
 
         if (st.settings.jamLiveSyncEnabled) {
