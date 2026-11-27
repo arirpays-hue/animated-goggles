@@ -2146,16 +2146,14 @@ class StreamRepository(private val context: Context) {
             .replace(Regex("\\s+"), " ")
             .trim()
     }
-
     private fun cleanArtistName(artist: String): String {
         return artist
             .replace("- Topic", "", true)
             .replace("VEVO", "", true)
             .replace("Official", "", true)
+            .replace(Regex("\\s*(?:feat\\.|ft\\.).*", RegexOption.IGNORE_CASE), "")
             .substringBefore(",")
             .substringBefore("&")
-            .substringBefore("feat.", ignoreCase = true)
-            .substringBefore("ft.", ignoreCase = true)
             .trim()
     }
 
