@@ -202,7 +202,6 @@ fun SpotifySeekBar(progress: Float, onScrubChange: (Float) -> Unit, onScrubFinis
     }
 }
 
-// Structured Spotify Lyrics Display Model: treats instrumental melodies as first-class animated rows!
 private sealed class LyricDisplayRow {
     abstract val timeMs: Long
     abstract val keyId: String
@@ -233,7 +232,6 @@ private fun isInstrumentalMarkerText(text: String): Boolean {
 private fun buildLyricDisplayRows(lyrics: List<LyricLine>): List<LyricDisplayRow> {
     if (lyrics.isEmpty()) return emptyList()
     val out = mutableListOf<LyricDisplayRow>()
-    // Intro melody symbol row if song starts with an instrumental opening (>= 3.5s)
     if (lyrics.first().timeMs >= 3500L) {
         out.add(LyricDisplayRow.MelodyRow(timeMs = 0L, breakId = 0))
     }
@@ -251,7 +249,6 @@ private fun buildLyricDisplayRows(lyrics: List<LyricLine>): List<LyricDisplayRow
     return out
 }
 
-// Smooth Spotify-like gliding scroll to active lyric/melody row
 private suspend fun smoothGlideToLyric(listState: LazyListState, targetIndex: Int, topOffsetPx: Int) {
     val visible = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }
     if (visible != null) {
@@ -388,7 +385,6 @@ private fun SpotifyAnimatedLyricLine(
             lineHeight = ((if (isCurrent) activeFontSp else baseFontSp) * 1.30f * fontScale).sp,
             fontSize = ((if (isCurrent) activeFontSp else baseFontSp) * fontScale).sp
         )
-        // Spotify-style smaller, clean subtitle translation directly underneath the original lyric line
         AnimatedVisibility(
             visible = showTranslation && !line.translatedText.isNullOrBlank(),
             enter = fadeIn(tween(260)) + expandVertically(tween(260)),
@@ -396,7 +392,7 @@ private fun SpotifyAnimatedLyricLine(
         ) {
             Text(
                 text = line.translatedText.orEmpty(),
-                color = if (isCurrent) Color.White.copy(alpha = 0.80f) else lineColor.copy(alpha = 0.72f),
+                color = if (isCurrent) Color.White.copy(alpha = 0.82f) else lineColor.copy(alpha = 0.72f),
                 fontWeight = FontWeight.Medium,
                 fontFamily = FontFamily.SansSerif,
                 fontSize = (translationFontSp * fontScale).sp,
@@ -404,6 +400,30 @@ private fun SpotifyAnimatedLyricLine(
                 modifier = Modifier.padding(top = 2.dp)
             )
         }
+    }
+}
+
+@Composable
+private fun LyricsTranslateErrorBanner(errorMsg: String, str: AppStrings, onOpenSettings: () -> Unit, onDismiss: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+            .clip(RoundedCornerShape(10.dp)).background(Color(0xCC2B1212))
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Rounded.WarningAmber, null, tint = Color(0xFFFFB74D), modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(errorMsg, color = SpotifyWhite, fontSize = 11.5.sp, modifier = Modifier.weight(1f))
+        if (errorMsg.contains("API", true) || errorMsg.contains("מפתח")) {
+            Text(
+                str.t("הגדרות", "Settings"),
+                color = SpotifyGreen,
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.ExtraBold,
+                modifier = Modifier.clickable(onClick = onOpenSettings).padding(horizontal = 6.dp)
+            )
+        }
+        Icon(Icons.Rounded.Close, "Close", tint = SpotifySubtle, modifier = Modifier.size(16.dp).clickable(onClick = onDismiss))
     }
 }
 
@@ -523,7 +543,12 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Text(qualityLabel, color = if (state.resolvedStreams?.isLossless == true) SpotifyGreen else SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        if (state.isWeakNetworkActive) "$qualityLabel • ${str.t("הגנת רשת חלשה", "Weak-Net Shield")}" else qualityLabel,
+                        color = if (state.resolvedStreams?.isLossless == true || state.resolvedStreams?.codecLabel == "INSTANT CACHE") SpotifyGreen else SpotifyWhite,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
                 Row {
                     IconButton(onClick = { showSpeedSheet = true }) {
@@ -624,7 +649,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                 ) {
                     Row(
                         modifier = Modifier.weight(1f).clip(RoundedCornerShape(50)).background(SpotifyGreen.copy(alpha = 0.2f))
-                            .spotifyPressClickable { vm.switchAiDjVibe() }.padding(horizontal = 12.dp, vertical = 8.dp),
+                            .clickable { vm.switchAiDjVibe() }.padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center
                     ) {
                         Icon(Icons.Rounded.GraphicEq, null, tint = SpotifyGreen, modifier = Modifier.size(17.dp))
@@ -633,7 +658,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                     }
                     Box(
                         modifier = Modifier.clip(RoundedCornerShape(50)).background(SpotifyCard)
-                            .spotifyPressClickable { vm.setShowDjStudioSheet(true) }
+                            .clickable { vm.setShowDjStudioSheet(true) }
                             .padding(horizontal = 12.dp, vertical = 8.dp)
                     ) {
                         Icon(Icons.Rounded.Tune, "DJ Studio", tint = SpotifyWhite, modifier = Modifier.size(18.dp))
@@ -781,7 +806,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // Spotify Animated Synced Lyrics Card (Dedicated Melody Symbol Rows + Small Sub-Translation + Hidden in Video Mode!)
             if (!state.isVideoMode) {
                 Spacer(Modifier.height(18.dp))
                 val lyricsCardBg by animateColorAsState(
@@ -819,7 +843,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                                     Box(
                                         modifier = Modifier.clip(RoundedCornerShape(50))
                                             .background(if (state.showTranslatedLyrics) SpotifyWhite else Color.Black.copy(alpha = 0.32f))
-                                            .spotifyPressClickable { vm.toggleTranslateLyrics() }
+                                            .clickable { vm.toggleTranslateLyrics() }
                                             .padding(horizontal = 10.dp, vertical = 5.dp)
                                     ) {
                                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -854,6 +878,15 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                         }
 
                         Spacer(Modifier.height(10.dp))
+
+                        state.lyricsTranslateError?.let { err ->
+                            LyricsTranslateErrorBanner(
+                                errorMsg = err,
+                                str = str,
+                                onOpenSettings = { vm.openAiApiSettings() },
+                                onDismiss = { vm.clearLyricsTranslateError() }
+                            )
+                        }
 
                         if (state.isLoadingLyrics) {
                             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 16.dp)) {
@@ -919,7 +952,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(16.dp))
 
-            // Spotify-Style "About the artist" Hero Card
             Card(
                 modifier = Modifier.fillMaxWidth().spotifyPressClickable { vm.openArtistPage(track.artist, track.artworkUrl) },
                 shape = RoundedCornerShape(16.dp),
@@ -1083,7 +1115,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
         }
     }
 
-    // Full-Screen Spotify Synced Lyrics Sheet (Melody Symbol Rows + Small Sub-Translation + Smooth 520ms Glide)
+    // Full-Screen Spotify Synced Lyrics Sheet with Visible Error Banner + Smooth Glide + Melody Rows
     if (showFullLyrics && !state.isVideoMode) {
         var manualQuery by remember(track.id) { mutableStateOf("${track.artist} ${track.title}") }
         val activeRowIdx = remember(lyricDisplayRows, state.positionMs) {
@@ -1129,12 +1161,18 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                                     .clickable { vm.toggleTranslateLyrics() }
                                     .padding(horizontal = 12.dp, vertical = 6.dp)
                             ) {
-                                Text(
-                                    if (state.isTranslatingLyrics) str.translating else if (state.showTranslatedLyrics) str.showOriginal else str.translateLyrics,
-                                    color = if (state.showTranslatedLyrics) Color.Black else SpotifyWhite,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (state.isTranslatingLyrics) {
+                                        CircularProgressIndicator(color = SpotifyGreen, strokeWidth = 1.8.dp, modifier = Modifier.size(12.dp))
+                                        Spacer(Modifier.width(5.dp))
+                                    }
+                                    Text(
+                                        if (state.isTranslatingLyrics) str.translating else if (state.showTranslatedLyrics) str.showOriginal else str.translateLyrics,
+                                        color = if (state.showTranslatedLyrics) Color.Black else SpotifyWhite,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
                         items(LyricsLanguage.entries) { lang ->
@@ -1151,7 +1189,16 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
 
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(10.dp))
+
+                state.lyricsTranslateError?.let { err ->
+                    LyricsTranslateErrorBanner(
+                        errorMsg = err,
+                        str = str,
+                        onOpenSettings = { showFullLyrics = false; vm.openAiApiSettings() },
+                        onDismiss = { vm.clearLyricsTranslateError() }
+                    )
+                }
 
                 if (state.isLoadingLyrics) {
                     Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) {
