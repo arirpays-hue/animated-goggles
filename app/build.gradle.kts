@@ -12,8 +12,8 @@ android {
         applicationId = "com.sonify.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "10.2.0"
+        versionCode = 14
+        versionName = "11.0.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
