@@ -80,11 +80,11 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
         vm.clearStatus()
     }
 
-    // Hardware Back navigation priority stack
     BackHandler(
-        enabled = state.showNowPlaying || state.showSettings || state.openedArtist != null || state.openedPlaylist != null || state.selectedTab != MainTab.HOME
+        enabled = state.showDjStudioSheet || state.showNowPlaying || state.showSettings || state.openedArtist != null || state.openedPlaylist != null || state.selectedFolderId != null || state.selectedTab != MainTab.HOME
     ) {
         when {
+            state.showDjStudioSheet -> vm.setShowDjStudioSheet(false)
             state.showNowPlaying -> vm.setShowNowPlaying(false)
             state.showSettings -> {
                 if (state.settingsSection != SettingsSection.ROOT) vm.setSettingsSection(SettingsSection.ROOT)
@@ -92,6 +92,7 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
             }
             state.openedArtist != null -> vm.closeArtistPage()
             state.openedPlaylist != null -> vm.openPlaylist(null)
+            state.selectedFolderId != null -> vm.selectFolder(null)
             state.selectedTab != MainTab.HOME -> vm.selectTab(MainTab.HOME)
         }
     }
@@ -109,7 +110,7 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
         MaterialTheme(colorScheme = darkColors) {
             Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
 
-                // Keeps WebPlaybackEngine permanently attached for seamless audio & screen-off playback whenever video viewport is hidden
+                // Keeps WebPlaybackEngine permanently attached for seamless audio & screen-off playback
                 if (!(state.showNowPlaying && state.isVideoMode)) {
                     AndroidView(
                         factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
@@ -177,7 +178,15 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
                     state.playlists.firstOrNull { it.id == plId }?.let { pl -> CoverArtCreatorSheet(pl, vm, str) }
                 }
 
-                // AI Playlist Generation Progress Pill
+                // Dedicated AI DJ Studio Overlay rendered at top Z-index (always opens above Home, Create & Now Playing!)
+                AnimatedVisibility(
+                    visible = state.showDjStudioSheet,
+                    enter = slideInVertically(initialOffsetY = { it / 2 }) + fadeIn(),
+                    exit = slideOutVertically(targetOffsetY = { it / 2 }) + fadeOut()
+                ) {
+                    AiDjStudioOverlay(state = state, vm = vm)
+                }
+
                 if (state.isBuildingAiPlaylist) {
                     Card(
                         modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp),
