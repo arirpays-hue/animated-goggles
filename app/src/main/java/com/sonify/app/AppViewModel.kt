@@ -10,27 +10,28 @@ import coil.imageLoader
 import coil.request.CachePolicy
 import coil.request.ImageRequest
 import coil.request.SuccessResult
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
+
+// Safe labels for podcasts & audiobooks across all screens without needing to touch Strings.kt
+val AppStrings.episodes: String get() = t("פרקים", "episodes")
+val AppStrings.books: String get() = t("ספרים", "books")
 
 data class UiState(
     val selectedTab: MainTab = MainTab.HOME,
@@ -84,7 +85,7 @@ data class UiState(
     val hasSearched: Boolean = false,
     val isSearching: Boolean = false,
 
-    // Library, Playlist Smart Shuffle, Bulk Download & Social
+    // Library, Playlist Smart Shuffle, Background Downloads & Social
     val likedTracks: List<Track> = emptyList(),
     val hiddenTrackIds: Set<String> = emptySet(),
     val followedArtists: Set<String> = emptySet(),
@@ -105,7 +106,7 @@ data class UiState(
     val bulkDownloadDone: Int = 0,
     val bulkDownloadTotal: Int = 0,
 
-    // Playback & Lyrics Translation
+    // Playback, Weak-Network Shield & Lyrics Translation
     val queue: List<Track> = emptyList(),
     val currentIndex: Int = -1,
     val currentTrack: Track? = null,
@@ -113,6 +114,7 @@ data class UiState(
     val activeVideoClipId: String? = null,
     val isFindingVideoClip: Boolean = false,
     val isUsingWebEngine: Boolean = false,
+    val isWeakNetworkActive: Boolean = false,
     val dynamicAccentColor: Long = 0xFF1F3B33,
     val isPlaying: Boolean = false,
     val isResolvingStream: Boolean = false,
@@ -127,6 +129,7 @@ data class UiState(
     val isLoadingLyrics: Boolean = false,
     val showTranslatedLyrics: Boolean = false,
     val isTranslatingLyrics: Boolean = false,
+    val lyricsTranslateError: String? = null,
     val lyricsFontScale: Float = 1.0f,
     val sleepMinutesLeft: Int? = null,
     val sleepEndOfTrack: Boolean = false,
@@ -152,10 +155,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var lastWidgetTrackId = ""
     private var lastWidgetPlaying = false
     private var lastStatsTickMs = 0L
+    private var lastCompletedDlVersion = -1
     private var searchJob: Job? = null
     private var homeJob: Job? = null
     private var infiniteHomeJob: Job? = null
-    private var bulkDownloadJob: Job? = null
     private var prefetchJob: Job? = null
     private var homeInfinitePage = 0
     @Volatile private var isApplyingRemoteJam = false
@@ -208,6 +211,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     init {
         loadSavedState()
         viewModelScope.launch(Dispatchers.IO) { repo.prewarmYtDlp() }
+
+        // Observe Background Foreground DownloadService Coordinator continuously!
+        viewModelScope.launch {
+            OfflineDownloadCoordinator.state.collect { dl ->
+                val versionChanged = dl.completedVersion != lastCompletedDlVersion
+                if (versionChanged) lastCompletedDlVersion = dl.completedVersion
+                val msg = dl.lastMessage
+                if (msg != null) OfflineDownloadCoordinator.clearLastMessage()
+
+                _uiState.update { cur ->
+                    cur.copy(
+                        downloadingIds = dl.downloadingIds,
+                        downloadProgress = dl.downloadProgress,
+                        activeBulkDownloadPlaylistId = dl.activeBulkPlaylistId,
+                        bulkDownloadDone = dl.bulkDone,
+                        bulkDownloadTotal = dl.bulkTotal,
+                        offlineTrackIds = if (versionChanged) repo.getOfflineTrackIds() else cur.offlineTrackIds,
+                        storageRefreshKey = if (versionChanged) cur.storageRefreshKey + 1 else cur.storageRefreshKey,
+                        statusMessage = msg ?: cur.statusMessage
+                    )
+                }
+            }
+        }
 
         WidgetActionBridge.onPrev = { skipPrevious() }
         WidgetActionBridge.onPlayPause = { togglePlayPause() }
@@ -467,7 +493,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            val dayPlaylist = if (dayT.isNotEmpty()) Playlist("home_daylist_${filter.name}", dayTitle, "Sonify", "", dayT.first().artworkUrl, tracks = dayT, isRemote = true, aiSeedPrompt = dayQuery, aiStyleTag = "DAYLIST") else null
+            val dayTag = when (filter) {
+                HomeFilter.AUDIOBOOKS -> "AUDIOBOOK"
+                HomeFilter.PODCASTS -> "PODCAST"
+                else -> "DAYLIST"
+            }
+            val dayPlaylist = if (dayT.isNotEmpty()) Playlist("home_daylist_${filter.name}", dayTitle, "Sonify", "", dayT.first().artworkUrl, tracks = dayT, isRemote = true, aiSeedPrompt = dayQuery, aiStyleTag = dayTag) else null
 
             _uiState.update { state ->
                 state.copy(
@@ -551,9 +582,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun selectTab(tab: MainTab) = _uiState.update { it.copy(selectedTab = tab, showSettings = false, settingsSection = SettingsSection.ROOT, openedPlaylist = null, openedArtist = null, openedArtistProfile = null) }
     fun setShowSettings(show: Boolean) = _uiState.update { it.copy(showSettings = show, settingsSection = SettingsSection.ROOT) }
     fun setSettingsSection(section: SettingsSection) = _uiState.update { it.copy(settingsSection = section) }
+    fun openAiApiSettings() = _uiState.update { it.copy(showNowPlaying = false, showSettings = true, settingsSection = SettingsSection.AI_NOTIFICATIONS) }
     fun setShowNowPlaying(show: Boolean) = _uiState.update { it.copy(showNowPlaying = show) }
     fun setShowCreateSheet(show: Boolean) = _uiState.update { it.copy(showCreateSheet = show) }
-    fun setShowDjStudioSheet(show: Boolean) = _uiState.update { it.copy(showDjStudioSheet = show) }
+    fun setShowDjStudioSheet(show: Boolean) = _uiState.update { it.copy(showDjStudioSheet = show, showCreateSheet = if (show) false else it.showCreateSheet) }
     fun setShowDevicesSheet(show: Boolean) = _uiState.update { it.copy(showDevicesSheet = show) }
     fun setShowStatsSheet(show: Boolean) = _uiState.update { it.copy(showStatsSheet = show) }
     fun setShowMessagesSheet(show: Boolean) = _uiState.update { it.copy(showMessagesSheet = show) }
@@ -566,6 +598,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun closeArtistPage() = _uiState.update { it.copy(openedArtist = null, openedArtistProfile = null) }
     fun openTrackOptions(track: Track?) = _uiState.update { it.copy(trackForOptions = track) }
     fun clearStatus() = _uiState.update { it.copy(statusMessage = null) }
+    fun clearLyricsTranslateError() = _uiState.update { it.copy(lyricsTranslateError = null) }
     fun setLyricsFontScale(scale: Float) = _uiState.update { it.copy(lyricsFontScale = scale.coerceIn(0.8f, 1.5f)) }
 
     fun setHomeFilter(filter: HomeFilter) { _uiState.update { it.copy(homeFilter = filter) }; refreshHomeContent() }
@@ -651,7 +684,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- Smart Library Virtual Playlists (Dedicated Local Files Playlist!) ----------
+    // ---------- Smart Library Virtual Playlists ----------
     fun openLikedSongsPlaylist() {
         val st = _uiState.value; val s = st.strings
         openPlaylist(Playlist("virtual_liked", s.likedSongs, "Sonify", "${st.likedTracks.size} ${s.songs}", st.likedTracks.firstOrNull()?.artworkUrl ?: "", 0xFF503750, customCoverSticker = "♥", tracks = st.likedTracks, isRemote = true, aiStyleTag = "LIKED"))
@@ -883,14 +916,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val s = _uiState.value.strings
         val trimmed = raw.trim()
 
-        // 1. Cloudless Friend Blend Token
         if (trimmed.startsWith("sonify:blend:", true)) {
             setShowCodeFor(null)
             createBlendFromFriendCode(trimmed)
             return
         }
 
-        // 2. Cloudless Shared Playlist Token
         val sharedPl = BlendTasteCodec.decodeSharedPlaylist(trimmed)
         if (sharedPl != null) {
             setShowCodeFor(null)
@@ -943,8 +974,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- Playback, Next-Track Prefetch & Official Music Video ----------
+    // ---------- Instant-Switch Pre-Cache + Weak-Network Shield Playback ----------
     private suspend fun resolveFastWithCache(track: Track, settings: AppSettings, attempt: Int = 0): ResolvedStreams? {
+        // Priority 0: Offline or Local Pre-Cached file on disk -> 0ms instant start!
+        if (attempt == 0) {
+            val offlineFile = repo.getOfflineFile(track.id)
+            if (offlineFile.exists() && offlineFile.length() > 4096) {
+                return ResolvedStreams(offlineFile.toURI().toString(), isLossless = track.source != StreamSource.YOUTUBE, isOffline = true, codecLabel = "OFFLINE")
+            }
+            val precacheFile = repo.getPrecachedAudioFile(track.id)
+            if (precacheFile.exists() && precacheFile.length() > 64_000) {
+                precacheFile.setLastModified(System.currentTimeMillis())
+                return ResolvedStreams(precacheFile.toURI().toString(), isOffline = true, codecLabel = "INSTANT CACHE")
+            }
+        }
         if (attempt == 0 && track.source == StreamSource.YOUTUBE && !settings.offlineMode) {
             val cached = resolvedStreamCache[track.id]
             if (cached != null && (System.currentTimeMillis() - cached.second) < 35L * 60_000L) {
@@ -958,20 +1001,34 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return fresh
     }
 
-    private fun prefetchNextTrackInQueue(queue: List<Track>, currentIndex: Int) {
+    // Pre-downloads the actual audio bytes of the next track to disk for 0ms transitions & weak-network continuity!
+    private fun prefetchNextTracksInQueue(queue: List<Track>, currentIndex: Int) {
         prefetchJob?.cancel()
-        val next = queue.getOrNull(currentIndex + 1) ?: return
         val settings = _uiState.value.settings
-        if (settings.offlineMode || next.source != StreamSource.YOUTUBE || settings.ytEngineMode == YouTubeEngineMode.WEB_DIRECT) return
-        if (next.id in _uiState.value.offlineTrackIds) return
-        val existing = resolvedStreamCache[next.id]
-        if (existing != null && (System.currentTimeMillis() - existing.second) < 30L * 60_000L) return
+        if (settings.offlineMode || settings.ytEngineMode == YouTubeEngineMode.WEB_DIRECT) return
+
+        val next1 = queue.getOrNull(currentIndex + 1)
+        val next2 = queue.getOrNull(currentIndex + 2)
+        if (next1 == null && next2 == null) return
 
         prefetchJob = viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                val res = repo.resolveStreams(next, settings, attemptIndex = 0)
-                if (res != null && !res.isOffline) {
-                    resolvedStreamCache[next.id] = res to System.currentTimeMillis()
+            delay(1500) // Let current track start at full speed first
+            if (next1 != null && next1.source == StreamSource.YOUTUBE) {
+                val precached = runCatching { repo.precacheTrackAudio(next1, settings) }.getOrDefault(false)
+                if (!precached) {
+                    val res = runCatching { repo.resolveStreams(next1, settings, attemptIndex = 0) }.getOrNull()
+                    if (res != null && !res.isOffline) {
+                        resolvedStreamCache[next1.id] = res to System.currentTimeMillis()
+                    }
+                }
+            }
+            if (next2 != null && next2.source == StreamSource.YOUTUBE) {
+                val existing = resolvedStreamCache[next2.id]
+                if (existing == null || (System.currentTimeMillis() - existing.second) >= 30L * 60_000L) {
+                    val res2 = runCatching { repo.resolveStreams(next2, settings, attemptIndex = 0) }.getOrNull()
+                    if (res2 != null && !res2.isOffline) {
+                        resolvedStreamCache[next2.id] = res2 to System.currentTimeMillis()
+                    }
                 }
             }
         }
@@ -1000,7 +1057,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         val state = _uiState.value
         val s = state.strings
-        val isOfflineReady = track.id in state.offlineTrackIds || track.source == StreamSource.LOCAL
+        val isOfflineReady = track.id in state.offlineTrackIds ||
+            track.source == StreamSource.LOCAL ||
+            repo.getPrecachedAudioFile(track.id).let { it.exists() && it.length() > 64_000 }
+
         if (state.settings.offlineMode && !isOfflineReady) {
             _uiState.update { it.copy(statusMessage = s.t("מצב אופליין פעיל — השיר הזה לא הורד", "Offline Mode ON — track not downloaded")) }
             return
@@ -1034,15 +1094,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             state.jamState.copy(joinUrl = SonifyLinkCodec.buildSmartJamLink(state.jamState.code, track, startAtMs))
         } else state.jamState
 
+        val weakNet = !isOfflineReady && repo.isWeakNetwork()
+
         _uiState.update {
             it.copy(
                 queue = finalQueue, currentIndex = idx, currentTrack = track, recentTracks = updatedRecent,
                 stats = updatedStats, resolvedStreams = null, activeVideoClipId = null, isFindingVideoClip = false,
                 isAiDjActive = if (keepDjActive) it.isAiDjActive else false,
                 activeDjStyleLabel = if (keepDjActive) it.activeDjStyleLabel else "",
-                isUsingWebEngine = useWebDirect, isResolvingStream = !useWebDirect, isPlayerBuffering = useWebDirect,
+                isUsingWebEngine = useWebDirect, isWeakNetworkActive = weakNet,
+                isResolvingStream = !useWebDirect && !isOfflineReady,
+                isPlayerBuffering = useWebDirect,
                 isVideoMode = false, positionMs = startAtMs, durationMs = track.durationMs,
-                lyrics = emptyList(), isLoadingLyrics = true, showTranslatedLyrics = false, isTranslatingLyrics = false,
+                lyrics = emptyList(), isLoadingLyrics = true, showTranslatedLyrics = false,
+                isTranslatingLyrics = false, lyricsTranslateError = null,
                 jamState = updatedJam
             )
         }
@@ -1061,7 +1126,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             publishJamState("TRACK", trackOverride = track, posOverride = startAtMs, playingOverride = true)
         }
 
-        prefetchNextTrackInQueue(finalQueue, idx)
+        prefetchNextTracksInQueue(finalQueue, idx)
 
         if (openVideoImmediately || (!settings.dataSaver && !(track.isPodcast && settings.audioOnlyPodcasts) && settings.autoVideoOnWifi && track.source == StreamSource.YOUTUBE)) {
             viewModelScope.launch { toggleVideoClipMode() }
@@ -1092,15 +1157,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (track.source == StreamSource.YOUTUBE && settings.ytEngineMode != YouTubeEngineMode.EXOPLAYER_ONLY && !settings.offlineMode) {
                     activateWebFallback(track, startAtMs)
                 } else {
-                    _uiState.update { it.copy(isResolvingStream = false, isPlayerBuffering = false, statusMessage = it.strings.t("לא נמצא זרם זמין", "No stream available")) }
+                    _uiState.update { it.copy(isResolvingStream = false, isPlayerBuffering = false, statusMessage = it.strings.t("רשת חלשה — לא נמצא זרם זמין", "Weak signal — no stream available")) }
                 }
                 return@launch
             }
             audioEngine.playResolved(resolved, track, videoMode = forceVideo && resolved.hasVideoClip, startPositionMs = startAtMs)
-            _uiState.update { it.copy(isUsingWebEngine = false, resolvedStreams = resolved, isResolvingStream = false, isVideoMode = forceVideo && resolved.hasVideoClip) }
+            _uiState.update {
+                it.copy(
+                    isUsingWebEngine = false,
+                    resolvedStreams = resolved,
+                    isResolvingStream = false,
+                    isVideoMode = forceVideo && resolved.hasVideoClip
+                )
+            }
         }
     }
 
+    // Weak-network resilient recovery: pauses briefly and resumes from exact positionMs!
     private fun handlePlaybackError(code: String) {
         val state = _uiState.value
         val track = state.currentTrack ?: return
@@ -1108,8 +1181,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (track.source == StreamSource.YOUTUBE && !state.settings.offlineMode) {
             if (retryAttemptForCurrent < 5) {
                 retryAttemptForCurrent++
-                _uiState.update { it.copy(isResolvingStream = true) }
-                resolveAndStartTrack(track, attempt = retryAttemptForCurrent, forceVideo = state.isVideoMode, startAtMs = state.positionMs)
+                val resumePos = state.positionMs
+                val backoffMs = if (code.contains("NETWORK", true) || code.contains("TIMEOUT", true)) 1200L else 250L
+                _uiState.update { it.copy(isResolvingStream = true, isWeakNetworkActive = repo.isWeakNetwork()) }
+                viewModelScope.launch {
+                    delay(backoffMs)
+                    if (_uiState.value.currentTrack?.id == track.id) {
+                        resolveAndStartTrack(track, attempt = retryAttemptForCurrent, forceVideo = state.isVideoMode, startAtMs = resumePos)
+                    }
+                }
             } else if (state.settings.ytEngineMode != YouTubeEngineMode.EXOPLAYER_ONLY) {
                 activateWebFallback(track, startAtMs = state.positionMs)
             } else {
@@ -1429,56 +1509,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- Offline Download (Single + Parallel Bulk with Cancel & Local Guard!) ----------
+    // ---------- Background ForegroundService Offline Downloads (Zero Crash on App Exit!) ----------
     fun downloadOffline(track: Track) {
         if (track.source == StreamSource.LOCAL) return
-        val s = _uiState.value.strings
-        if (_uiState.value.offlineTrackIds.contains(track.id)) {
+        val st = _uiState.value
+        val s = st.strings
+        if (st.offlineTrackIds.contains(track.id)) {
             repo.deleteOfflineTrack(track.id)
             _uiState.update { it.copy(offlineTrackIds = repo.getOfflineTrackIds(), storageRefreshKey = it.storageRefreshKey + 1, statusMessage = s.t("הוסר מהורדות האופליין", "Removed from downloads")) }
             return
         }
-        if (track.id in _uiState.value.downloadingIds) return
-        _uiState.update {
-            it.copy(
-                downloadingIds = it.downloadingIds + track.id,
-                downloadProgress = it.downloadProgress + (track.id to 1),
-                statusMessage = s.t("מוריד \"${track.title}\"...", "Downloading \"${track.title}\"...")
-            )
+        if (st.settings.offlineMode) {
+            _uiState.update { it.copy(statusMessage = s.t("מצב אופליין פעיל — כבה אותו כדי להוריד", "Turn off Offline Mode to download")) }
+            return
         }
-        viewModelScope.launch {
-            val captured = audioEngine.getCapturedStreams(track.id)
-            val (_, msg) = repo.downloadTrackOffline(
-                track = track,
-                settings = _uiState.value.settings,
-                capturedStreams = captured,
-                webViewDownloadFn = { targetFile, prog -> audioEngine.webEngine.downloadViaWebViewFetch(track.id, targetFile, prog) }
-            ) { pct -> _uiState.update { st -> st.copy(downloadProgress = st.downloadProgress + (track.id to pct)) } }
-            _uiState.update {
-                it.copy(
-                    downloadingIds = it.downloadingIds - track.id,
-                    downloadProgress = it.downloadProgress - track.id,
-                    offlineTrackIds = repo.getOfflineTrackIds(),
-                    storageRefreshKey = it.storageRefreshKey + 1,
-                    statusMessage = msg
-                )
-            }
+        if (!st.settings.downloadUsingCellular && !repo.isOnWifi()) {
+            _uiState.update { it.copy(statusMessage = s.t("הורדה בסלולר חסומה בהגדרות", "Cellular downloads disabled in settings")) }
+            return
         }
+        OfflineDownloadCoordinator.enqueueSingle(getApplication(), track, st.settings)
     }
 
     fun cancelPlaylistDownload() {
-        bulkDownloadJob?.cancel()
-        bulkDownloadJob = null
-        _uiState.update {
-            it.copy(
-                activeBulkDownloadPlaylistId = null,
-                bulkDownloadDone = 0,
-                bulkDownloadTotal = 0,
-                downloadingIds = emptySet(),
-                downloadProgress = emptyMap(),
-                statusMessage = it.strings.t("הורדת הפלייליסט בוטלה", "Playlist download cancelled")
-            )
-        }
+        OfflineDownloadCoordinator.cancelAll(getApplication(), _uiState.value.strings.isEn)
     }
 
     fun downloadEntirePlaylist(playlist: Playlist) {
@@ -1491,7 +1544,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (playlist.tracks.isEmpty()) {
-            _uiState.update { it.copy(statusMessage = s.t("אין שירים בפלייליסט להורדה", "No songs in playlist to download")) }
+            _uiState.update { it.copy(statusMessage = s.t("אין פריטים בפלייליסט להורדה", "No items in playlist to download")) }
             return
         }
         if (st.settings.offlineMode) {
@@ -1502,83 +1555,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(statusMessage = s.t("הורדה בסלולר חסומה בהגדרות", "Cellular downloads disabled in settings")) }
             return
         }
-
-        val toDownload = playlist.tracks
-            .distinctBy { it.id }
-            .filter { it.id !in st.offlineTrackIds && it.source != StreamSource.LOCAL }
-
-        if (toDownload.isEmpty()) {
-            _uiState.update { it.copy(statusMessage = s.t("כל השירים בפלייליסט כבר באופליין", "All tracks already downloaded")) }
-            return
-        }
-
-        bulkDownloadJob?.cancel()
-        val concurrency = st.settings.downloadSpeedMode.concurrentSongs.coerceIn(2, 4)
-        val sem = Semaphore(concurrency)
-        val completedCount = AtomicInteger(0)
-        val successCount = AtomicInteger(0)
-
-        _uiState.update {
-            it.copy(
-                activeBulkDownloadPlaylistId = playlist.id,
-                bulkDownloadDone = 0,
-                bulkDownloadTotal = toDownload.size,
-                statusMessage = s.t("מוריד ${toDownload.size} שירים במקביל (${concurrency}x)...", "Downloading ${toDownload.size} tracks (${concurrency}x)...")
-            )
-        }
-
-        bulkDownloadJob = viewModelScope.launch {
-            try {
-                coroutineScope {
-                    toDownload.map { trk ->
-                        async(Dispatchers.IO) {
-                            sem.withPermit {
-                                _uiState.update { it.copy(downloadingIds = it.downloadingIds + trk.id, downloadProgress = it.downloadProgress + (trk.id to 2)) }
-                                try {
-                                    val captured = audioEngine.getCapturedStreams(trk.id)
-                                    val (ok, _) = repo.downloadTrackOffline(
-                                        trk, _uiState.value.settings, captured,
-                                        webViewDownloadFn = { file, prog -> audioEngine.webEngine.downloadViaWebViewFetch(trk.id, file, prog) }
-                                    ) { pct -> _uiState.update { cur -> cur.copy(downloadProgress = cur.downloadProgress + (trk.id to pct)) } }
-                                    if (ok) successCount.incrementAndGet()
-                                } finally {
-                                    val doneNow = completedCount.incrementAndGet()
-                                    _uiState.update { cur ->
-                                        cur.copy(
-                                            downloadingIds = cur.downloadingIds - trk.id,
-                                            downloadProgress = cur.downloadProgress - trk.id,
-                                            bulkDownloadDone = doneNow,
-                                            offlineTrackIds = repo.getOfflineTrackIds(),
-                                            storageRefreshKey = cur.storageRefreshKey + 1
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }.awaitAll()
-                }
-                _uiState.update {
-                    it.copy(
-                        activeBulkDownloadPlaylistId = null,
-                        statusMessage = s.t("ירדו ${successCount.get()} מתוך ${toDownload.size} שירים לאופליין!", "Downloaded ${successCount.get()} / ${toDownload.size} tracks!")
-                    )
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } finally {
-                _uiState.update {
-                    it.copy(
-                        activeBulkDownloadPlaylistId = null,
-                        bulkDownloadDone = 0,
-                        bulkDownloadTotal = 0,
-                        offlineTrackIds = repo.getOfflineTrackIds()
-                    )
-                }
-            }
-        }
+        OfflineDownloadCoordinator.enqueuePlaylist(getApplication(), playlist.id, playlist.name, playlist.tracks, st.settings)
     }
 
-    // ---------- Lyrics Translation via User's Gemini API Key ----------
+    // ---------- Bulletproof Gemini Lyrics Translation with Visible In-Sheet Errors ----------
     fun toggleTranslateLyrics(forceTargetLang: LyricsLanguage? = null) {
         val st = _uiState.value
         val s = st.strings
@@ -1591,45 +1571,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (st.showTranslatedLyrics && forceTargetLang == null) {
-            _uiState.update { it.copy(showTranslatedLyrics = false) }
+            _uiState.update { it.copy(showTranslatedLyrics = false, lyricsTranslateError = null) }
             return
         }
 
         val cacheKey = "${track.id}_${targetLang.name}"
         translatedLyricsCache[cacheKey]?.let { cached ->
-            _uiState.update { it.copy(lyrics = cached, showTranslatedLyrics = true, isTranslatingLyrics = false) }
+            _uiState.update { it.copy(lyrics = cached, showTranslatedLyrics = true, isTranslatingLyrics = false, lyricsTranslateError = null) }
             return
         }
 
         val apiKey = st.settings.geminiApiKey.trim()
         if (apiKey.isBlank()) {
-            _uiState.update {
-                it.copy(statusMessage = s.t("לתרגום מילים יש להזין Gemini API Key בהגדרות ← בינה מלאכותית", "Add your Gemini API Key in Settings -> AI & Notifications to translate lyrics"))
-            }
+            val msg = s.t("חסר מפתח Gemini API — הזן אותו בהגדרות ← בינה מלאכותית", "Missing Gemini API Key — add it in Settings -> AI")
+            _uiState.update { it.copy(lyricsTranslateError = msg, statusMessage = msg) }
             return
         }
 
         if (st.isTranslatingLyrics) return
-        _uiState.update { it.copy(isTranslatingLyrics = true) }
+        _uiState.update { it.copy(isTranslatingLyrics = true, lyricsTranslateError = null) }
 
         viewModelScope.launch {
             val (translated, err) = repo.translateLyricsWithGemini(st.lyrics, targetLang, apiKey)
             if (_uiState.value.currentTrack?.id != track.id) return@launch
             if (translated != null) {
                 translatedLyricsCache[cacheKey] = translated
-                _uiState.update { it.copy(lyrics = translated, showTranslatedLyrics = true, isTranslatingLyrics = false) }
+                _uiState.update { it.copy(lyrics = translated, showTranslatedLyrics = true, isTranslatingLyrics = false, lyricsTranslateError = null) }
             } else {
+                val finalErr = err ?: s.t("תרגום המילים נכשל — נסה שוב", "Lyrics translation failed — try again")
                 _uiState.update {
                     it.copy(
                         isTranslatingLyrics = false,
-                        statusMessage = s.t("שגיאה בתרגום המילים ($err) — בדוק את מפתח ה-API", "Lyrics translation failed ($err) — check API key")
+                        lyricsTranslateError = finalErr,
+                        statusMessage = finalErr
                     )
                 }
             }
         }
     }
 
-    // ---------- Playlists & Folders (Restored Complete Management!) ----------
+    // ---------- Playlists & Folders ----------
     private fun savePlaylists(updated: List<Playlist>) {
         prefs.edit().putString("playlists", encodePlaylists(updated)).apply()
         _uiState.update { state ->
@@ -1663,19 +1644,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (pl.id.startsWith("MPRE") || pl.id.startsWith("OLAK") || pl.id == "virtual_local") return
         if (_uiState.value.isExpandingPlaylist) return
         val s = _uiState.value.strings
-        _uiState.update { it.copy(isExpandingPlaylist = true, statusMessage = s.t("מוסיף שירים דומים לפלייליסט...", "Adding more tracks...")) }
+        _uiState.update { it.copy(isExpandingPlaylist = true, statusMessage = s.t("מוסיף פריטים דומים...", "Adding more items...")) }
         viewModelScope.launch {
             val seedQuery = pl.aiSeedPrompt.ifBlank { pl.tracks.randomOrNull()?.artist ?: pl.name }
-            val extra = repo.searchTracks("$seedQuery similar hits", _uiState.value.settings, maxResults = 25)
+            val extra = repo.searchTracks(
+                query = "$seedQuery similar hits",
+                settings = _uiState.value.settings,
+                podcastsOnly = pl.isPodcastPlaylist,
+                audiobooksOnly = pl.isAudiobookPlaylist,
+                maxResults = 25
+            )
                 .filterNot { cand -> pl.tracks.any { it.id == cand.id } || cand.id in _uiState.value.hiddenTrackIds }
                 .take(15)
             if (extra.isEmpty()) {
-                _uiState.update { it.copy(isExpandingPlaylist = false, statusMessage = s.t("לא נמצאו שירים נוספים", "No more tracks found")) }
+                _uiState.update { it.copy(isExpandingPlaylist = false, statusMessage = s.t("לא נמצאו פריטים נוספים", "No more items found")) }
                 return@launch
             }
             val updatedPl = pl.copy(tracks = pl.tracks + extra)
             updateOpenedAndSavedPlaylist(updatedPl)
-            _uiState.update { it.copy(isExpandingPlaylist = false, statusMessage = s.t("נוספו ${extra.size} שירים (סה\"כ ${updatedPl.tracks.size})", "Added ${extra.size} tracks (${updatedPl.tracks.size} total)")) }
+            _uiState.update { it.copy(isExpandingPlaylist = false, statusMessage = s.t("נוספו ${extra.size} (${updatedPl.countLabel(s)})", "Added ${extra.size} (${updatedPl.countLabel(s)})")) }
         }
     }
 
@@ -1815,7 +1802,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- Smarter AI Playlist Studio & Customizable AI DJ ----------
+    // ---------- AI Playlist Studio & Reliable AI DJ Studio ----------
     fun createAiPlaylist(config: AiPlaylistConfig) {
         val s = _uiState.value.strings
         if (config.prompt.isBlank()) { _uiState.update { it.copy(statusMessage = s.t("תאר איזה פלייליסט תרצה", "Describe your playlist")) }; return }
@@ -1830,7 +1817,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // Tapping AI DJ anywhere now opens the full AI DJ Style & Voice Studio screen!
     fun startAiDj() {
         _uiState.update { it.copy(showCreateSheet = false, showDjStudioSheet = true) }
     }
@@ -1838,7 +1824,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun launchAiDj(config: AiDjConfig) {
         val st = _uiState.value
         val s = st.strings
-        // Persist user's DJ narration toggles
         val updatedSettings = st.settings.copy(
             djIntroVoice = config.speakAtStart,
             djBetweenTracksVoice = config.speakBetweenTracks,
@@ -1974,7 +1959,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 runCatching { repo.searchTracks("top hits 2026", st.settings, maxResults = 16) }.getOrDefault(emptyList())
             } else emptyList()
 
-            // Interleave my songs and friend's songs for an authentic Blend feel!
             val friendUnique = (friendTracks + fallbackPool).distinctBy { it.id }
             val merged = mutableListOf<Track>()
             val maxLen = maxOf(myPool.size, friendUnique.size)
@@ -2277,7 +2261,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun retryLyrics(customQuery: String? = null) {
         val track = _uiState.value.currentTrack ?: return
-        _uiState.update { it.copy(isLoadingLyrics = true, showTranslatedLyrics = false) }
+        _uiState.update { it.copy(isLoadingLyrics = true, showTranslatedLyrics = false, lyricsTranslateError = null) }
         viewModelScope.launch {
             val lyrics = repo.fetchSyncedLyrics(track, customQuery)
             _uiState.update { it.copy(lyrics = lyrics, isLoadingLyrics = false) }
