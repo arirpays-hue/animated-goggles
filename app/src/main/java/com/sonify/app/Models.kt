@@ -41,15 +41,15 @@ enum class LyricsLanguage(val apiName: String, val labelHe: String, val labelEn:
 }
 
 enum class DownloadSpeedMode(val parallelChunks: Int, val concurrentSongs: Int, val labelHe: String, val labelEn: String) {
-    BALANCED(4, 2, "מאוזן (4 חיבורים)", "Balanced (4x)"),
-    TURBO(8, 3, "טורבו (8 חיבורים)", "Turbo (8x)"),
-    MAX(10, 4, "מקסימום (10 חיבורים)", "Max (10x)");
+    BALANCED(4, 1, "מאוזן (4 חיבורים)", "Balanced (4x)"),
+    TURBO(6, 2, "טורבו (6 חיבורים)", "Turbo (6x)"),
+    MAX(8, 2, "מקסימום (8 חיבורים)", "Max (8x)");
     fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
 }
 
 enum class AudioBufferProfile(val minMs: Int, val maxMs: Int, val playMs: Int, val rebufferMs: Int, val labelHe: String, val labelEn: String) {
-    STANDARD(25_000, 75_000, 1_500, 2_500, "רגיל (25s)", "Standard (25s)"),
-    HIGH_STABILITY(45_000, 120_000, 2_200, 3_500, "יציב נגד קטיעות (45s)", "Anti-Stutter (45s)");
+    STANDARD(30_000, 90_000, 600, 1_800, "רגיל (30s)", "Standard (30s)"),
+    HIGH_STABILITY(60_000, 180_000, 750, 2_200, "יציב לרשת חלשה (60s)", "Weak-Network Shield (60s)");
     fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
 }
 
@@ -122,7 +122,7 @@ enum class StreamSource(val labelHe: String, val labelEn: String, val subHe: Str
 }
 
 enum class YouTubeEngineMode(val labelHe: String, val labelEn: String, val subHe: String, val subEn: String) {
-    AUTO("אוטומטי (ExoPlayer + גיבוי Web)", "Auto (ExoPlayer + Web Fallback)", "מנסה אודיו ישיר עם אקולייזר ועובר לגיבוי אוטומטי בעת חסימה", "Tries direct audio with EQ, falls back automatically if blocked"),
+    AUTO("אוטומטי (ExoPlayer + גיבוי Web)", "Auto (ExoPlayer + Web Fallback)", "מנסה אודיו ישיר עם אקולייזר ומטמון דיסק ועובר לגיבוי אוטומטי בעת חסימה", "Direct audio with EQ & disk cache, auto web fallback if blocked"),
     WEB_DIRECT("נגן YouTube מובנה (מהיר וללא 403)", "Built-in YouTube Engine (Fast, No 403)", "ניגון מיידי ללא חסימות סלולר + מעבר לקליפ רשמי", "Instant playback on cellular + official video switch"),
     EXOPLAYER_ONLY("ExoPlayer בלבד", "ExoPlayer Only", "הזרמה ישירה בלבד (אקולייזר 10 ערוצים, מונו ואיזון)", "Direct stream only (10-band EQ, Mono & Balance)");
     fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
@@ -234,7 +234,29 @@ data class Playlist(
     val aiSeedPrompt: String = "",
     val aiStyleTag: String = "",
     val createdAt: Long = System.currentTimeMillis()
-)
+) {
+    val isAudiobookPlaylist: Boolean
+        get() = id.startsWith("book_") ||
+            id.contains("AUDIOBOOKS", true) ||
+            aiStyleTag.equals("AUDIOBOOK", true) ||
+            creator.contains("Audiobook", true) ||
+            (tracks.isNotEmpty() && tracks.all { it.isAudiobook })
+
+    val isPodcastPlaylist: Boolean
+        get() = !isAudiobookPlaylist && (
+            id.startsWith("pod_") ||
+                id.contains("PODCASTS", true) ||
+                aiStyleTag.equals("PODCAST", true) ||
+                creator.contains("Podcast", true) ||
+                (tracks.isNotEmpty() && tracks.all { it.isPodcast })
+            )
+
+    fun countLabel(str: AppStrings): String = when {
+        isAudiobookPlaylist -> "${tracks.size} ${str.books}"
+        isPodcastPlaylist -> "${tracks.size} ${str.episodes}"
+        else -> "${tracks.size} ${str.songs}"
+    }
+}
 
 data class HomeFeedSection(
     val id: String,
@@ -301,7 +323,6 @@ data class AiDjConfig(
     val speakBetweenTracks: Boolean = true
 )
 
-// Cloudless Friend Blend & Shared Playlist Token Codec (works via WhatsApp / Copy / QR without accounts!)
 data class FriendTasteProfile(
     val name: String,
     val artists: List<String>,
