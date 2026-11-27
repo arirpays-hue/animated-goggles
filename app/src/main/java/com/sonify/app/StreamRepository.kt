@@ -78,7 +78,6 @@ class StreamRepository(private val context: Context) {
         .followRedirects(true)
         .build()
 
-    // High-concurrency dispatcher removes OkHttp's default 5-per-host bottleneck for 8x-10x downloads!
     private val downloadClient = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
             maxRequests = 64
@@ -230,7 +229,7 @@ class StreamRepository(private val context: Context) {
         (s1 + s2).distinctBy { it.id }.take(35)
     }
 
-    // ---------- 1B. Full Spotify-Style Artist Profile (Real Artist Banner, Albums, Latest Release, Singles, Similar Artists!) ----------
+    // ---------- 1B. Full Spotify-Style Artist Profile ----------
     suspend fun fetchFullArtistProfile(
         artistName: String,
         settings: AppSettings,
@@ -247,7 +246,6 @@ class StreamRepository(private val context: Context) {
             )
         }
 
-        // Step 1: Locate Artist's UC channel browseId & photo
         val foundArtist = if (knownBrowseId.startsWith("UC")) {
             SimilarArtist(cleanName, knownBrowseId, "", "")
         } else {
@@ -264,7 +262,6 @@ class StreamRepository(private val context: Context) {
         val featuredPlaylists = mutableListOf<RemotePlaylist>()
         val similarArtists = mutableListOf<SimilarArtist>()
 
-        // Step 2: Browse full YouTube Music Artist Page
         if (foundArtist != null && foundArtist.browseId.startsWith("UC")) {
             val root = runCatching { fetchYtMusicBrowseJson(foundArtist.browseId) }.getOrNull()
             if (root != null) {
@@ -298,7 +295,6 @@ class StreamRepository(private val context: Context) {
                     }
                 }
 
-                // Parse Sections: Top Songs, Albums, Singles, Featured On, Fans Also Like
                 val sectionContents = root.optJSONObject("contents")
                     ?.optJSONObject("singleColumnBrowseResultsRenderer")
                     ?.optJSONArray("tabs")?.optJSONObject(0)
@@ -311,7 +307,7 @@ class StreamRepository(private val context: Context) {
                     for (i in 0 until sectionContents.length()) {
                         val sec = sectionContents.optJSONObject(i) ?: continue
                         sec.optJSONObject("musicShelfRenderer")?.let { shelf ->
-                            extractYtMusicSongs(shelf, topTracks, 35)
+                            extractYtMusicSongs(shelf, topTracks, 35, fallbackArtist = cleanName)
                         }
                         sec.optJSONObject("musicCarouselShelfRenderer")?.let { carousel ->
                             val headerTitle = extractRunsText(
@@ -369,7 +365,6 @@ class StreamRepository(private val context: Context) {
             }
         }
 
-        // Step 3: Supplement missing sections so Artist Page is ALWAYS Spotify-rich
         coroutineScope {
             val extraTracksJob = if (topTracks.size < 12) async { searchArtistTracks(cleanName, settings) } else null
             val extraAlbumsJob = if (albums.isEmpty() && singles.isEmpty()) async { searchYtMusicAlbums(cleanName) } else null
@@ -549,6 +544,92 @@ class StreamRepository(private val context: Context) {
         }
     }
 
+    // ---------- Shared Track Real Metadata Fetcher (Fixes "שיר משותף" & Lyrics Lookup!) ----------
+    suspend fun fetchTrackMetadataById(videoId: String): Track = withContext(Dispatchers.IO) {
+        val cleanId = videoId.trim().take(11)
+        val defaultArt = "https://i.ytimg.com/vi/$cleanId/maxresdefault.jpg"
+
+        val fromPlayer = runCatching {
+            val bodyJson = JSONObject().apply {
+                put("videoId", cleanId)
+                put("context", JSONObject().apply {
+                    put("client", JSONObject().apply {
+                        put("clientName", "WEB")
+                        put("clientVersion", "2.20250219.01.00")
+                        put("hl", "he")
+                        put("gl", "IL")
+                    })
+                })
+            }
+            val req = Request.Builder()
+                .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                .build()
+            fastProxyClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val vd = JSONObject(resp.body?.string() ?: return@use null).optJSONObject("videoDetails") ?: return@use null
+                val rawTitle = vd.optString("title").trim()
+                val rawAuthor = cleanArtistName(vd.optString("author").trim())
+                val durMs = vd.optString("lengthSeconds").toLongOrNull()?.times(1000L) ?: 0L
+                val thumbs = vd.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+                val art = if (thumbs != null && thumbs.length() > 0) {
+                    upgradeArtworkUrlGlobal(thumbs.optJSONObject(thumbs.length() - 1)?.optString("url").orEmpty()).ifBlank { defaultArt }
+                } else defaultArt
+                if (rawTitle.isBlank()) return@use null
+                val (parsedArtist, parsedTitle) = splitArtistAndTitle(rawTitle, rawAuthor)
+                Track(
+                    id = cleanId,
+                    title = parsedTitle,
+                    artist = parsedArtist,
+                    artworkUrl = art,
+                    durationMs = durMs,
+                    source = StreamSource.YOUTUBE,
+                    isExplicit = detectExplicit(rawTitle)
+                )
+            }
+        }.getOrNull()
+        if (fromPlayer != null) return@withContext fromPlayer
+
+        val fromOembed = runCatching {
+            val url = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=$cleanId&format=json"
+            val req = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
+            fastProxyClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val o = JSONObject(resp.body?.string() ?: return@use null)
+                val rawTitle = o.optString("title").trim()
+                val rawAuthor = cleanArtistName(o.optString("author_name").trim())
+                val art = upgradeArtworkUrlGlobal(o.optString("thumbnail_url")).ifBlank { defaultArt }
+                if (rawTitle.isBlank()) return@use null
+                val (parsedArtist, parsedTitle) = splitArtistAndTitle(rawTitle, rawAuthor)
+                Track(
+                    id = cleanId,
+                    title = parsedTitle,
+                    artist = parsedArtist,
+                    artworkUrl = art,
+                    source = StreamSource.YOUTUBE,
+                    isExplicit = detectExplicit(rawTitle)
+                )
+            }
+        }.getOrNull()
+        if (fromOembed != null) return@withContext fromOembed
+
+        Track(cleanId, "YouTube Track", "YouTube", artworkUrl = defaultArt)
+    }
+
+    private fun splitArtistAndTitle(rawTitle: String, rawAuthor: String): Pair<String, String> {
+        val cleanedTitle = cleanSongTitle(rawTitle).ifBlank { rawTitle.trim() }
+        val sep = listOf(" - ", " – ", " — ").firstOrNull { cleanedTitle.contains(it) }
+        if (sep != null) {
+            val left = cleanedTitle.substringBefore(sep).trim()
+            val right = cleanedTitle.substringAfter(sep).trim()
+            if (left.length in 2..40 && right.length >= 2) {
+                return left to right
+            }
+        }
+        return rawAuthor.ifBlank { "YouTube" } to cleanedTitle
+    }
+
     // ---------- Official Music Video Finder ----------
     suspend fun findOfficialMusicVideoId(track: Track): String? = withContext(Dispatchers.IO) {
         val cleanTitle = cleanSongTitle(track.title)
@@ -648,7 +729,6 @@ class StreamRepository(private val context: Context) {
     suspend fun searchPlaylists(query: String): List<RemotePlaylist> = withContext(Dispatchers.IO) {
         val combined = mutableListOf<RemotePlaylist>()
 
-        // Run Featured + Community YouTube Music playlist searches concurrently!
         val (featured, community) = coroutineScope {
             val d1 = async { searchYtMusicPlaylistsByParam(query, "EgeKAQQoADgBagwQDhAKEAMQBRAJEAQ=") }
             val d2 = async { searchYtMusicPlaylistsByParam(query, "EgeKAQQoAEABagoQAxAEEAkQChAF") }
@@ -710,7 +790,7 @@ class StreamRepository(private val context: Context) {
     private fun searchYouTubeWebPlaylists(query: String): List<RemotePlaylist> {
         val bodyJson = JSONObject().apply {
             put("query", query)
-            put("params", "EgIQAw==") // Playlists filter on YouTube Web
+            put("params", "EgIQAw==")
             put("context", JSONObject().apply {
                 put("client", JSONObject().apply {
                     put("clientName", "WEB"); put("clientVersion", "2.20250219.01.00"); put("hl", "he"); put("gl", "IL")
@@ -764,23 +844,32 @@ class StreamRepository(private val context: Context) {
         all.distinctBy { it.id.removePrefix("VL") }.take(maxTotal)
     }
 
-    suspend fun fetchPlaylistTracks(playlistId: String, maxTracks: Int = 100, fallbackCoverUrl: String = ""): List<Track> = withContext(Dispatchers.IO) {
+    suspend fun fetchPlaylistTracks(
+        playlistId: String,
+        maxTracks: Int = 100,
+        fallbackCoverUrl: String = "",
+        fallbackArtist: String = ""
+    ): List<Track> = withContext(Dispatchers.IO) {
         val browseId = if (playlistId.startsWith("VL") || playlistId.startsWith("MPRE")) playlistId else "VL$playlistId"
         val rawId = playlistId.removePrefix("VL")
 
         val ytMusicTracks = runCatching {
             val root = fetchYtMusicBrowseJson(browseId) ?: return@runCatching emptyList()
-            val headerThumb = root.optJSONObject("header")
+            val headerObj = root.optJSONObject("header")
                 ?.let { h -> h.optJSONObject("musicDetailHeaderRenderer") ?: h.optJSONObject("musicResponsiveHeaderRenderer") }
+            val headerThumb = headerObj
                 ?.optJSONObject("thumbnail")
                 ?.let { t -> t.optJSONObject("croppedSquareThumbnailRenderer") ?: t.optJSONObject("musicThumbnailRenderer") }
                 ?.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
                 ?.let { arr -> if (arr.length() > 0) arr.optJSONObject(arr.length() - 1)?.optString("url").orEmpty() else "" }
                 .orEmpty()
+            val headerArtist = extractRunsText(headerObj?.optJSONObject("straplineTextOne"))
+                .ifBlank { extractRunsText(headerObj?.optJSONObject("subtitle")).substringAfter("•", "").substringBefore("•").trim() }
             val effectiveCover = upgradeArtworkUrlGlobal(fallbackCoverUrl.ifBlank { headerThumb })
+            val effectiveArtist = fallbackArtist.ifBlank { headerArtist }
 
             val out = mutableListOf<Track>()
-            extractYtMusicSongs(root, out, maxTracks, fallbackCover = effectiveCover)
+            extractYtMusicSongs(root, out, maxTracks, fallbackCover = effectiveCover, fallbackArtist = effectiveArtist)
             out.filter { isLikelySingleSong(it) }.distinctBy { it.id }
         }.getOrDefault(emptyList())
         if (ytMusicTracks.isNotEmpty()) return@withContext ytMusicTracks
@@ -797,7 +886,8 @@ class StreamRepository(private val context: Context) {
                             if (id.length != 11) continue
                             val title = o.optString("title", "ללא שם")
                             val thumb = o.optString("thumbnail").ifBlank { fallbackCoverUrl }.ifBlank { "https://i.ytimg.com/vi/$id/maxresdefault.jpg" }
-                            add(Track(id, title, o.optString("uploaderName", "אמן"), artworkUrl = upgradeArtworkUrlGlobal(thumb), durationMs = o.optLong("duration", 0L) * 1000L, source = StreamSource.YOUTUBE, isExplicit = detectExplicit(title)))
+                            val uploader = o.optString("uploaderName").ifBlank { fallbackArtist }.ifBlank { "אמן" }
+                            add(Track(id, title, uploader, artworkUrl = upgradeArtworkUrlGlobal(thumb), durationMs = o.optLong("duration", 0L) * 1000L, source = StreamSource.YOUTUBE, isExplicit = detectExplicit(title)))
                         }
                     }.filter { isLikelySingleSong(it) }
                 }
@@ -832,7 +922,13 @@ class StreamRepository(private val context: Context) {
         })
     }
 
-    private fun extractYtMusicSongs(node: Any?, out: MutableList<Track>, maxLimit: Int = 100, fallbackCover: String = "") {
+    private fun extractYtMusicSongs(
+        node: Any?,
+        out: MutableList<Track>,
+        maxLimit: Int = 100,
+        fallbackCover: String = "",
+        fallbackArtist: String = ""
+    ) {
         if (out.size >= maxLimit || node == null) return
         when (node) {
             is JSONObject -> {
@@ -866,8 +962,12 @@ class StreamRepository(private val context: Context) {
                             val durPart = parts.lastOrNull { it.matches(Regex("\\d{1,2}:\\d{2}(:\\d{2})?")) }
                             if (durPart != null) { durationMs = parseDurationText(durPart); parts.remove(durPart) }
                         }
-                        val artist = parts.firstOrNull { !it.contains("צפיות") && !it.contains("plays", true) && !it.contains("views", true) } ?: "אמן"
-                        val album = parts.getOrNull(1)?.takeIf { !it.contains("צפיות") && !it.contains("plays", true) } ?: ""
+                        val artist = parts.firstOrNull {
+                            !it.contains("צפיות") && !it.contains("השמעות") && !it.contains("plays", true) && !it.contains("views", true)
+                        }?.takeIf { it.isNotBlank() } ?: fallbackArtist.ifBlank { "אמן" }
+                        val album = parts.getOrNull(1)?.takeIf {
+                            !it.contains("צפיות") && !it.contains("השמעות") && !it.contains("plays", true)
+                        } ?: ""
                         val thumbs = item.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer")?.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
                         val rawThumb = if (thumbs != null && thumbs.length() > 0) thumbs.optJSONObject(thumbs.length() - 1)?.optString("url").orEmpty() else ""
                         val art = upgradeArtworkUrlGlobal(rawThumb.ifBlank { fallbackCover }.ifBlank { "https://i.ytimg.com/vi/$videoId/maxresdefault.jpg" })
@@ -878,10 +978,10 @@ class StreamRepository(private val context: Context) {
                     }
                 } else {
                     val keys = node.keys()
-                    while (keys.hasNext()) extractYtMusicSongs(node.opt(keys.next()), out, maxLimit, fallbackCover)
+                    while (keys.hasNext()) extractYtMusicSongs(node.opt(keys.next()), out, maxLimit, fallbackCover, fallbackArtist)
                 }
             }
-            is JSONArray -> { for (i in 0 until node.length()) extractYtMusicSongs(node.opt(i), out, maxLimit, fallbackCover) }
+            is JSONArray -> { for (i in 0 until node.length()) extractYtMusicSongs(node.opt(i), out, maxLimit, fallbackCover, fallbackArtist) }
         }
     }
 
@@ -1255,7 +1355,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 4. Turbo Parallel Offline Downloader (8x-10x Parallel OkHttp + Accelerated yt-dlp!) ----------
+    // ---------- 4. Turbo Parallel Offline Downloader ----------
     private suspend fun downloadViaYtDlp(
         videoId: String,
         quality: AudioQuality,
@@ -1357,13 +1457,11 @@ class StreamRepository(private val context: Context) {
 
             val quality = effectiveQuality(settings, forDownload = true)
 
-            // Priority 1: Turbo 8x-10x Parallel OkHttp via ANDROID_VR direct stream (~1-2 seconds!)
             val fastDirect = runCatching { fetchInnerTubeClient(track.id, "ANDROID_VR", quality, preferHls = false) }.getOrNull()
             if (fastDirect != null && downloadSmart(fastDirect.audioUrl, fastDirect.userAgent, fastDirect.cookie, emptyMap(), target, false, parallel, onProgress)) {
                 return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
             }
 
-            // Priority 2: Turbo Parallel OkHttp on captured stream
             for (cap in capturedStreams.sortedByDescending { it.isAudioOnly }.take(2)) {
                 val cleanBase = sanitizeYouTubePlaybackUrl(cap.url)
                 if (downloadSmart(cleanBase, cap.userAgent, cap.cookie, cap.headers, target, true, parallel, onProgress)) {
@@ -1371,18 +1469,15 @@ class StreamRepository(private val context: Context) {
                 }
             }
 
-            // Priority 3: Accelerated prewarmed yt-dlp engine
             if (downloadViaYtDlp(track.id, quality, parallel, target, onProgress)) {
                 return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
             }
 
-            // Priority 4: Direct WebView JS fetch fallback
             if (webViewDownloadFn != null && capturedStreams.isNotEmpty()) {
                 val wvOk = runCatching { webViewDownloadFn(target, onProgress) }.getOrDefault(false)
                 if (wvOk) return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
             }
 
-            // Priority 5: Fast IOS HLS / Cobalt / Piped / Invidious fallback
             for (strategy in youtubeStrategies(track.id, quality).drop(1)) {
                 val resolved = runCatching { strategy() }.getOrNull() ?: continue
                 if (downloadSmart(resolved.audioUrl, resolved.userAgent, resolved.cookie, emptyMap(), target, false, parallel, onProgress)) {
@@ -1527,7 +1622,6 @@ class StreamRepository(private val context: Context) {
         }.getOrDefault(false)
     }
 
-    // Turbo 8x-10x parallel range downloader with adaptive chunk size to saturate full mobile bandwidth
     private suspend fun downloadChunkedParallel(
         baseUrl: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>,
         target: File, isWebOrigin: Boolean, parallel: Int, onProgress: (Int) -> Unit
@@ -1539,7 +1633,6 @@ class StreamRepository(private val context: Context) {
             val tmp = File(target.parentFile, "${target.name}.tmp")
             var activeBase = baseUrl
             val workers = parallel.coerceIn(4, 10)
-            // Dynamic chunk sizing so even a 3MB song splits across all parallel workers simultaneously!
             val chunkSize = (clen / workers).coerceIn(384 * 1024L, 1024 * 1024L)
 
             fun fetchRange(urlBase: String, start: Long, end: Long): Pair<ByteArray?, String?> {
@@ -1632,7 +1725,6 @@ class StreamRepository(private val context: Context) {
         val isPod = homeFilter == HomeFilter.PODCASTS
         val isBook = homeFilter == HomeFilter.AUDIOBOOKS
 
-        // Build Taste Profile from Liked Tracks + Most Played Artists
         val tasteArtists = (
             likedTracks.map { cleanArtistName(it.artist) } +
             stats.artistPlayCounts.entries.sortedByDescending { it.value }.map { cleanArtistName(it.key) } +
@@ -1640,7 +1732,6 @@ class StreamRepository(private val context: Context) {
         ).filter { a -> a.length >= 2 && excludedArtists.none { ex -> a.contains(ex, true) } }
             .distinct()
 
-        // Every 3rd infinite page -> Ready-made YouTube Playlists curated by taste!
         if (!isPod && !isBook && settings.showYoutubePlaylistsHome && pageIndex % 3 == 2) {
             val seedArtist = tasteArtists.getOrNull((pageIndex / 3) % tasteArtists.size.coerceAtLeast(1))
             val ytQueries = if (seedArtist != null) {
@@ -1664,7 +1755,6 @@ class StreamRepository(private val context: Context) {
             }
         }
 
-        // Try Gemini API for ultra-smart taste-aware section concepts when key is available
         val geminiConcepts = if (!isPod && !isBook && settings.geminiApiKey.isNotBlank()) {
             runCatching { requestGeminiInfiniteBatch(tasteArtists.take(8), likedTracks.take(10), existingTitles, isEn, settings.geminiApiKey) }.getOrNull()
         } else null
@@ -1741,7 +1831,6 @@ class StreamRepository(private val context: Context) {
             return bookThemes[pageIndex % bookThemes.size]
         }
 
-        // Personalized artist-based rotation when user has liked/played tracks!
         if (tasteArtists.isNotEmpty() && pageIndex % 2 == 0) {
             val anchor = tasteArtists[(pageIndex / 2) % tasteArtists.size]
             val second = tasteArtists[((pageIndex / 2) + 1) % tasteArtists.size]
@@ -1756,7 +1845,6 @@ class StreamRepository(private val context: Context) {
             return Triple(title, sub, cards)
         }
 
-        // Rich diverse mood & genre rotation for infinite discovery
         val discoveryPool = listOf(
             Triple(if (isEn) "High Energy & Focus" else "אנרגיה, אימון וריכוז", "Sonify AI", listOf(
                 Triple(if (isEn) "Beast Mode Gym" else "אימון כוח מקסימלי", "gym workout phonk rap energy", "ENERGY"),
@@ -1837,7 +1925,6 @@ class StreamRepository(private val context: Context) {
             val geminiPlan = runCatching { requestGeminiSongList(config, likedContext, settings.geminiApiKey) }.getOrNull()
             if (geminiPlan != null && geminiPlan.second.isNotEmpty()) {
                 val curated = mutableListOf<Track>()
-                // Search Gemini tracks in parallel batches of 4 for 4x faster AI playlist generation!
                 for (batch in geminiPlan.second.take(targetCount).chunked(4)) {
                     val foundBatch = coroutineScope {
                         batch.map { q -> async { searchTracks(q, settings, maxResults = 3).firstOrNull() } }.awaitAll()
@@ -1920,7 +2007,6 @@ class StreamRepository(private val context: Context) {
                 queries += listOf("$prompt$eraSuffix$energySuffix", "$prompt best songs", "$prompt top hits", "$prompt similar artists", "$prompt essentials")
             }
         }
-        // Blend in 1-2 user favorite artists matching the mood
         likedContext.map { cleanArtistName(it.artist) }.distinct().take(2).forEach { fav ->
             queries.add("$fav$energySuffix")
         }
