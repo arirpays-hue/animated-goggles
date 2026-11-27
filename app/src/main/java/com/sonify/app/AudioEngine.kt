@@ -72,6 +72,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URLDecoder
@@ -284,7 +285,6 @@ class PlaybackService : MediaSessionService() {
     }
 }
 
-// Keeps Chromium WebView media pipeline alive when screen turns off
 private class BackgroundWebView(context: Context) : WebView(context) {
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(View.VISIBLE)
@@ -323,6 +323,42 @@ class WebPlaybackEngine(private val context: Context) {
     var onProgress: ((Long, Long, Boolean, Boolean) -> Unit)? = null
     var onEnded: (() -> Unit)? = null
 
+    private val adBlockedHostFragments = listOf(
+        "doubleclick.net",
+        "googlesyndication.com",
+        "googleadservices.com",
+        "adservice.google",
+        "imasdk.googleapis.com",
+        "2mdn.net",
+        "moatads.com"
+    )
+
+    private val adBlockedUrlFragments = listOf(
+        "/pagead/",
+        "/api/stats/ads",
+        "/ptracking",
+        "/get_midroll_info",
+        "/youtubei/v1/ad_break",
+        "adformat=",
+        "adunit=",
+        "oad=",
+        "ctier=L",
+        "googleads."
+    )
+
+    private fun isAdRequest(url: String, host: String): Boolean {
+        val h = host.lowercase()
+        val u = url.lowercase()
+        if (adBlockedHostFragments.any { h.contains(it) }) return true
+        if (adBlockedUrlFragments.any { u.contains(it) }) return true
+        // Block ad video playback streams (marked with adformat / oad / ctier=L on googlevideo)
+        if (h.contains("googlevideo.com") && (u.contains("&oad=") || u.contains("?oad=") || u.contains("adformat="))) return true
+        return false
+    }
+
+    private fun emptyAdResponse(): WebResourceResponse =
+        WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+
     private val visibilitySpoofJs = """
         (function() {
           try {
@@ -340,7 +376,7 @@ class WebPlaybackEngine(private val context: Context) {
 
     private fun recordCapturedUrl(videoId: String, rawUrl: String, isAudio: Boolean, headers: Map<String, String> = emptyMap()) {
         if (videoId.isBlank() || !rawUrl.startsWith("http")) return
-        if (rawUrl.contains("sabr=1", true)) return
+        if (rawUrl.contains("sabr=1", true) || rawUrl.contains("oad=", true)) return
         val list = capturedStreamsMap.getOrPut(videoId) { CopyOnWriteArrayList() }
         val key = rawUrl.substringBefore("&range=").substringBefore("&rn=")
         if (list.any { it.url.substringBefore("&range=").substringBefore("&rn=") == key }) return
@@ -383,6 +419,11 @@ class WebPlaybackEngine(private val context: Context) {
 
                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                     val url = request?.url?.toString().orEmpty()
+                    val host = request?.url?.host.orEmpty()
+                    // Layer 1 Ad Blocker: drop ad network & ad-break requests before they reach the player!
+                    if (isAdRequest(url, host)) {
+                        return emptyAdResponse()
+                    }
                     val vid = currentVideoId
                     if (vid.isNotBlank() && url.contains("googlevideo.com/videoplayback") && !url.contains("sabr=1", true)) {
                         val decoded = runCatching { URLDecoder.decode(url, "UTF-8") }.getOrDefault(url)
@@ -699,7 +740,8 @@ class WebPlaybackEngine(private val context: Context) {
         .ytp-gradient-bottom, .ytp-pause-overlay, .ytp-watermark, .ytp-bezel-text-wrapper,
         .ytp-doubletap-ui-legacy, .ytm-custom-control-host, .ytp-spinner, .ytp-mweb-player-chrome,
         .ytp-cued-thumbnail-overlay, .ytp-large-play-button, ytm-promoted-sparkles-web-renderer,
-        .ytp-endscreen-content, .ytp-ce-element, .ytp-suggested-action, .ytp-cards-teaser {
+        .ytp-endscreen-content, .ytp-ce-element, .ytp-suggested-action, .ytp-cards-teaser,
+        .ytp-ad-module, .ytp-ad-overlay-container, .ytp-ad-player-overlay, .video-ads {
           display:none !important; opacity:0 !important; visibility:hidden !important; pointer-events:none !important;
         }
         #player-container-id, .player-container, #player, #movie_player, .html5-video-player, .html5-video-container {
@@ -719,6 +761,7 @@ class WebPlaybackEngine(private val context: Context) {
         mainHandler.post { webView?.evaluateJavascript(js, null) }
     }
 
+    // Layer 2 Ad Blocker inside m.youtube.com: instantly mutes, fast-forwards & clicks skip on any inline ad!
     private fun injectMobileWatchHook(startSec: Double) {
         val css = cleanMobileCssString()
         val js = """
@@ -768,9 +811,26 @@ class WebPlaybackEngine(private val context: Context) {
               } catch(e) {}
 
               window.__sonifyTimer = setInterval(function() {
-                var skip = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern');
-                if (skip) { try { skip.click(); } catch(e){} }
                 var v = document.querySelector('video');
+                var playerEl = document.querySelector('#movie_player, .html5-video-player');
+                var isAd = (playerEl && (playerEl.classList.contains('ad-showing') || playerEl.classList.contains('ad-interrupting')))
+                           || !!document.querySelector('.ytp-ad-player-overlay, .ytp-ad-text, .ytp-ad-preview-container');
+
+                var skip = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button-slot button');
+                if (skip) { try { skip.click(); } catch(e){} }
+
+                if (isAd && v) {
+                  try {
+                    v.muted = true;
+                    v.playbackRate = 16.0;
+                    if (isFinite(v.duration) && v.duration > 0.2 && v.currentTime < v.duration - 0.2) {
+                      v.currentTime = v.duration - 0.1;
+                    }
+                  } catch(e) {}
+                  SonifyBridge.onProgress(0, 0, false, true);
+                  return;
+                }
+
                 if (!v) return;
                 if (!window.__sonifySeekedOnce && $startSec >= 1 && v.readyState >= 1) {
                   window.__sonifySeekedOnce = true;
@@ -796,7 +856,7 @@ class WebPlaybackEngine(private val context: Context) {
                   SonifyBridge.onProgress(pos, dur, playing, buffering);
                 }
                 if (v.ended && !window.__sonifyEndedFired) { window.__sonifyEndedFired = true; SonifyBridge.onEnded(); }
-              }, 450);
+              }, 350);
 
               window.sonifyPlay = function() { window.__sonifyUserPaused = false; var v = document.querySelector('video'); if (v) { v.muted = false; v.play().catch(function(){}); } };
               window.sonifyPause = function() { window.__sonifyUserPaused = true; var v = document.querySelector('video'); if (v) v.pause(); };
@@ -1039,8 +1099,8 @@ class AudioEngine(private val context: Context) {
         }
     }
 
-    fun speakDjAnnouncement(text: String, isEn: Boolean) {
-        if (!lastSettings.djVoiceEnabled || !ttsReady) return
+    fun speakDjAnnouncement(text: String, isEn: Boolean, forceAllow: Boolean = false) {
+        if ((!lastSettings.djVoiceEnabled && !forceAllow) || !ttsReady) return
         runCatching {
             val loc = if (isEn) Locale.US else Locale("he", "IL")
             tts?.language = loc
@@ -1152,7 +1212,6 @@ class AudioEngine(private val context: Context) {
         if (player.audioSessionId > 0 && dynamicsProcessing == null && equalizer == null) attachAudioEffects(player.audioSessionId)
     }
 
-    // Chromium WebView manages its own Android AudioFocus natively — no conflicting AudioFocusRequest!
     fun playViaWebEngine(videoId: String, startPositionMs: Long = 0L, title: String = "Sonify", artist: String = "") {
         currentWebTitle = title
         currentWebArtist = artist
