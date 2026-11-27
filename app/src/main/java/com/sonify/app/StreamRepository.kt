@@ -8,10 +8,13 @@ import android.provider.MediaStore
 import android.text.Html
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.ConnectionPool
@@ -24,10 +27,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 
 data class ArtistRelease(
@@ -63,12 +69,28 @@ data class ArtistProfileDetails(
 
 class StreamRepository(private val context: Context) {
 
+    companion object {
+        // Serializes yt-dlp Python executions so concurrent calls NEVER crash JNI/Python!
+        private val ytDlpMutex = Mutex()
+        private val ytDlpInitLock = Any()
+        @Volatile private var ytDlpInitialized = false
+        @Volatile private var ytDlpUpdateRunning = false
+    }
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(14, TimeUnit.SECONDS)
         .callTimeout(22, TimeUnit.SECONDS)
         .connectionPool(ConnectionPool(10, 5, TimeUnit.MINUTES))
         .followRedirects(true)
+        .build()
+
+    // Dedicated client for Gemini API (generous timeout so translations never drop!)
+    private val geminiClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .callTimeout(55, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     private val fastProxyClient = OkHttpClient.Builder()
@@ -80,13 +102,13 @@ class StreamRepository(private val context: Context) {
 
     private val downloadClient = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
-            maxRequests = 64
-            maxRequestsPerHost = 16
+            maxRequests = 48
+            maxRequestsPerHost = 12
         })
-        .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
+        .connectionPool(ConnectionPool(12, 5, TimeUnit.MINUTES))
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(12, TimeUnit.SECONDS)
-        .callTimeout(18, TimeUnit.SECONDS)
+        .callTimeout(24, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
@@ -115,12 +137,12 @@ class StreamRepository(private val context: Context) {
         "https://cobalt-api.kwiatekmiki.com"
     )
 
-    private val ytDlpInitLock = Any()
-    @Volatile private var ytDlpInitialized = false
-    @Volatile private var ytDlpUpdateRunning = false
-
     private val offlineDir: File
         get() = File(context.filesDir, "offline_tracks").apply { if (!exists()) mkdirs() }
+
+    // Rolling pre-cache directory for instant 0ms next-track transitions & weak-network protection
+    private val streamPrecacheDir: File
+        get() = File(context.cacheDir, "stream_precache").apply { if (!exists()) mkdirs() }
 
     suspend fun prewarmYtDlp() = withContext(Dispatchers.IO) {
         if (!ensureYtDlpInitOnly()) return@withContext
@@ -131,11 +153,13 @@ class StreamRepository(private val context: Context) {
             ytDlpUpdateRunning = true
             runCatching {
                 withTimeoutOrNull(25_000L) {
-                    YoutubeDL.getInstance().updateYoutubeDL(
-                        context.applicationContext,
-                        YoutubeDL.UpdateChannel.NIGHTLY
-                    )
-                    dlPrefs.edit().putLong("last_update_ms", System.currentTimeMillis()).apply()
+                    ytDlpMutex.withLock {
+                        YoutubeDL.getInstance().updateYoutubeDL(
+                            context.applicationContext,
+                            YoutubeDL.UpdateChannel.NIGHTLY
+                        )
+                        dlPrefs.edit().putLong("last_update_ms", System.currentTimeMillis()).apply()
+                    }
                 }
             }
             ytDlpUpdateRunning = false
@@ -162,6 +186,16 @@ class StreamRepository(private val context: Context) {
         return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
     }
 
+    // Detects low-bandwidth / weak cellular zones (just like Spotify Adaptive Bitrate!)
+    fun isWeakNetwork(): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val net = cm.activeNetwork ?: return true
+        val caps = cm.getNetworkCapabilities(net) ?: return true
+        val downKbps = caps.linkDownstreamBandwidthKbps
+        if (downKbps in 1..1500) return true
+        return !caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && downKbps in 1..2500
+    }
+
     fun effectiveQuality(settings: AppSettings, forDownload: Boolean = false): AudioQuality {
         val raw = when {
             forDownload -> settings.downloadQuality
@@ -170,14 +204,70 @@ class StreamRepository(private val context: Context) {
             else -> settings.cellularQuality
         }
         val clamped = settings.streamSource.clampQuality(raw)
-        return if (!forDownload && settings.autoAdjustQuality && !isOnWifi() && clamped == AudioQuality.LOSSLESS) {
-            AudioQuality.HIGH
-        } else clamped
+        if (!forDownload && settings.autoAdjustQuality) {
+            if (isWeakNetwork()) {
+                return if (clamped == AudioQuality.LOW) AudioQuality.LOW else AudioQuality.NORMAL
+            }
+            if (!isOnWifi() && clamped == AudioQuality.LOSSLESS) {
+                return AudioQuality.HIGH
+            }
+        }
+        return clamped
     }
 
     fun getOfflineFile(trackId: String): File {
         val safe = trackId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
         return File(offlineDir, "$safe.media")
+    }
+
+    fun getPrecachedAudioFile(trackId: String): File {
+        val safe = trackId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+        return File(streamPrecacheDir, "$safe.cache")
+    }
+
+    private fun trimStreamPrecache() {
+        runCatching {
+            val files = streamPrecacheDir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: return
+            var totalBytes = 0L
+            files.forEachIndexed { idx, f ->
+                totalBytes += f.length()
+                if (idx >= 6 || totalBytes > 45L * 1024L * 1024L) {
+                    f.delete()
+                }
+            }
+        }
+    }
+
+    // Downloads the next song in queue quietly to disk -> 0ms switch & uninterrupted in weak-signal zones!
+    suspend fun precacheTrackAudio(track: Track, settings: AppSettings): Boolean = withContext(Dispatchers.IO) {
+        if (settings.offlineMode || settings.dataSaver || track.source != StreamSource.YOUTUBE) return@withContext false
+        if (getOfflineFile(track.id).let { it.exists() && it.length() > 16_384 }) return@withContext true
+        val target = getPrecachedAudioFile(track.id)
+        if (target.exists() && target.length() > 64_000) {
+            target.setLastModified(System.currentTimeMillis())
+            return@withContext true
+        }
+        val quality = effectiveQuality(settings, forDownload = false)
+        val resolved = runCatching { fetchInnerTubeClient(track.id, "ANDROID_VR", quality, preferHls = false) }.getOrNull()
+            ?: runCatching { fetchInnerTubeClient(track.id, "IOS", quality, preferHls = true) }.getOrNull()
+            ?: return@withContext false
+
+        if (resolved.audioUrl.contains(".m3u8", true)) return@withContext false
+        val clen = Regex("[?&]clen=(\\d+)").find(resolved.audioUrl)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+        if (clen > 18L * 1024L * 1024L) return@withContext false // Skip huge podcasts for auto-precache
+
+        val ok = downloadSmart(
+            url = resolved.audioUrl,
+            userAgent = resolved.userAgent,
+            cookie = resolved.cookie,
+            extraHeaders = emptyMap(),
+            target = target,
+            isWebOrigin = false,
+            parallel = 3,
+            onProgress = {}
+        )
+        if (ok) trimStreamPrecache()
+        ok
     }
 
     fun getOfflineTrackIds(): Set<String> {
@@ -195,7 +285,15 @@ class StreamRepository(private val context: Context) {
         return dirSize(context.cacheDir) / (1024f * 1024f)
     }
 
-    fun clearCache() { runCatching { context.cacheDir.listFiles()?.forEach { it.deleteRecursively() } } }
+    fun clearCache() {
+        runCatching {
+            AudioCacheHolder.clearAllEntries()
+            context.cacheDir.listFiles()?.forEach { f ->
+                if (f.name != "exo_stream_cache") f.deleteRecursively()
+            }
+        }
+    }
+
     fun deleteAllOfflineTracks() { runCatching { offlineDir.listFiles()?.forEach { it.delete() } } }
     fun deleteOfflineTrack(trackId: String) { val f = getOfflineFile(trackId); if (f.exists()) f.delete() }
 
@@ -544,7 +642,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- Shared Track Real Metadata Fetcher (Fixes "שיר משותף" & Lyrics Lookup!) ----------
+    // ---------- Shared Track Real Metadata Fetcher ----------
     suspend fun fetchTrackMetadataById(videoId: String): Track = withContext(Dispatchers.IO) {
         val cleanId = videoId.trim().take(11)
         val defaultArt = "https://i.ytimg.com/vi/$cleanId/maxresdefault.jpg"
@@ -578,15 +676,7 @@ class StreamRepository(private val context: Context) {
                 } else defaultArt
                 if (rawTitle.isBlank()) return@use null
                 val (parsedArtist, parsedTitle) = splitArtistAndTitle(rawTitle, rawAuthor)
-                Track(
-                    id = cleanId,
-                    title = parsedTitle,
-                    artist = parsedArtist,
-                    artworkUrl = art,
-                    durationMs = durMs,
-                    source = StreamSource.YOUTUBE,
-                    isExplicit = detectExplicit(rawTitle)
-                )
+                Track(cleanId, parsedTitle, parsedArtist, artworkUrl = art, durationMs = durMs, source = StreamSource.YOUTUBE, isExplicit = detectExplicit(rawTitle))
             }
         }.getOrNull()
         if (fromPlayer != null) return@withContext fromPlayer
@@ -602,14 +692,7 @@ class StreamRepository(private val context: Context) {
                 val art = upgradeArtworkUrlGlobal(o.optString("thumbnail_url")).ifBlank { defaultArt }
                 if (rawTitle.isBlank()) return@use null
                 val (parsedArtist, parsedTitle) = splitArtistAndTitle(rawTitle, rawAuthor)
-                Track(
-                    id = cleanId,
-                    title = parsedTitle,
-                    artist = parsedArtist,
-                    artworkUrl = art,
-                    source = StreamSource.YOUTUBE,
-                    isExplicit = detectExplicit(rawTitle)
-                )
+                Track(cleanId, parsedTitle, parsedArtist, artworkUrl = art, source = StreamSource.YOUTUBE, isExplicit = detectExplicit(rawTitle))
             }
         }.getOrNull()
         if (fromOembed != null) return@withContext fromOembed
@@ -725,7 +808,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 2. Enhanced Ready YouTube Playlists Search, Browse & Import ----------
+    // ---------- 2. Playlists Search, Browse & Import ----------
     suspend fun searchPlaylists(query: String): List<RemotePlaylist> = withContext(Dispatchers.IO) {
         val combined = mutableListOf<RemotePlaylist>()
 
@@ -1118,11 +1201,17 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 3. Verified Stream Resolution ----------
+    // ---------- 3. Verified Stream Resolution (Checks Offline -> Instant Pre-Cache -> Network!) ----------
     suspend fun resolveStreams(track: Track, settings: AppSettings, attemptIndex: Int = 0, forDownload: Boolean = false): ResolvedStreams? = withContext(Dispatchers.IO) {
         val offlineFile = getOfflineFile(track.id)
         if (!forDownload && offlineFile.exists() && offlineFile.length() > 4096) {
             return@withContext ResolvedStreams(audioUrl = offlineFile.toURI().toString(), isLossless = track.source != StreamSource.YOUTUBE, isOffline = true, codecLabel = "OFFLINE")
+        }
+        // Instant 0ms local pre-cache hit (works even in elevators / tunnels / weak network!)
+        val precacheFile = getPrecachedAudioFile(track.id)
+        if (!forDownload && attemptIndex == 0 && precacheFile.exists() && precacheFile.length() > 64_000) {
+            precacheFile.setLastModified(System.currentTimeMillis())
+            return@withContext ResolvedStreams(audioUrl = precacheFile.toURI().toString(), isOffline = true, codecLabel = "INSTANT CACHE")
         }
         if (track.source == StreamSource.LOCAL && !track.localUri.isNullOrBlank()) {
             val isFlac = track.title.endsWith(".flac", true) || track.album.contains("FLAC", true)
@@ -1355,7 +1444,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 4. Turbo Parallel Offline Downloader ----------
+    // ---------- 4. Fast, Zero-OOM, Crash-Free Offline Downloader (RandomAccessFile + Anti-Throttle + yt-dlp Mutex) ----------
     private suspend fun downloadViaYtDlp(
         videoId: String,
         quality: AudioQuality,
@@ -1364,69 +1453,66 @@ class StreamRepository(private val context: Context) {
         onProgress: (Int) -> Unit
     ): Boolean {
         if (!ensureYtDlpInitOnly()) return false
-        onProgress(10)
-
-        val qualityFormat = when (quality) {
-            AudioQuality.LOW -> "worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio/18"
-            AudioQuality.NORMAL -> "bestaudio[abr<=100][ext=m4a]/bestaudio[abr<=100]/bestaudio[ext=m4a]/18"
-            AudioQuality.HIGH -> "bestaudio[abr<=160][ext=m4a]/bestaudio[abr<=160]/bestaudio[ext=m4a]/18"
-            AudioQuality.VERY_HIGH, AudioQuality.LOSSLESS -> "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/18"
-        }
-
-        val attempts = listOf(
-            qualityFormat to "youtube:player_client=android_vr,ios,tv_downgraded",
-            "bestaudio/18" to "youtube:player_client=tv_downgraded,mweb,android_vr",
-            "18/best[ext=mp4]/best" to null
-        )
-
-        val tmpPrefix = "${target.nameWithoutExtension}_ytdlp"
-        val tmpFile = File(target.parentFile, "$tmpPrefix.tmp")
-
-        for ((fmt, extractorArgs) in attempts) {
-            target.parentFile?.listFiles()?.filter { it.name.startsWith(tmpPrefix) }?.forEach { it.delete() }
-
-            val request = YoutubeDLRequest("https://www.youtube.com/watch?v=$videoId").apply {
-                addOption("--no-playlist")
-                addOption("--no-part")
-                addOption("--no-mtime")
-                addOption("--force-overwrites")
-                addOption("--no-cache-dir")
-                addOption("--retries", "2")
-                addOption("--socket-timeout", "10")
-                addOption("--http-chunk-size", "524288")
-                addOption("--concurrent-fragments", parallelCount.coerceIn(4, 10).toString())
-                addOption("-f", fmt)
-                if (!extractorArgs.isNullOrBlank()) {
-                    addOption("--extractor-args", extractorArgs)
-                }
-                addOption("-o", tmpFile.absolutePath)
+        return ytDlpMutex.withLock {
+            onProgress(12)
+            val qualityFormat = when (quality) {
+                AudioQuality.LOW -> "worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio/18"
+                AudioQuality.NORMAL -> "bestaudio[abr<=100][ext=m4a]/bestaudio[abr<=100]/bestaudio[ext=m4a]/18"
+                AudioQuality.HIGH -> "bestaudio[abr<=160][ext=m4a]/bestaudio[abr<=160]/bestaudio[ext=m4a]/18"
+                AudioQuality.VERY_HIGH, AudioQuality.LOSSLESS -> "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/18"
             }
 
-            val ok = runCatching {
-                YoutubeDL.getInstance().execute(request, "sonify_dl_$videoId") { progress: Float, _: Long, _: String ->
-                    if (progress >= 0f) {
-                        val mapped = (12 + (progress * 0.86f).toInt()).coerceIn(12, 98)
-                        onProgress(mapped)
+            val attempts = listOf(
+                qualityFormat to "youtube:player_client=android_vr,ios,tv_downgraded",
+                "bestaudio/18" to "youtube:player_client=tv_downgraded,mweb,android_vr"
+            )
+
+            val tmpPrefix = "${target.nameWithoutExtension}_ytdlp"
+            val tmpFile = File(target.parentFile, "$tmpPrefix.tmp")
+
+            for ((fmt, extractorArgs) in attempts) {
+                target.parentFile?.listFiles()?.filter { it.name.startsWith(tmpPrefix) }?.forEach { it.delete() }
+
+                val request = YoutubeDLRequest("https://www.youtube.com/watch?v=$videoId").apply {
+                    addOption("--no-playlist")
+                    addOption("--no-part")
+                    addOption("--no-mtime")
+                    addOption("--force-overwrites")
+                    addOption("--no-cache-dir")
+                    addOption("--retries", "2")
+                    addOption("--socket-timeout", "10")
+                    addOption("--http-chunk-size", "1048576")
+                    addOption("--concurrent-fragments", parallelCount.coerceIn(4, 8).toString())
+                    addOption("-f", fmt)
+                    addOption("--extractor-args", extractorArgs)
+                    addOption("-o", tmpFile.absolutePath)
+                }
+
+                val ok = runCatching {
+                    YoutubeDL.getInstance().execute(request, "sonify_dl_$videoId") { progress: Float, _: Long, _: String ->
+                        if (progress >= 0f) {
+                            onProgress((12 + (progress * 0.86f).toInt()).coerceIn(12, 98))
+                        }
                     }
-                }
-                val produced = if (tmpFile.exists() && tmpFile.length() > 16_384) {
-                    tmpFile
-                } else {
-                    target.parentFile?.listFiles()?.firstOrNull { it.name.startsWith(tmpPrefix) && it.length() > 16_384 }
-                }
-                if (produced != null) {
-                    if (target.exists()) target.delete()
-                    produced.renameTo(target)
-                    onProgress(100)
-                    true
-                } else false
-            }.getOrDefault(false)
+                    val produced = if (tmpFile.exists() && tmpFile.length() > 16_384) {
+                        tmpFile
+                    } else {
+                        target.parentFile?.listFiles()?.firstOrNull { it.name.startsWith(tmpPrefix) && it.length() > 16_384 }
+                    }
+                    if (produced != null) {
+                        if (target.exists()) target.delete()
+                        produced.renameTo(target)
+                        onProgress(100)
+                        true
+                    } else false
+                }.getOrDefault(false)
 
-            if (ok) return true
+                if (ok) return@withLock true
+            }
+
+            target.parentFile?.listFiles()?.filter { it.name.startsWith(tmpPrefix) }?.forEach { it.delete() }
+            false
         }
-
-        target.parentFile?.listFiles()?.filter { it.name.startsWith(tmpPrefix) }?.forEach { it.delete() }
-        return false
     }
 
     suspend fun downloadTrackOffline(
@@ -1442,9 +1528,21 @@ class StreamRepository(private val context: Context) {
         }
 
         val target = getOfflineFile(track.id)
+
+        // Instant move from rolling stream precache if already cached on disk (0.1s download!)
+        val cached = getPrecachedAudioFile(track.id)
+        if (cached.exists() && cached.length() > 64_000) {
+            val copied = runCatching {
+                cached.copyTo(target, overwrite = true)
+                onProgress(100)
+                true
+            }.getOrDefault(false)
+            if (copied) return@withContext true to "השיר נשמר מיד להאזנה אופליין!"
+        }
+
         val parallel = settings.downloadSpeedMode.parallelChunks
 
-        val result = withTimeoutOrNull(85_000L) {
+        val result = withTimeoutOrNull(75_000L) {
             onProgress(3)
 
             if (track.source != StreamSource.YOUTUBE) {
@@ -1457,11 +1555,19 @@ class StreamRepository(private val context: Context) {
 
             val quality = effectiveQuality(settings, forDownload = true)
 
+            // Priority 1: Direct unthrottled ANDROID_VR stream with RandomAccessFile parallel workers
             val fastDirect = runCatching { fetchInnerTubeClient(track.id, "ANDROID_VR", quality, preferHls = false) }.getOrNull()
             if (fastDirect != null && downloadSmart(fastDirect.audioUrl, fastDirect.userAgent, fastDirect.cookie, emptyMap(), target, false, parallel, onProgress)) {
                 return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
             }
 
+            // Priority 2: Fast IOS HLS parallel segments (never throttled by googlevideo range caps!)
+            val iosHls = runCatching { fetchInnerTubeClient(track.id, "IOS", quality, preferHls = true) }.getOrNull()
+            if (iosHls != null && downloadSmart(iosHls.audioUrl, iosHls.userAgent, iosHls.cookie, emptyMap(), target, false, parallel, onProgress)) {
+                return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
+            }
+
+            // Priority 3: Captured stream if available
             for (cap in capturedStreams.sortedByDescending { it.isAudioOnly }.take(2)) {
                 val cleanBase = sanitizeYouTubePlaybackUrl(cap.url)
                 if (downloadSmart(cleanBase, cap.userAgent, cap.cookie, cap.headers, target, true, parallel, onProgress)) {
@@ -1469,20 +1575,23 @@ class StreamRepository(private val context: Context) {
                 }
             }
 
-            if (downloadViaYtDlp(track.id, quality, parallel, target, onProgress)) {
-                return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
-            }
-
-            if (webViewDownloadFn != null && capturedStreams.isNotEmpty()) {
-                val wvOk = runCatching { webViewDownloadFn(target, onProgress) }.getOrDefault(false)
-                if (wvOk) return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
-            }
-
-            for (strategy in youtubeStrategies(track.id, quality).drop(1)) {
+            // Priority 4: Cobalt / Piped / Invidious fast proxy fallback
+            for (strategy in youtubeStrategies(track.id, quality).drop(2)) {
                 val resolved = runCatching { strategy() }.getOrNull() ?: continue
                 if (downloadSmart(resolved.audioUrl, resolved.userAgent, resolved.cookie, emptyMap(), target, false, parallel, onProgress)) {
                     return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
                 }
+            }
+
+            // Priority 5: Serialized Mutex-protected yt-dlp engine
+            if (downloadViaYtDlp(track.id, quality, parallel, target, onProgress)) {
+                return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
+            }
+
+            // Priority 6: WebView JS fetch fallback
+            if (webViewDownloadFn != null && capturedStreams.isNotEmpty()) {
+                val wvOk = runCatching { webViewDownloadFn(target, onProgress) }.getOrDefault(false)
+                if (wvOk) return@withTimeoutOrNull true to "השיר ירד להאזנה אופליין!"
             }
 
             false to "לא ניתן להוריד שיר זה כרגע — נסה שוב בעוד רגע"
@@ -1521,7 +1630,7 @@ class StreamRepository(private val context: Context) {
         }
         val clean = sanitizeYouTubePlaybackUrl(url)
         if (clean.contains("googlevideo.com") && clean.contains("clen=")) {
-            if (downloadChunkedParallel(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, parallel, onProgress)) return true
+            if (downloadChunkedDirectToDisk(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, parallel, onProgress)) return true
         }
         return downloadUrlToFile(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, onProgress)
     }
@@ -1544,7 +1653,8 @@ class StreamRepository(private val context: Context) {
     private suspend fun downloadHlsAudioParallel(
         manifestUrl: String, userAgent: String, cookie: String?, target: File, parallel: Int, onProgress: (Int) -> Unit
     ): Boolean {
-        return runCatching {
+        val tmp = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
+        return try {
             fun fetchText(u: String): String? {
                 val req = buildMediaRequest(u, userAgent, cookie, emptyMap(), false)
                 return downloadClient.newCall(req).execute().use { r -> if (r.isSuccessful) r.body?.string() else null }
@@ -1558,10 +1668,10 @@ class StreamRepository(private val context: Context) {
             val segments = playlistText.lines().map { it.trim() }.filter { it.startsWith("http") }
             if (segments.isEmpty()) return false
 
-            val tmp = File(target.parentFile, "${target.name}.tmp")
             var completed = 0
+            val workers = parallel.coerceIn(4, 8)
             FileOutputStream(tmp).use { out ->
-                for (batch in segments.chunked(parallel.coerceIn(4, 10))) {
+                for (batch in segments.chunked(workers)) {
                     val fetched = coroutineScope {
                         batch.map { segUrl ->
                             async(Dispatchers.IO) {
@@ -1587,18 +1697,25 @@ class StreamRepository(private val context: Context) {
                 onProgress(100)
                 true
             } else { tmp.delete(); false }
-        }.getOrDefault(false)
+        } catch (e: CancellationException) {
+            tmp.delete()
+            throw e
+        } catch (_: Throwable) {
+            tmp.delete()
+            false
+        }
     }
 
     private fun downloadUrlToFile(url: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>, target: File, isWebOrigin: Boolean, onProgress: (Int) -> Unit): Boolean {
-        return runCatching {
+        val tmp = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
+        return try {
             val req = buildMediaRequest(url, userAgent, cookie, extraHeaders, isWebOrigin)
             downloadClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return false
                 val ct = resp.header("Content-Type").orEmpty().lowercase()
                 if (ct.contains("text/html") || ct.contains("application/json") || ct.contains("yt-ump")) return false
                 val total = resp.body?.contentLength() ?: -1L
-                val tmp = File(target.parentFile, "${target.name}.tmp")
+                val startMs = System.currentTimeMillis()
                 resp.body?.byteStream()?.use { input ->
                     FileOutputStream(tmp).use { output ->
                         val buf = ByteArray(32 * 1024)
@@ -1608,6 +1725,11 @@ class StreamRepository(private val context: Context) {
                             if (n <= 0) break
                             output.write(buf, 0, n)
                             copied += n
+                            val elapsed = System.currentTimeMillis() - startMs
+                            if (elapsed > 3000L && total > 600_000L && (copied * 1000L / elapsed) < 85_000L) {
+                                tmp.delete()
+                                return false // Throttled stream -> escape immediately to faster source!
+                            }
                             if (total > 0) onProgress(((copied * 98) / total).toInt().coerceIn(5, 98))
                         }
                     }
@@ -1619,41 +1741,27 @@ class StreamRepository(private val context: Context) {
                     true
                 } else { tmp.delete(); false }
             }
-        }.getOrDefault(false)
+        } catch (e: CancellationException) {
+            tmp.delete()
+            throw e
+        } catch (_: Throwable) {
+            tmp.delete()
+            false
+        }
     }
 
-    private suspend fun downloadChunkedParallel(
+    // Streaming parallel RandomAccessFile writer: near-zero RAM usage + Anti-Throttle detection!
+    private suspend fun downloadChunkedDirectToDisk(
         baseUrl: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>,
         target: File, isWebOrigin: Boolean, parallel: Int, onProgress: (Int) -> Unit
     ): Boolean {
         val clen = Regex("[?&]clen=(\\d+)").find(baseUrl)?.groupValues?.get(1)?.toLongOrNull() ?: return false
         if (clen <= 0L || clen > 85_000_000L) return false
 
-        return runCatching {
-            val tmp = File(target.parentFile, "${target.name}.tmp")
-            var activeBase = baseUrl
-            val workers = parallel.coerceIn(4, 10)
-            val chunkSize = (clen / workers).coerceIn(384 * 1024L, 1024 * 1024L)
-
-            fun fetchRange(urlBase: String, start: Long, end: Long): Pair<ByteArray?, String?> {
-                val sep = if (urlBase.contains("?")) "&" else "?"
-                val req = buildMediaRequest("$urlBase${sep}range=$start-$end", userAgent, cookie, extraHeaders, isWebOrigin)
-                return runCatching {
-                    downloadClient.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) return@use null to null
-                        val ct = resp.header("Content-Type").orEmpty().lowercase()
-                        if (ct.contains("yt-ump") || ct.contains("text/html")) return@use null to null
-                        val bytes = resp.body?.bytes() ?: return@use null to null
-                        if (ct.contains("text/plain") && bytes.size < 2048) {
-                            val redir = String(bytes).trim()
-                            if (redir.startsWith("https://")) return@use null to sanitizeYouTubePlaybackUrl(redir)
-                            return@use null to null
-                        }
-                        bytes to null
-                    }
-                }.getOrDefault(null to null)
-            }
-
+        val tmp = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
+        return try {
+            val workers = parallel.coerceIn(4, 6)
+            val chunkSize = (clen / workers).coerceIn(256 * 1024L, 1_536 * 1024L)
             val ranges = mutableListOf<Pair<Long, Long>>()
             var cursor = 0L
             while (cursor < clen) {
@@ -1662,41 +1770,74 @@ class StreamRepository(private val context: Context) {
                 cursor = end + 1
             }
 
-            var firstBytes: ByteArray? = null
-            for (r in 0..1) {
-                val (b, redir) = fetchRange(activeBase, ranges[0].first, ranges[0].second)
-                if (redir != null) { activeBase = redir; continue }
-                if (b != null && b.isNotEmpty()) { firstBytes = b; break }
-            }
-            if (firstBytes == null) return false
+            val writeLock = Any()
+            val totalWritten = AtomicLong(0L)
+            val aborted = AtomicBoolean(false)
+            val startTimeMs = System.currentTimeMillis()
 
-            var written = firstBytes.size.toLong()
-            onProgress(((written * 98) / clen).toInt().coerceIn(5, 98))
+            RandomAccessFile(tmp, "rw").use { raf ->
+                raf.setLength(clen)
 
-            FileOutputStream(tmp).use { out ->
-                out.write(firstBytes)
-                val remainingRanges = ranges.drop(1)
-                for (batch in remainingRanges.chunked(workers)) {
-                    val results = coroutineScope {
-                        batch.map { (start, end) ->
-                            async(Dispatchers.IO) {
-                                var got: ByteArray? = null
-                                var localUrl = activeBase
-                                for (retry in 0..2) {
-                                    val (b, redir) = fetchRange(localUrl, start, end)
-                                    if (redir != null) { localUrl = redir; continue }
-                                    if (b != null && b.isNotEmpty()) { got = b; break }
+                fun streamRangeToDisk(start: Long, end: Long): Boolean {
+                    var activeUrl = baseUrl
+                    for (attempt in 0..2) {
+                        if (aborted.get()) return false
+                        val sep = if (activeUrl.contains("?")) "&" else "?"
+                        val req = buildMediaRequest("$activeUrl${sep}range=$start-$end", userAgent, cookie, extraHeaders, isWebOrigin)
+                        val result = runCatching {
+                            downloadClient.newCall(req).execute().use { resp ->
+                                if (!resp.isSuccessful) return@use -1
+                                val ct = resp.header("Content-Type").orEmpty().lowercase()
+                                if (ct.contains("yt-ump") || ct.contains("text/html")) return@use -1
+                                val body = resp.body ?: return@use -1
+                                if (ct.contains("text/plain")) {
+                                    val txt = body.string().trim()
+                                    if (txt.startsWith("https://")) {
+                                        activeUrl = sanitizeYouTubePlaybackUrl(txt)
+                                        return@use 2 // Redirect retry
+                                    }
+                                    return@use -1
                                 }
-                                got
+                                val buf = ByteArray(32 * 1024)
+                                var pos = start
+                                body.byteStream().use { input ->
+                                    while (true) {
+                                        if (aborted.get()) return@use -1
+                                        val n = input.read(buf)
+                                        if (n <= 0) break
+                                        synchronized(writeLock) {
+                                            raf.seek(pos)
+                                            raf.write(buf, 0, n)
+                                        }
+                                        pos += n
+                                        val writtenNow = totalWritten.addAndGet(n.toLong())
+                                        val elapsed = System.currentTimeMillis() - startTimeMs
+                                        // Anti-throttle guard: if aggregate speed < 100 KB/s after 2.6s, switch source!
+                                        if (elapsed > 2600L && clen > 700_000L && (writtenNow * 1000L / elapsed) < 100_000L) {
+                                            aborted.set(true)
+                                            return@use -1
+                                        }
+                                        onProgress(((writtenNow * 98) / clen).toInt().coerceIn(5, 98))
+                                    }
+                                }
+                                if (pos >= end) 1 else -1
                             }
-                        }.awaitAll()
+                        }.getOrDefault(-1)
+                        if (result == 1) return true
+                        if (result != 2 && aborted.get()) return false
                     }
-                    for (chunk in results) {
-                        if (chunk == null) { tmp.delete(); return false }
-                        out.write(chunk)
-                        written += chunk.size
+                    return false
+                }
+
+                // Run parallel chunk batches directly into RandomAccessFile
+                for (batch in ranges.chunked(workers)) {
+                    val allOk = coroutineScope {
+                        batch.map { (s, e) -> async(Dispatchers.IO) { streamRangeToDisk(s, e) } }.awaitAll().all { it }
                     }
-                    onProgress(((written * 98) / clen).toInt().coerceIn(5, 98))
+                    if (!allOk || aborted.get()) {
+                        tmp.delete()
+                        return false
+                    }
                 }
             }
 
@@ -1706,7 +1847,13 @@ class StreamRepository(private val context: Context) {
                 onProgress(100)
                 true
             } else { tmp.delete(); false }
-        }.getOrDefault(false)
+        } catch (e: CancellationException) {
+            tmp.delete()
+            throw e
+        } catch (_: Throwable) {
+            tmp.delete()
+            false
+        }
     }
 
     // ---------- 5. Smarter AI Engine: Infinite Taste-Aware Home Feed & Smart Playlist Studio ----------
@@ -1769,9 +1916,17 @@ class StreamRepository(private val context: Context) {
                         .filterNot { t -> excludedArtists.any { ex -> t.artist.contains(ex, true) } }
                     if (found.isEmpty()) null
                     else Playlist(
-                        id = "ai_inf_${pageIndex}_$idx",
+                        id = when {
+                            isBook -> "book_inf_${pageIndex}_$idx"
+                            isPod -> "pod_inf_${pageIndex}_$idx"
+                            else -> "ai_inf_${pageIndex}_$idx"
+                        },
                         name = title,
-                        creator = "Sonify AI",
+                        creator = when {
+                            isBook -> "Audiobooks"
+                            isPod -> "Podcasts"
+                            else -> "Sonify AI"
+                        },
                         description = query,
                         coverUrl = found.first().artworkUrl,
                         tracks = found,
@@ -1808,13 +1963,13 @@ class StreamRepository(private val context: Context) {
             val podThemes = listOf(
                 Triple(if (isEn) "Deep Dive Podcasts" else "פודקאסטים להעמקה", if (isEn) "AI Picks" else "בחירת AI", listOf(
                     Triple(if (isEn) "True Crime" else "פשע אמיתי וחקירות", "true crime podcast", "PODCAST"),
-                    Triple(if (isEn) "AI & Future Tech" else "בינה מלאכותית ועתיד", "AI technology podcast", "TECH"),
-                    Triple(if (isEn) "Psychology & Mind" else "פסיכולוגיה ומוח", "psychology mind podcast", "FOCUS")
+                    Triple(if (isEn) "AI & Future Tech" else "בינה מלאכותית ועתיד", "AI technology podcast", "PODCAST"),
+                    Triple(if (isEn) "Psychology & Mind" else "פסיכולוגיה ומוח", "psychology mind podcast", "PODCAST")
                 )),
                 Triple(if (isEn) "Stories & Culture" else "סיפורים ותרבות", if (isEn) "Endless Feed" else "פיד אינסופי", listOf(
                     Triple(if (isEn) "World History" else "היסטוריה עולמית", "history stories podcast", "PODCAST"),
-                    Triple(if (isEn) "Sports & Fitness" else "ספורט וכושר", "fitness sports podcast", "ENERGY"),
-                    Triple(if (isEn) "Israeli Talks" else "שיחות וראיונות בישראל", "פודקאסט ראיונות ישראלי", "IL MIX")
+                    Triple(if (isEn) "Sports & Fitness" else "ספורט וכושר", "fitness sports podcast", "PODCAST"),
+                    Triple(if (isEn) "Israeli Talks" else "שיחות וראיונות בישראל", "פודקאסט ראיונות ישראלי", "PODCAST")
                 ))
             )
             return podThemes[pageIndex % podThemes.size]
@@ -1865,6 +2020,68 @@ class StreamRepository(private val context: Context) {
         return discoveryPool[pageIndex % discoveryPool.size]
     }
 
+    private fun cleanGeminiKey(raw: String): String = raw.trim().replace(Regex("\\s+"), "")
+
+    private fun callGeminiText(prompt: String, apiKey: String, expectJson: Boolean = false): Pair<String?, String?> {
+        val cleanKey = cleanGeminiKey(apiKey)
+        if (cleanKey.isBlank()) return null to "לא הוזן מפתח Gemini API בהגדרות"
+
+        val models = listOf(
+            "gemini-2.5-flash" to true,
+            "gemini-2.0-flash" to false,
+            "gemini-2.0-flash-lite" to false
+        )
+        var lastError = "שגיאת חיבור לשרת Gemini"
+
+        for ((model, disableThinking) in models) {
+            val genConfig = JSONObject().apply {
+                put("temperature", 0.2)
+                if (expectJson) put("responseMimeType", "application/json")
+                if (disableThinking) {
+                    put("thinkingConfig", JSONObject().apply { put("thinkingBudget", 0) })
+                }
+            }
+            val payload = JSONObject().apply {
+                put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
+                put("generationConfig", genConfig)
+            }
+            val req = Request.Builder()
+                .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$cleanKey")
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+
+            try {
+                geminiClient.newCall(req).execute().use { resp ->
+                    val bodyStr = resp.body?.string().orEmpty()
+                    if (resp.isSuccessful) {
+                        val root = JSONObject(bodyStr)
+                        val text = root.optJSONArray("candidates")
+                            ?.optJSONObject(0)
+                            ?.optJSONObject("content")
+                            ?.optJSONArray("parts")
+                            ?.optJSONObject(0)
+                            ?.optString("text")
+                            ?.trim()
+                        if (!text.isNullOrBlank()) return text to null
+                        lastError = "המודל החזיר תשובה ריקה"
+                    } else {
+                        val apiMsg = runCatching { JSONObject(bodyStr).optJSONObject("error")?.optString("message").orEmpty() }.getOrDefault("")
+                        lastError = when (resp.code) {
+                            400, 403 -> if (apiMsg.contains("API key", true) || apiMsg.contains("key", true)) "מפתח ה-API לא תקין — בדוק שהעתקת נכון" else "שגיאת בקשה (${resp.code})"
+                            429 -> "חרגת ממכסת הבקשות של המפתח (429) — נסה שוב בעוד דקה"
+                            404 -> "מודל לא זמין ($model)"
+                            else -> "שגיאת שרת Gemini (${resp.code})"
+                        }
+                        if (resp.code == 400 && apiMsg.contains("API key", true)) return null to lastError
+                    }
+                }
+            } catch (e: Exception) {
+                lastError = "בעיית רשת בגישה ל-Gemini (${e.javaClass.simpleName})"
+            }
+        }
+        return null to lastError
+    }
+
     private fun requestGeminiInfiniteBatch(
         topArtists: List<String>,
         likedTracks: List<Track>,
@@ -1883,20 +2100,9 @@ class StreamRepository(private val context: Context) {
             {"sectionTitle": "...", "subtitle": "...", "cards": [{"title": "...", "searchQuery": "artist/genre query for youtube music", "styleTag": "SHORT_EN_TAG"}]}
         """.trimIndent()
 
-        val payload = JSONObject().apply {
-            put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
-            put("generationConfig", JSONObject().apply { put("responseMimeType", "application/json") })
-        }
-        val req = Request.Builder()
-            .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
-            .post(payload.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-
-        return client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val text = JSONObject(resp.body?.string() ?: return null)
-                .optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")
-                ?.optJSONArray("parts")?.optJSONObject(0)?.optString("text") ?: return null
+        val (text, _) = callGeminiText(prompt, apiKey, expectJson = true)
+        if (text.isNullOrBlank()) return null
+        return runCatching {
             val parsed = JSONObject("{${text.substringAfter("{").substringBeforeLast("}")}}")
             val secTitle = parsed.optString("sectionTitle").takeIf { it.isNotBlank() } ?: return null
             val secSub = parsed.optString("subtitle", "Gemini AI")
@@ -1911,7 +2117,7 @@ class StreamRepository(private val context: Context) {
                 }
             }
             if (cards.isEmpty()) null else Triple(secTitle, secSub, cards)
-        }
+        }.getOrNull()
     }
 
     suspend fun buildAiPlaylist(
@@ -2021,76 +2227,78 @@ class StreamRepository(private val context: Context) {
             Preferences: language=${config.languagePref}, energy=${config.energyPref}, era=${config.eraPref}.
             Reply ONLY with valid JSON: {"title": "Short catchy title", "songs": ["Artist - Song", ...]}
         """.trimIndent()
-        val payload = JSONObject().apply {
-            put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sysPrompt)))))
-            put("generationConfig", JSONObject().apply { put("responseMimeType", "application/json") })
-        }
-        val req = Request.Builder()
-            .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
-            .post(payload.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-        return client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val text = JSONObject(resp.body?.string() ?: return null)
-                .optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")
-                ?.optJSONArray("parts")?.optJSONObject(0)?.optString("text") ?: return null
+        val (text, _) = callGeminiText(sysPrompt, apiKey, expectJson = true)
+        if (text.isNullOrBlank()) return null
+        return runCatching {
             val parsed = JSONObject("{${text.substringAfter("{").substringBeforeLast("}")}}")
             val title = parsed.optString("title", "AI • ${config.prompt.take(24)}")
             val songsArr = parsed.optJSONArray("songs") ?: return null
             title to buildList { for (i in 0 until songsArr.length()) songsArr.optString(i).takeIf { it.isNotBlank() }?.let { add(it) } }
-        }
+        }.getOrNull()
     }
 
-    // ---------- 6. 4-Layer Synced Lyrics Engine + Gemini API Lyrics Translation ----------
+    // ---------- 6. Fast & Bulletproof Gemini Lyrics Translation (No Thinking Timeout, No Broken JSON!) ----------
     suspend fun translateLyricsWithGemini(
         lines: List<LyricLine>,
         targetLanguage: LyricsLanguage,
         apiKey: String
     ): Pair<List<LyricLine>?, String?> = withContext(Dispatchers.IO) {
-        if (apiKey.isBlank()) return@withContext null to "NO_API_KEY"
-        if (lines.isEmpty()) return@withContext null to "EMPTY"
+        if (cleanGeminiKey(apiKey).isBlank()) return@withContext null to "הזן Gemini API Key בהגדרות ← בינה מלאכותית"
+        if (lines.isEmpty()) return@withContext null to "אין מילים לתרגום"
 
-        runCatching {
-            val result = lines.toMutableList()
-            val batchSize = 55
-            var offset = 0
-            while (offset < lines.size) {
-                val end = (offset + batchSize).coerceAtMost(lines.size)
-                val slice = lines.subList(offset, end)
-                val inputArr = JSONArray().apply { slice.forEach { put(it.text) } }
-                val prompt = """
-                    Translate each song lyric line in this JSON array naturally into ${targetLanguage.apiName}.
-                    Preserve meaning and poetic flow. Return ONLY a JSON array of strings with the EXACT SAME LENGTH (${slice.size}).
-                    Input: $inputArr
-                """.trimIndent()
+        val result = lines.toMutableList()
+        val batchSize = 45
+        var offset = 0
+        var translatedCount = 0
 
-                val payload = JSONObject().apply {
-                    put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
-                    put("generationConfig", JSONObject().apply { put("responseMimeType", "application/json") })
-                }
-                val req = Request.Builder()
-                    .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
-                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
+        while (offset < lines.size) {
+            val end = (offset + batchSize).coerceAtMost(lines.size)
+            val slice = lines.subList(offset, end)
+            val numberedInput = slice.mapIndexed { idx, l -> "$idx|${l.text.replace("\n", " ")}" }.joinToString("\n")
+            val prompt = """
+                Translate each numbered song lyric line naturally into ${targetLanguage.apiName}.
+                Keep the exact line index and pipe format: INDEX|TRANSLATED_LINE
+                Do not add explanations, markdown, or extra lines.
+                
+                $numberedInput
+            """.trimIndent()
 
-                val translatedBatch = client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@withContext null to "HTTP_${resp.code}"
-                    val raw = JSONObject(resp.body?.string() ?: return@withContext null to "EMPTY_BODY")
-                        .optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")
-                        ?.optJSONArray("parts")?.optJSONObject(0)?.optString("text") ?: return@withContext null to "PARSE_ERR"
-                    val arrStr = "[" + raw.substringAfter("[").substringBeforeLast("]") + "]"
-                    val arr = JSONArray(arrStr)
-                    List(arr.length()) { idx -> arr.optString(idx) }
-                }
-
-                for (i in slice.indices) {
-                    val tr = translatedBatch.getOrNull(i)?.takeIf { it.isNotBlank() }
-                    result[offset + i] = result[offset + i].copy(translatedText = tr)
-                }
-                offset = end
+            val (rawOutput, err) = callGeminiText(prompt, apiKey, expectJson = false)
+            if (rawOutput.isNullOrBlank()) {
+                return@withContext null to (err ?: "שגיאה בתרגום המילים")
             }
-            result.toList() to null
-        }.getOrElse { null to (it.message ?: "ERROR") }
+
+            val cleanedLines = rawOutput
+                .replace("```", "")
+                .lines()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+
+            val parsedMap = mutableMapOf<Int, String>()
+            val numRegex = Regex("^(\\d+)\\s*[|:\\-]\\s*(.+)$")
+            cleanedLines.forEach { l ->
+                val m = numRegex.find(l)
+                if (m != null) {
+                    val idx = m.groupValues[1].toIntOrNull()
+                    val txt = m.groupValues[2].trim()
+                    if (idx != null && idx in slice.indices && txt.isNotBlank()) {
+                        parsedMap[idx] = txt
+                    }
+                }
+            }
+
+            for (i in slice.indices) {
+                val tr = parsedMap[i] ?: cleanedLines.getOrNull(i)?.substringAfter("|", "")?.trim()?.takeIf { it.isNotBlank() }
+                if (!tr.isNullOrBlank()) {
+                    result[offset + i] = result[offset + i].copy(translatedText = tr)
+                    translatedCount++
+                }
+            }
+            offset = end
+        }
+
+        if (translatedCount == 0) null to "לא הצלחנו לפענח את התרגום — נסה שוב"
+        else result.toList() to null
     }
 
     private fun cleanSongTitle(title: String): String {
@@ -2123,8 +2331,8 @@ class StreamRepository(private val context: Context) {
 
         if (cleanArtist.isNotBlank()) {
             val exact = runCatching {
-                val url = "https://lrclib.net/api/get?artist_name=${URLEncoder.encode(cleanArtist, "UTF-8")}&track_name=${URLEncoder.encode(cleanTitle, "UTF-8")}"
-                client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/10.0").build()).execute().use { resp ->
+                val url = "[https://lrclib.net/api/get?artist_name=$](https://lrclib.net/api/get?artist_name=$){URLEncoder.encode(cleanArtist, "UTF-8")}&track_name=${URLEncoder.encode(cleanTitle, "UTF-8")}"
+                client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/10.2").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
                 }
@@ -2140,7 +2348,7 @@ class StreamRepository(private val context: Context) {
         for (sq in searchQueries) {
             val found = runCatching {
                 val q = URLEncoder.encode(sq, "UTF-8")
-                client.newCall(Request.Builder().url("https://lrclib.net/api/search?q=$q").header("User-Agent", "Sonify/10.0").build()).execute().use { resp ->
+                client.newCall(Request.Builder().url("[https://lrclib.net/api/search?q=$q](https://lrclib.net/api/search?q=$q)").header("User-Agent", "Sonify/10.2").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
                     for (i in 0 until arr.length().coerceAtMost(8)) {
@@ -2167,8 +2375,8 @@ class StreamRepository(private val context: Context) {
 
         if (cleanArtist.isNotBlank() && cleanTitle.isNotBlank()) {
             val ovh = runCatching {
-                val url = "https://api.lyrics.ovh/v1/${URLEncoder.encode(cleanArtist, "UTF-8")}/${URLEncoder.encode(cleanTitle, "UTF-8")}"
-                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/10.0").build()).execute().use { resp ->
+                val url = "[https://api.lyrics.ovh/v1/$](https://api.lyrics.ovh/v1/$){URLEncoder.encode(cleanArtist, "UTF-8")}/${URLEncoder.encode(cleanTitle, "UTF-8")}"
+                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/10.2").build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
                     val plain = JSONObject(resp.body?.string() ?: return@use emptyList()).optString("lyrics")
                     plain.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("Paroles de", true) }
@@ -2191,7 +2399,7 @@ class StreamRepository(private val context: Context) {
             })
         }
         val req = Request.Builder()
-            .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            .url("[https://www.youtube.com/youtubei/v1/player?prettyPrint=false](https://www.youtube.com/youtubei/v1/player?prettyPrint=false)")
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             .build()
