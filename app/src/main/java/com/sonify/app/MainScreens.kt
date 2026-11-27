@@ -7,7 +7,9 @@ import android.net.Uri
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -33,10 +35,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -44,10 +49,12 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import kotlinx.coroutines.Dispatchers
@@ -60,6 +67,7 @@ import okhttp3.Request
 import org.json.JSONArray
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 
 private val liveSuggestClient = OkHttpClient.Builder()
     .connectTimeout(3, TimeUnit.SECONDS)
@@ -81,7 +89,7 @@ private suspend fun fetchLiveYouTubeSuggestions(query: String): List<String> = w
             val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
             val suggestions = arr.optJSONArray(1) ?: return@use emptyList()
             buildList {
-                for (i in 0 until suggestions.length().coerceAtMost(7)) {
+                for (i in 0 until suggestions.length().coerceAtMost(6)) {
                     val s = suggestions.optString(i).trim()
                     if (s.isNotBlank()) add(s)
                 }
@@ -126,9 +134,110 @@ fun ArtworkImage(url: String, contentDescription: String?, modifier: Modifier = 
     )
 }
 
+/**
+ * Enhanced Spotify-grade Playlist Cover Art supporting:
+ * - ARTIST_ONLY: Clean real artist portrait without song-art clutter
+ * - COLLAGE: 2x2 mosaic of up to 4 unique track artworks
+ * - MINIMAL: Clean custom gradient card with sticker & typography
+ * - AUTO: Standard AI cover art
+ */
+@Composable
+fun EnhancedPlaylistCoverArt(
+    playlist: Playlist,
+    useAiCovers: Boolean = true,
+    modifier: Modifier = Modifier
+) {
+    val mode = playlist.coverMode.uppercase()
+    when {
+        mode == "ARTIST_ONLY" && (playlist.artistCoverUrl.isNotBlank() || playlist.coverUrl.isNotBlank()) -> {
+            val img = playlist.artistCoverUrl.ifBlank { playlist.coverUrl }
+            val accent = Color(playlist.customCoverBgHex ?: 0xFF1DB954)
+            Box(modifier = modifier.clip(RoundedCornerShape(10.dp)).background(SpotifyCard)) {
+                ArtworkImage(img, playlist.name, Modifier.fillMaxSize())
+                Box(
+                    modifier = Modifier.fillMaxSize().background(
+                        Brush.verticalGradient(
+                            0f to Color.Transparent,
+                            0.55f to Color.Transparent,
+                            1f to Color.Black.copy(alpha = 0.78f)
+                        )
+                    )
+                )
+                Box(
+                    modifier = Modifier.align(Alignment.TopEnd).padding(6.dp)
+                        .clip(RoundedCornerShape(4.dp)).background(accent.copy(alpha = 0.88f))
+                        .padding(horizontal = 5.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        playlist.aiStyleTag.ifBlank { "ARTIST" }.take(8),
+                        color = Color.Black, fontSize = 8.sp, fontWeight = FontWeight.Black
+                    )
+                }
+                val label = playlist.customCoverText.ifBlank { playlist.name }
+                if (label.isNotBlank()) {
+                    Text(
+                        text = label,
+                        color = Color.White,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        maxLines = 2,
+                        lineHeight = 13.sp,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.align(Alignment.BottomStart).padding(8.dp)
+                    )
+                }
+            }
+        }
+
+        mode == "COLLAGE" && playlist.tracks.map { it.artworkUrl }.filter { it.isNotBlank() }.distinct().size >= 2 -> {
+            val arts = remember(playlist.tracks) {
+                val u = playlist.tracks.map { it.artworkUrl }.filter { it.isNotBlank() }.distinct()
+                List(4) { i -> u[i % u.size] }
+            }
+            Column(modifier = modifier.clip(RoundedCornerShape(10.dp)).background(SpotifyCard)) {
+                Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    ArtworkImage(arts[0], null, Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(0.dp)))
+                    ArtworkImage(arts[1], null, Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(0.dp)))
+                }
+                Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    ArtworkImage(arts[2], null, Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(0.dp)))
+                    ArtworkImage(arts[3], null, Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(0.dp)))
+                }
+            }
+        }
+
+        mode == "MINIMAL" -> {
+            val baseColor = Color(playlist.customCoverBgHex ?: 0xFF1DB954)
+            Box(
+                modifier = modifier.clip(RoundedCornerShape(10.dp))
+                    .background(Brush.linearGradient(listOf(baseColor, Color(0xFF141414)))),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(10.dp)) {
+                    if (playlist.customCoverSticker.isNotBlank()) {
+                        Text(playlist.customCoverSticker, fontSize = 30.sp)
+                        Spacer(Modifier.height(4.dp))
+                    }
+                    Text(
+                        text = playlist.customCoverText.ifBlank { playlist.name },
+                        color = Color.White,
+                        fontWeight = FontWeight.Black,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+
+        else -> AiPlaylistCoverArt(playlist = playlist, useAiCovers = useAiCovers, modifier = modifier)
+    }
+}
+
 @Composable
 fun PlaylistCoverBox(playlist: Playlist, modifier: Modifier = Modifier, useAiCovers: Boolean = true) {
-    AiPlaylistCoverArt(playlist = playlist, useAiCovers = useAiCovers, modifier = modifier)
+    EnhancedPlaylistCoverArt(playlist = playlist, useAiCovers = useAiCovers, modifier = modifier)
 }
 
 @Composable
@@ -144,10 +253,8 @@ fun TrackRowItem(
     isUnavailable: Boolean = false,
     showDownloadButton: Boolean = track.source != StreamSource.LOCAL,
     isEditOrderMode: Boolean = false,
-    canMoveUp: Boolean = false,
-    canMoveDown: Boolean = false,
-    onMoveUp: (() -> Unit)? = null,
-    onMoveDown: (() -> Unit)? = null,
+    dragHandleModifier: Modifier = Modifier,
+    isBeingDragged: Boolean = false,
     onRemoveFromPlaylist: (() -> Unit)? = null,
     onKeepSmartClick: (() -> Unit)? = null,
     onClick: () -> Unit,
@@ -159,13 +266,26 @@ fun TrackRowItem(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
-            .background(containerColor)
+            .background(if (isBeingDragged) SpotifyCard else containerColor)
             .alpha(if (isUnavailable) 0.42f else 1f)
             .spotifyPressClickable(pressedScale = 0.985f, onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        if (indexNumber != null) {
+        if (isEditOrderMode) {
+            Box(
+                modifier = dragHandleModifier.size(36.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Rounded.DragHandle,
+                    contentDescription = "Drag",
+                    tint = if (isBeingDragged) SpotifyGreen else SpotifySubtle,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            Spacer(Modifier.width(4.dp))
+        } else if (indexNumber != null) {
             Box(modifier = Modifier.width(26.dp), contentAlignment = Alignment.Center) {
                 if (isPlayingCurrent) {
                     SpotifyPlayingBars(isPlaying = isAudioPlaying, color = SpotifyGreen, size = 14.dp)
@@ -207,7 +327,12 @@ fun TrackRowItem(
             Spacer(Modifier.height(2.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (isOffline && !isLocal) {
-                    Icon(Icons.Rounded.DownloadDone, null, tint = SpotifyGreen, modifier = Modifier.size(13.dp).padding(end = 4.dp))
+                    Box(
+                        modifier = Modifier.padding(end = 5.dp).size(13.dp).clip(CircleShape).background(SpotifyGreen),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Rounded.ArrowDownward, null, tint = Color.Black, modifier = Modifier.size(9.dp))
+                    }
                 }
                 if (track.isExplicit) {
                     Box(
@@ -227,15 +352,9 @@ fun TrackRowItem(
         }
 
         if (isEditOrderMode) {
-            IconButton(onClick = { onMoveUp?.invoke() }, enabled = canMoveUp, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Rounded.ArrowUpward, "Up", tint = if (canMoveUp) SpotifyWhite else SpotifyMuted, modifier = Modifier.size(18.dp))
-            }
-            IconButton(onClick = { onMoveDown?.invoke() }, enabled = canMoveDown, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Rounded.ArrowDownward, "Down", tint = if (canMoveDown) SpotifyWhite else SpotifyMuted, modifier = Modifier.size(18.dp))
-            }
             if (onRemoveFromPlaylist != null) {
-                IconButton(onClick = onRemoveFromPlaylist, modifier = Modifier.size(32.dp)) {
-                    Icon(Icons.Rounded.Delete, "Remove", tint = Color(0xFFFF6B6B), modifier = Modifier.size(18.dp))
+                IconButton(onClick = onRemoveFromPlaylist, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Rounded.DeleteOutline, "Remove", tint = Color(0xFFFF6B6B), modifier = Modifier.size(20.dp))
                 }
             }
         } else {
@@ -251,19 +370,14 @@ fun TrackRowItem(
             }
 
             if (showDownloadButton && !isLocal) {
-                IconButton(onClick = onDownloadClick, modifier = Modifier.size(34.dp)) {
-                    when {
-                        isDownloading -> {
-                            if (downloadPct != null && downloadPct > 1) {
-                                Text("$downloadPct%", color = SpotifyGreen, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                            } else {
-                                CircularProgressIndicator(color = SpotifyGreen, strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
-                            }
-                        }
-                        isOffline -> Icon(Icons.Rounded.DownloadDone, "Downloaded", tint = SpotifyGreen, modifier = Modifier.size(19.dp))
-                        else -> Icon(Icons.Rounded.Download, "Download", tint = SpotifySubtle, modifier = Modifier.size(19.dp))
-                    }
-                }
+                SpotifyDownloadRingButton(
+                    isOffline = isOffline,
+                    isDownloading = isDownloading,
+                    progressPct = downloadPct,
+                    onClick = onDownloadClick,
+                    size = 21.dp,
+                    idleTint = SpotifySubtle
+                )
             }
 
             IconButton(onClick = onMoreClick, modifier = Modifier.size(34.dp)) {
@@ -279,7 +393,7 @@ private fun formatTrackDuration(ms: Long): String {
 }
 
 // =====================================================================
-// 1. INFINITE AI HOME SCREEN
+// 1. INFINITE AI HOME SCREEN (Full Offline Support + Taste-Aware YouTube Mixes)
 // =====================================================================
 @Composable
 fun HomeScreen(state: UiState, vm: AppViewModel) {
@@ -351,23 +465,62 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
+        // Dedicated Offline Mode Banner (clean, functional, 1-tap exit!)
+        if (state.settings.offlineMode) {
+            item(key = "home_offline_banner") {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1A2E25))
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                            Icon(Icons.Rounded.CloudOff, null, tint = SpotifyGreen, modifier = Modifier.size(22.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Column {
+                                Text(str.t("מצב אופליין פעיל", "Offline Mode Active"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                Text(str.t("מציג רק שירים שהורדו וקבצי מכשיר • קליפים חסומים", "Downloaded & local audio only • videos disabled"), color = SpotifySubtle, fontSize = 11.5.sp)
+                            }
+                        }
+                        TextButton(onClick = { vm.updateSettings(state.settings.copy(offlineMode = false)) }) {
+                            Text(str.t("חזור לאונליין", "Go Online"), color = SpotifyGreen, fontWeight = FontWeight.ExtraBold, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+
         item(key = "quick_grid") {
             val quickCards = buildList<Pair<String, () -> Unit>> {
                 add(str.likedSongs to { vm.openLikedSongsPlaylist() })
+                if (state.offlineTrackIds.isNotEmpty()) {
+                    add(str.offlineDownloads to { vm.openOfflineDownloadsPlaylist() })
+                }
                 if (state.localAudioTracks.isNotEmpty()) {
                     add(str.t("קבצי המכשיר", "Device Audio") to { vm.openLocalFilesPlaylist() })
                 }
                 state.homeMixPlaylists.take(3).forEach { pl -> add(pl.name to { vm.openPlaylist(pl) }) }
-                state.recentTracks.take(4).forEach { trk -> add(trk.title to { vm.playTrack(trk, state.recentTracks) }) }
+                if (!state.settings.offlineMode) {
+                    state.recentTracks.take(4).forEach { trk -> add(trk.title to { vm.playTrack(trk, state.recentTracks) }) }
+                }
             }.take(6)
 
             val quickArt = buildList<Pair<String, Playlist?>> {
                 add((state.likedTracks.firstOrNull()?.artworkUrl ?: "") to Playlist("ql", str.likedSongs, "Sonify", customCoverBgHex = 0xFF503750, aiStyleTag = "LIKED"))
+                if (state.offlineTrackIds.isNotEmpty()) {
+                    add("" to Playlist("qoff", str.offlineDownloads, "Sonify", customCoverBgHex = 0xFF006450, aiStyleTag = "OFFLINE"))
+                }
                 if (state.localAudioTracks.isNotEmpty()) {
                     add((state.localAudioTracks.firstOrNull()?.artworkUrl ?: "") to Playlist("qloc", str.t("קבצי המכשיר", "Device Audio"), "Device", customCoverBgHex = 0xFF1E3264, aiStyleTag = "LOCAL"))
                 }
                 state.homeMixPlaylists.take(3).forEach { pl -> add(pl.coverUrl to pl) }
-                state.recentTracks.take(4).forEach { trk -> add(trk.artworkUrl to null) }
+                if (!state.settings.offlineMode) {
+                    state.recentTracks.take(4).forEach { trk -> add(trk.artworkUrl to null) }
+                }
             }.take(6)
 
             Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -382,7 +535,7 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 if (plObj != null) {
-                                    AiPlaylistCoverArt(plObj, state.settings.aiUniqueCovers, Modifier.size(56.dp))
+                                    EnhancedPlaylistCoverArt(plObj, state.settings.aiUniqueCovers, Modifier.size(56.dp))
                                 } else {
                                     ArtworkImage(artUrl, title, Modifier.size(56.dp))
                                 }
@@ -399,7 +552,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Daylist + AI DJ Card (Direct Card onClick so it ALWAYS opens reliably!)
         item(key = "daylist_dj") {
             Spacer(Modifier.height(14.dp))
             Row(
@@ -414,7 +566,7 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
                         colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface)
                     ) {
                         Row(modifier = Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
-                            AiPlaylistCoverArt(dl, state.settings.aiUniqueCovers, Modifier.size(92.dp))
+                            EnhancedPlaylistCoverArt(dl, state.settings.aiUniqueCovers, Modifier.size(92.dp))
                             Column(modifier = Modifier.padding(10.dp).weight(1f)) {
                                 Text("DAYLIST", color = SpotifyGreen, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
                                 Text(dl.name, color = SpotifyWhite, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -460,7 +612,7 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
                 LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     items(state.homeMixPlaylists, key = { it.id }) { pl ->
                         Column(modifier = Modifier.width(148.dp).spotifyPressClickable { vm.openPlaylist(pl) }) {
-                            AiPlaylistCoverArt(pl, state.settings.aiUniqueCovers, Modifier.size(148.dp))
+                            EnhancedPlaylistCoverArt(pl, state.settings.aiUniqueCovers, Modifier.size(148.dp))
                             Spacer(Modifier.height(7.dp))
                             Text(pl.name, color = SpotifyWhite, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text(pl.countLabel(str), color = SpotifySubtle, fontSize = 11.sp)
@@ -470,7 +622,7 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        if (state.readyYoutubePlaylists.isNotEmpty() && state.settings.showYoutubePlaylistsHome) {
+        if (state.readyYoutubePlaylists.isNotEmpty() && state.settings.showYoutubePlaylistsHome && !state.settings.offlineMode) {
             item(key = "yt_ready_playlists") {
                 Spacer(Modifier.height(22.dp))
                 Row(
@@ -498,15 +650,16 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
         if (state.trendingSongs.isNotEmpty()) {
             item(key = "rec_header") {
                 Spacer(Modifier.height(22.dp))
-                val recTitle = when (state.homeFilter) {
-                    HomeFilter.AUDIOBOOKS -> str.topAudiobooks
-                    HomeFilter.PODCASTS -> str.topPodcasts
+                val recTitle = when {
+                    state.settings.offlineMode -> str.t("זמין להאזנה באופליין", "Available Offline")
+                    state.homeFilter == HomeFilter.AUDIOBOOKS -> str.topAudiobooks
+                    state.homeFilter == HomeFilter.PODCASTS -> str.topPodcasts
                     else -> str.recommendedSongs
                 }
                 Text(recTitle, color = SpotifyWhite, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 16.dp))
                 Spacer(Modifier.height(8.dp))
             }
-            items(state.trendingSongs.take(8), key = { "tr_${it.id}" }) { track ->
+            items(state.trendingSongs.take(12), key = { "tr_${it.id}" }) { track ->
                 Box(modifier = Modifier.padding(horizontal = 10.dp)) {
                     TrackRowItem(
                         track = track,
@@ -537,7 +690,7 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
                     LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         items(section.playlists, key = { it.id }) { pl ->
                             Column(modifier = Modifier.width(148.dp).spotifyPressClickable { vm.openPlaylist(pl) }) {
-                                AiPlaylistCoverArt(pl, state.settings.aiUniqueCovers, Modifier.size(148.dp))
+                                EnhancedPlaylistCoverArt(pl, state.settings.aiUniqueCovers, Modifier.size(148.dp))
                                 Spacer(Modifier.height(6.dp))
                                 Text(pl.name, color = SpotifyWhite, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(pl.countLabel(str), color = SpotifySubtle, fontSize = 11.sp)
@@ -607,7 +760,7 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
 }
 
 // =====================================================================
-// 2. SPOTIFY-STYLE LIVE TYPE-AHEAD SEARCH SCREEN + MOOD CARDS
+// 2. SEARCH SCREEN (Shows Artists + Live Type-Ahead + Offline Search!)
 // =====================================================================
 @Composable
 fun SearchScreen(state: UiState, vm: AppViewModel) {
@@ -617,21 +770,35 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
 
     var liveSuggestions by remember { mutableStateOf<List<String>>(emptyList()) }
     var instantTracks by remember { mutableStateOf<List<Track>>(emptyList()) }
+    var instantArtists by remember { mutableStateOf<List<SearchArtistResult>>(emptyList()) }
     var isFetchingLive by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.searchQuery, state.hasSearched, state.settings.offlineMode, state.searchMode) {
         val q = state.searchQuery.trim()
-        if (q.isEmpty() || state.hasSearched || state.settings.offlineMode) {
+        if (q.isEmpty() || state.hasSearched) {
             if (q.isEmpty()) {
                 liveSuggestions = emptyList()
                 instantTracks = emptyList()
+                instantArtists = emptyList()
             }
             isFetchingLive = false
             return@LaunchedEffect
         }
+        if (state.settings.offlineMode) {
+            val pool = (state.likedTracks + state.recentTracks + state.playlists.flatMap { it.tracks } + state.localAudioTracks)
+                .distinctBy { it.id }
+                .filter { it.id in state.offlineTrackIds || it.source == StreamSource.LOCAL }
+                .filter { it.title.contains(q, true) || it.artist.contains(q, true) }
+            instantTracks = pool.take(10)
+            instantArtists = emptyList()
+            liveSuggestions = emptyList()
+            isFetchingLive = false
+            return@LaunchedEffect
+        }
+
         isFetchingLive = true
         delay(170)
-        val (sugs, trks) = coroutineScope {
+        val (sugs, trks, arts) = coroutineScope {
             val sJob = async { fetchLiveYouTubeSuggestions(q) }
             val tJob = async {
                 runCatching {
@@ -644,11 +811,16 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                     )
                 }.getOrDefault(emptyList())
             }
-            sJob.await() to tJob.await()
+            val aJob = async {
+                if (state.searchMode == SearchMode.SONGS) runCatching { vm.repo.searchArtists(q, maxResults = 3) }.getOrDefault(emptyList())
+                else emptyList()
+            }
+            Triple(sJob.await(), tJob.await(), aJob.await())
         }
         if (state.searchQuery.trim() == q && !state.hasSearched) {
             liveSuggestions = sugs
             instantTracks = trks
+            instantArtists = arts
             isFetchingLive = false
         }
     }
@@ -673,7 +845,10 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                             .clickable { vm.setShowSettings(true); vm.setSettingsSection(SettingsSection.STREAM_QUALITY) }
                             .padding(horizontal = 10.dp, vertical = 5.dp)
                     ) {
-                        Text(state.settings.streamSource.label(isEn).substringBefore(" ("), color = SpotifyGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            if (state.settings.offlineMode) str.t("אופליין", "Offline") else state.settings.streamSource.label(isEn).substringBefore(" ("),
+                            color = SpotifyGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }
@@ -694,7 +869,10 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                     Spacer(Modifier.width(8.dp))
                     Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
                         if (state.searchQuery.isEmpty()) {
-                            Text(str.searchPlaceholder, color = Color(0xFF5A5A5A), fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                if (state.settings.offlineMode) str.t("חפש בהורדות ובקבצי המכשיר...", "Search offline & device audio...") else str.searchPlaceholder,
+                                color = Color(0xFF5A5A5A), fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
                         }
                         BasicTextField(
                             value = state.searchQuery,
@@ -708,7 +886,7 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                         )
                     }
                     if (state.searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { vm.onSearchQueryChange(""); liveSuggestions = emptyList(); instantTracks = emptyList() }, modifier = Modifier.size(26.dp)) {
+                        IconButton(onClick = { vm.onSearchQueryChange(""); liveSuggestions = emptyList(); instantTracks = emptyList(); instantArtists = emptyList() }, modifier = Modifier.size(26.dp)) {
                             Icon(Icons.Rounded.Close, "Clear", tint = Color(0xFF333333), modifier = Modifier.size(18.dp))
                         }
                     }
@@ -719,40 +897,47 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                     shape = RoundedCornerShape(8.dp),
                     contentPadding = PaddingValues(horizontal = 14.dp),
                     modifier = Modifier.height(48.dp)
-                ) {
-                    Text(str.go, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp)
-                }
+                ) { Text(str.go, fontWeight = FontWeight.ExtraBold, fontSize = 14.sp) }
             }
             Spacer(Modifier.height(10.dp))
         }
 
-        item(key = "search_modes") {
-            LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(SearchMode.entries) { mode ->
-                    val sel = state.searchMode == mode
-                    Box(
-                        modifier = Modifier.clip(RoundedCornerShape(50))
-                            .background(if (sel) SpotifyGreen else SpotifyCard)
-                            .spotifyPressClickable { vm.setSearchMode(mode, triggerSearch = state.hasSearched) }
-                            .padding(horizontal = 15.dp, vertical = 7.dp)
-                    ) {
-                        Text(mode.label(isEn), color = if (sel) Color.Black else SpotifyWhite, fontSize = 12.5.sp, fontWeight = FontWeight.Bold)
+        if (!state.settings.offlineMode) {
+            item(key = "search_modes") {
+                LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(SearchMode.entries) { mode ->
+                        val sel = state.searchMode == mode
+                        Box(
+                            modifier = Modifier.clip(RoundedCornerShape(50))
+                                .background(if (sel) SpotifyGreen else SpotifyCard)
+                                .spotifyPressClickable { vm.setSearchMode(mode, triggerSearch = state.hasSearched) }
+                                .padding(horizontal = 15.dp, vertical = 7.dp)
+                        ) {
+                            Text(mode.label(isEn), color = if (sel) Color.Black else SpotifyWhite, fontSize = 12.5.sp, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
+                Spacer(Modifier.height(10.dp))
             }
-            Spacer(Modifier.height(10.dp))
         }
 
         if (state.searchQuery.isNotBlank() && !state.hasSearched) {
-            if (isFetchingLive && liveSuggestions.isEmpty() && instantTracks.isEmpty()) {
+            if (isFetchingLive && liveSuggestions.isEmpty() && instantTracks.isEmpty() && instantArtists.isEmpty()) {
                 item(key = "live_loading") {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(color = SpotifyGreen, strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(10.dp))
-                        Text(str.t("מחפש הצעות ושירים...", "Finding live suggestions & songs..."), color = SpotifySubtle, fontSize = 13.sp)
+                        Text(str.t("מחפש אמנים, הצעות ושירים...", "Finding artists, suggestions & songs..."), color = SpotifySubtle, fontSize = 13.sp)
+                    }
+                }
+            }
+
+            // Live Artists Matches!
+            if (instantArtists.isNotEmpty()) {
+                items(instantArtists, key = { "lart_${it.name}_${it.browseId}" }) { art ->
+                    SearchArtistRow(artist = art, str = str) {
+                        focusManager.clearFocus()
+                        vm.openArtistPage(art.name, art.artworkUrl, art.browseId)
                     }
                 }
             }
@@ -765,23 +950,16 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                             val idx = suggestion.indexOf(qTrim, ignoreCase = true)
                             if (idx >= 0) {
                                 append(suggestion.substring(0, idx))
-                                withStyle(SpanStyle(color = SpotifyWhite, fontWeight = FontWeight.ExtraBold)) {
-                                    append(suggestion.substring(idx, idx + qTrim.length))
-                                }
-                                withStyle(SpanStyle(color = SpotifySubtle, fontWeight = FontWeight.Medium)) {
-                                    append(suggestion.substring(idx + qTrim.length))
-                                }
+                                withStyle(SpanStyle(color = SpotifyWhite, fontWeight = FontWeight.ExtraBold)) { append(suggestion.substring(idx, idx + qTrim.length)) }
+                                withStyle(SpanStyle(color = SpotifySubtle, fontWeight = FontWeight.Medium)) { append(suggestion.substring(idx + qTrim.length)) }
                             } else {
-                                withStyle(SpanStyle(color = SpotifyWhite, fontWeight = FontWeight.Medium)) {
-                                    append(suggestion)
-                                }
+                                withStyle(SpanStyle(color = SpotifyWhite, fontWeight = FontWeight.Medium)) { append(suggestion) }
                             }
                         }
                     }
                     Row(
-                        modifier = Modifier.fillMaxWidth()
-                            .clickable { focusManager.clearFocus(); vm.performSearch(suggestion) }
-                            .padding(horizontal = 16.dp, vertical = 11.dp),
+                        modifier = Modifier.fillMaxWidth().clickable { focusManager.clearFocus(); vm.performSearch(suggestion) }
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(Icons.Rounded.Search, null, tint = SpotifySubtle, modifier = Modifier.size(20.dp))
@@ -794,39 +972,9 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            val topArtist = instantTracks.firstOrNull()?.artist?.takeIf { it.isNotBlank() && !it.equals("YouTube", true) }
-            if (topArtist != null) {
-                item(key = "live_artist_jump") {
-                    Row(
-                        modifier = Modifier.fillMaxWidth()
-                            .clickable { focusManager.clearFocus(); vm.openArtistPage(topArtist, instantTracks.first().artworkUrl) }
-                            .padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        ArtworkImage(instantTracks.first().artworkUrl, topArtist, Modifier.size(48.dp).clip(CircleShape))
-                        Spacer(Modifier.width(12.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(topArtist, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Spacer(Modifier.width(5.dp))
-                                SpotifyVerifiedBadge(size = 15.dp)
-                            }
-                            Text(str.t("אמן • לחץ לפרופיל מלא", "Artist • Tap for full page"), color = SpotifySubtle, fontSize = 12.sp)
-                        }
-                        Icon(if (isEn) Icons.Rounded.ChevronRight else Icons.Rounded.ChevronLeft, null, tint = SpotifyMuted)
-                    }
-                }
-            }
-
             if (instantTracks.isNotEmpty()) {
                 item(key = "live_songs_header") {
-                    Text(
-                        str.t("תוצאות תואמות עכשיו", "Instant Matches"),
-                        color = SpotifyGreen,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
-                    )
+                    Text(str.t("תוצאות תואמות עכשיו", "Instant Matches"), color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
                 }
                 items(instantTracks, key = { "live_${it.id}" }) { track ->
                     Box(modifier = Modifier.padding(horizontal = 8.dp)) {
@@ -846,15 +994,8 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
             }
 
             item(key = "see_all_live") {
-                TextButton(
-                    onClick = { focusManager.clearFocus(); vm.performSearch() },
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
-                ) {
-                    Text(
-                        str.t("הצג את כל התוצאות והפלייליסטים עבור \"${state.searchQuery.trim()}\"", "See all results & playlists for \"${state.searchQuery.trim()}\""),
-                        color = SpotifyGreen,
-                        fontWeight = FontWeight.Bold
-                    )
+                TextButton(onClick = { focusManager.clearFocus(); vm.performSearch() }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
+                    Text(str.t("הצג את כל התוצאות והאמנים עבור \"${state.searchQuery.trim()}\"", "See all results & artists for \"${state.searchQuery.trim()}\""), color = SpotifyGreen, fontWeight = FontWeight.Bold)
                 }
             }
         } else if (state.hasSearched) {
@@ -864,7 +1005,7 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                         SpotifyMelodyDots(isPlaying = true, tint = SpotifyGreen, dotSize = 11.dp)
                     }
                 }
-            } else if (state.searchMode == SearchMode.PLAYLISTS) {
+            } else if (state.searchMode == SearchMode.PLAYLISTS && !state.settings.offlineMode) {
                 if (state.searchPlaylists.isEmpty()) {
                     item { Text(str.t("לא נמצאו פלייליסטים לחיפוש זה.", "No playlists found."), color = SpotifySubtle, modifier = Modifier.padding(20.dp)) }
                 } else {
@@ -885,7 +1026,20 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
             } else {
-                if (state.searchMode == SearchMode.SONGS && state.searchPlaylists.isNotEmpty()) {
+                // Dedicated Artists Results Section (Spotify-style!)
+                if (state.searchArtists.isNotEmpty()) {
+                    item(key = "search_artists_hdr") {
+                        Text(str.t("אמנים", "Artists"), color = SpotifyWhite, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
+                    }
+                    items(state.searchArtists.take(4), key = { "sart_${it.name}_${it.browseId}" }) { art ->
+                        SearchArtistRow(artist = art, str = str) {
+                            vm.openArtistPage(art.name, art.artworkUrl, art.browseId)
+                        }
+                    }
+                    item(key = "search_artists_div") { Spacer(Modifier.height(6.dp)) }
+                }
+
+                if (state.searchMode == SearchMode.SONGS && state.searchPlaylists.isNotEmpty() && !state.settings.offlineMode) {
                     item(key = "search_yt_pls_shelf") {
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
@@ -893,10 +1047,7 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(str.t("פלייליסטים תואמים מיוטיוב", "Matching YouTube Playlists"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                            Text(
-                                str.t("הכל", "See all"), color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                                modifier = Modifier.clickable { vm.setSearchMode(SearchMode.PLAYLISTS, triggerSearch = true) }
-                            )
+                            Text(str.t("הכל", "See all"), color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable { vm.setSearchMode(SearchMode.PLAYLISTS, triggerSearch = true) })
                         }
                         LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             items(state.searchPlaylists.take(8), key = { "srp_${it.id}" }) { rp ->
@@ -911,9 +1062,18 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
 
-                if (state.searchResults.isEmpty()) {
-                    item { Text(str.t("לא נמצאו תוצאות.", "No results found."), color = SpotifySubtle, modifier = Modifier.padding(20.dp)) }
-                } else {
+                if (state.searchResults.isEmpty() && state.searchArtists.isEmpty()) {
+                    item {
+                        Text(
+                            if (state.settings.offlineMode) str.t("לא נמצאו שירים תואמים בהורדות האופליין או בקבצי המכשיר.", "No matching offline or device songs found.")
+                            else str.t("לא נמצאו תוצאות.", "No results found."),
+                            color = SpotifySubtle, modifier = Modifier.padding(20.dp)
+                        )
+                    }
+                } else if (state.searchResults.isNotEmpty()) {
+                    item(key = "search_songs_hdr") {
+                        Text(str.t("שירים", "Songs"), color = SpotifyWhite, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+                    }
                     items(state.searchResults, key = { "res_${it.id}" }) { track ->
                         Box(modifier = Modifier.padding(horizontal = 8.dp)) {
                             TrackRowItem(
@@ -952,29 +1112,67 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            val grouped = vm.browseCategories.groupBy { it.displayGroup(isEn) }
-            grouped.forEach { (groupTitle, categories) ->
-                item(key = "grp_$groupTitle") {
-                    Text(groupTitle, color = SpotifyWhite, fontWeight = FontWeight.ExtraBold, fontSize = 17.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp))
-                }
-                items(categories.chunked(2), key = { pair -> "cat_${pair.first().titleEn}" }) { rowPair ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+            if (state.settings.offlineMode) {
+                item(key = "offline_search_hint") {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface)
                     ) {
-                        rowPair.forEach { cat ->
-                            SpotifyMoodBrowseCard(
-                                category = cat,
-                                isEn = isEn,
-                                onClick = { vm.performSearch(cat.query, modeOverride = cat.searchMode) },
-                                modifier = Modifier.weight(1f)
-                            )
+                        Column(modifier = Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Rounded.CloudOff, null, tint = SpotifyGreen, modifier = Modifier.size(34.dp))
+                            Spacer(Modifier.height(8.dp))
+                            Text(str.t("חיפוש במצב אופליין", "Offline Search"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            Spacer(Modifier.height(4.dp))
+                            Text(str.t("הקלד שם שיר או אמן לחיפוש מהיר בתוך ההורדות וקבצי המכשיר שלך.", "Type a song or artist to search your offline downloads and device audio."), color = SpotifySubtle, fontSize = 12.5.sp, textAlign = TextAlign.Center)
                         }
-                        if (rowPair.size == 1) Spacer(Modifier.weight(1f))
+                    }
+                }
+            } else {
+                val grouped = vm.browseCategories.groupBy { it.displayGroup(isEn) }
+                grouped.forEach { (groupTitle, categories) ->
+                    item(key = "grp_$groupTitle") {
+                        Text(groupTitle, color = SpotifyWhite, fontWeight = FontWeight.ExtraBold, fontSize = 17.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp))
+                    }
+                    items(categories.chunked(2), key = { pair -> "cat_${pair.first().titleEn}" }) { rowPair ->
+                        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            rowPair.forEach { cat ->
+                                SpotifyMoodBrowseCard(
+                                    category = cat,
+                                    isEn = isEn,
+                                    onClick = { vm.performSearch(cat.query, modeOverride = cat.searchMode) },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                            if (rowPair.size == 1) Spacer(Modifier.weight(1f))
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SearchArtistRow(artist: SearchArtistResult, str: AppStrings, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        ArtworkImage(artist.artworkUrl, artist.name, Modifier.size(52.dp).clip(CircleShape))
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(artist.name, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.width(5.dp))
+                SpotifyVerifiedBadge(size = 15.dp)
+            }
+            val sub = if (artist.subscribers.isNotBlank()) "${str.t("אמן", "Artist")} • ${artist.subscribers}" else str.t("אמן", "Artist")
+            Text(sub, color = SpotifySubtle, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Icon(if (str.isEn) Icons.Rounded.ChevronRight else Icons.Rounded.ChevronLeft, null, tint = SpotifyMuted)
     }
 }
 
@@ -1232,7 +1430,7 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
 }
 
 // =====================================================================
-// 4. PLAYLIST / ALBUM / PODCAST / AUDIOBOOK / LOCAL DETAIL SCREEN
+// 4. PLAYLIST / LIKED SONGS / ALBUM / LOCAL DETAIL SCREEN (Drag-to-Reorder + Full Liked Tools!)
 // =====================================================================
 @Composable
 fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
@@ -1240,13 +1438,24 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
     val isEn = str.isEn
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
+    val density = LocalDensity.current
 
     var searchInPl by remember(playlist.id) { mutableStateOf("") }
     var showRenameDialog by remember { mutableStateOf(false) }
     var renameInput by remember(playlist.name) { mutableStateOf(playlist.name) }
     var showPlOptions by remember { mutableStateOf(false) }
+    var showLikedOptions by remember { mutableStateOf(false) }
+    var showExportLikedDialog by remember { mutableStateOf(false) }
+    var exportLikedName by remember { mutableStateOf(str.t("השירים שאהבתי • אוסף", "My Liked Collection")) }
+    var showClearLikedConfirm by remember { mutableStateOf(false) }
     var showFolderPickerInSheet by remember { mutableStateOf(false) }
     var editOrderMode by remember(playlist.id) { mutableStateOf(false) }
+
+    // Smooth Spotify drag-to-reorder state
+    val rowHeightPx = remember(density) { with(density) { 68.dp.toPx() } }
+    var draggedTrackId by remember(playlist.id) { mutableStateOf<String?>(null) }
+    var dragOffsetY by remember(playlist.id) { mutableFloatStateOf(0f) }
+    val latestTracks by rememberUpdatedState(playlist.tracks)
 
     val filteredTracks = remember(playlist.tracks, searchInPl) {
         if (searchInPl.isBlank()) playlist.tracks
@@ -1255,6 +1464,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
     val isSmartOn = playlist.id in state.smartShuffledPlaylistIds
     val isAlbum = playlist.id.startsWith("MPRE") || playlist.id.startsWith("OLAK")
     val isLocalPlaylist = playlist.id == "virtual_local"
+    val isLikedPlaylist = playlist.id == "virtual_liked"
     val isUserOwned = !playlist.isRemote && !playlist.id.startsWith("virtual_")
     val isBulkDownloadingThis = state.activeBulkDownloadPlaylistId == playlist.id
     val allDownloaded = playlist.tracks.isNotEmpty() && playlist.tracks.all { it.id in state.offlineTrackIds || it.source == StreamSource.LOCAL }
@@ -1278,11 +1488,8 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                             Text(str.t("סיום עריכה", "Done"), color = SpotifyGreen, fontWeight = FontWeight.Bold)
                         }
                     }
-                    if (!isLocalPlaylist) {
-                        IconButton(onClick = {
-                            val code = if (isUserOwned) vm.buildSharedPlaylistCode(playlist) else "sonify:playlist:${playlist.id}"
-                            vm.setShowCodeFor(playlist.name to code)
-                        }) {
+                    if (!isLocalPlaylist && playlist.tracks.isNotEmpty()) {
+                        IconButton(onClick = { vm.setShowCodeFor(playlist.name to SonifyShareLinks.playlistUrl(playlist)) }) {
                             Icon(Icons.Rounded.QrCode2, "QR", tint = SpotifyWhite)
                         }
                     }
@@ -1294,6 +1501,10 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                         IconButton(onClick = { showFolderPickerInSheet = false; showPlOptions = true }) {
                             Icon(Icons.Rounded.MoreVert, "Options", tint = SpotifyWhite)
                         }
+                    } else if (isLikedPlaylist) {
+                        IconButton(onClick = { showLikedOptions = true }) {
+                            Icon(Icons.Rounded.MoreVert, "Liked Options", tint = SpotifyWhite)
+                        }
                     }
                 }
             }
@@ -1301,7 +1512,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
 
         item(key = "pl_header_art") {
             Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                AiPlaylistCoverArt(playlist, state.settings.aiUniqueCovers, Modifier.size(200.dp))
+                EnhancedPlaylistCoverArt(playlist, state.settings.aiUniqueCovers, Modifier.size(200.dp))
                 Spacer(Modifier.height(14.dp))
                 Text(playlist.name, color = SpotifyWhite, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Spacer(Modifier.height(4.dp))
@@ -1309,7 +1520,11 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                 if (playlist.description.isNotBlank()) {
                     Text(playlist.description, color = SpotifyMuted, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
                 }
-                if (isUserOwned && (playlist.isPinned || playlist.isCollaborative || playlist.isMixedMode || playlist.excludeFromTaste)) {
+                if (editOrderMode) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(str.t("החזק את הכפתור ≡ בצד השיר והחלק למעלה או למטה", "Hold ≡ on any song and drag up or down"), color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+                if (isUserOwned && !editOrderMode && (playlist.isPinned || playlist.isCollaborative || playlist.isMixedMode || playlist.excludeFromTaste)) {
                     Spacer(Modifier.height(8.dp))
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         if (playlist.isPinned) item { MiniBadge(str.t("נעוץ", "Pinned")) }
@@ -1368,40 +1583,54 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                                 }
                             }
                         } else {
-                            Box(
-                                modifier = Modifier.clip(RoundedCornerShape(50))
-                                    .background(
+                            if (!state.settings.offlineMode) {
+                                Box(
+                                    modifier = Modifier.clip(RoundedCornerShape(50))
+                                        .background(
+                                            when {
+                                                isBulkDownloadingThis -> Color(0xFF422020)
+                                                allDownloaded -> SpotifyGreen.copy(alpha = 0.2f)
+                                                else -> SpotifyCard
+                                            }
+                                        )
+                                        .spotifyPressClickable { vm.downloadEntirePlaylist(playlist) }
+                                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
                                         when {
-                                            isBulkDownloadingThis -> Color(0xFF422020)
-                                            allDownloaded -> SpotifyGreen.copy(alpha = 0.2f)
-                                            else -> SpotifyCard
-                                        }
-                                    )
-                                    .spotifyPressClickable { vm.downloadEntirePlaylist(playlist) }
-                                    .padding(horizontal = 12.dp, vertical = 8.dp)
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    when {
-                                        isBulkDownloadingThis -> {
-                                            CircularProgressIndicator(color = SpotifyGreen, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
-                                            Spacer(Modifier.width(6.dp))
-                                            Text("${state.bulkDownloadDone}/${state.bulkDownloadTotal} • ${str.cancel}", color = Color(0xFFFF8A80), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                        }
-                                        allDownloaded -> {
-                                            Icon(Icons.Rounded.DownloadDone, null, tint = SpotifyGreen, modifier = Modifier.size(16.dp))
-                                            Spacer(Modifier.width(5.dp))
-                                            Text(str.t("הכל באופליין", "Downloaded"), color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                        }
-                                        else -> {
-                                            Icon(Icons.Rounded.DownloadForOffline, null, tint = SpotifyWhite, modifier = Modifier.size(16.dp))
-                                            Spacer(Modifier.width(5.dp))
-                                            Text(str.downloadAll, color = SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                            isBulkDownloadingThis -> {
+                                                CircularProgressIndicator(color = SpotifyGreen, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
+                                                Spacer(Modifier.width(6.dp))
+                                                Text("${state.bulkDownloadDone}/${state.bulkDownloadTotal} • ${str.cancel}", color = Color(0xFFFF8A80), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                            allDownloaded -> {
+                                                Icon(Icons.Rounded.DownloadDone, null, tint = SpotifyGreen, modifier = Modifier.size(16.dp))
+                                                Spacer(Modifier.width(5.dp))
+                                                Text(str.t("הכל באופליין", "Downloaded"), color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                            else -> {
+                                                Icon(Icons.Rounded.DownloadForOffline, null, tint = SpotifyWhite, modifier = Modifier.size(16.dp))
+                                                Spacer(Modifier.width(5.dp))
+                                                Text(str.downloadAll, color = SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                            }
                                         }
                                     }
                                 }
                             }
 
-                            if (!isAlbum && !playlist.isPodcastPlaylist && !playlist.isAudiobookPlaylist) {
+                            if (isLikedPlaylist) {
+                                Box(
+                                    modifier = Modifier.clip(RoundedCornerShape(50)).background(SpotifyCard)
+                                        .spotifyPressClickable { showExportLikedDialog = true }
+                                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Rounded.PlaylistAdd, null, tint = SpotifyGreen, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(5.dp))
+                                        Text(str.t("ייצא לפלייליסט", "Export"), color = SpotifyWhite, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            } else if (!isAlbum && !playlist.isPodcastPlaylist && !playlist.isAudiobookPlaylist && !state.settings.offlineMode) {
                                 Box(
                                     modifier = Modifier.clip(RoundedCornerShape(50))
                                         .background(if (isSmartOn) SpotifyGreen else SpotifyCard)
@@ -1430,9 +1659,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                             modifier = Modifier.size(52.dp).clip(CircleShape).background(SpotifyGreen)
                                 .spotifyPressClickable(pressedScale = 0.90f) { vm.playTrack(playlist.tracks.first(), playlist.tracks) },
                             contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Rounded.PlayArrow, str.playAll, tint = Color.Black, modifier = Modifier.size(32.dp))
-                        }
+                        ) { Icon(Icons.Rounded.PlayArrow, str.playAll, tint = Color.Black, modifier = Modifier.size(32.dp)) }
                     }
                 }
                 Spacer(Modifier.height(10.dp))
@@ -1453,6 +1680,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                     Text(
                         when {
                             isLocalPlaylist -> str.t("לא נמצאו קובצי שמע במכשיר", "No local audio files found")
+                            isLikedPlaylist -> str.t("עדיין אין שירים שאהבת", "No Liked Songs yet")
                             isAlbum -> str.t("לא נמצאו רצועות באלבום זה", "No tracks found in this album")
                             else -> str.t("הפלייליסט עדיין ריק", "This playlist is empty")
                         },
@@ -1460,21 +1688,17 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                     )
                     if (isLocalPlaylist) {
                         Spacer(Modifier.height(14.dp))
-                        Button(
-                            onClick = { vm.openLocalFilesPlaylist() },
-                            colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
-                            shape = RoundedCornerShape(50)
-                        ) { Text(str.t("סרוק מכשיר עכשיו", "Scan Device Now"), fontWeight = FontWeight.Bold) }
-                    } else if (!isAlbum) {
+                        Button(onClick = { vm.openLocalFilesPlaylist() }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), shape = RoundedCornerShape(50)) {
+                            Text(str.t("סרוק מכשיר עכשיו", "Scan Device Now"), fontWeight = FontWeight.Bold)
+                        }
+                    } else if (!isAlbum && !isLikedPlaylist && !state.settings.offlineMode) {
                         Spacer(Modifier.height(4.dp))
                         Text(str.t("חפש שירים להוסיף או תן ל-AI למלא אותו בשבילך.", "Search songs to add or let AI fill it for you."), color = SpotifySubtle, fontSize = 13.sp)
                         Spacer(Modifier.height(16.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Button(
-                                onClick = { vm.openPlaylist(null); vm.selectTab(MainTab.SEARCH) },
-                                colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
-                                shape = RoundedCornerShape(50)
-                            ) { Text(str.t("הוסף שירים", "Add Songs"), fontWeight = FontWeight.Bold) }
+                            Button(onClick = { vm.openPlaylist(null); vm.selectTab(MainTab.SEARCH) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), shape = RoundedCornerShape(50)) {
+                                Text(str.t("הוסף שירים", "Add Songs"), fontWeight = FontWeight.Bold)
+                            }
                             OutlinedButton(onClick = { vm.loadMoreTracksForPlaylist(playlist) }, shape = RoundedCornerShape(50)) {
                                 Icon(Icons.Rounded.AutoAwesome, null, tint = SpotifyGreen, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(5.dp))
@@ -1485,11 +1709,46 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                 }
             }
         } else {
-            itemsIndexed(filteredTracks, key = { idx, it -> "plt_${idx}_${it.id}_${it.isSmartInjected}" }) { _, track ->
+            val canDragReorder = editOrderMode && isUserOwned && searchInPl.isBlank()
+            itemsIndexed(filteredTracks, key = { idx, it -> "plt_${it.id}_${it.isSmartInjected}_$idx" }) { _, track ->
                 val isUnavailable = (state.settings.offlineMode && track.id !in state.offlineTrackIds && track.source != StreamSource.LOCAL) || track.id in state.hiddenTrackIds
                 if (!isUnavailable || state.settings.showUnplayableSongs) {
-                    val realIdx = playlist.tracks.indexOfFirst { it.id == track.id }
-                    Box(modifier = Modifier.padding(horizontal = 8.dp)) {
+                    val isBeingDragged = canDragReorder && draggedTrackId == track.id
+                    val handleMod = if (canDragReorder) {
+                        Modifier.pointerInput(track.id) {
+                            detectDragGestures(
+                                onDragStart = { draggedTrackId = track.id; dragOffsetY = 0f },
+                                onDragEnd = { draggedTrackId = null; dragOffsetY = 0f },
+                                onDragCancel = { draggedTrackId = null; dragOffsetY = 0f },
+                                onDrag = { change, dragAmount ->
+                                    change.consume()
+                                    dragOffsetY += dragAmount.y
+                                    val steps = (dragOffsetY / rowHeightPx).roundToInt()
+                                    if (steps != 0) {
+                                        val curIdx = latestTracks.indexOfFirst { it.id == track.id }
+                                        if (curIdx >= 0) {
+                                            val targetIdx = (curIdx + steps).coerceIn(0, latestTracks.lastIndex)
+                                            if (targetIdx != curIdx) {
+                                                vm.movePlaylistTrack(playlist.id, curIdx, targetIdx)
+                                                dragOffsetY -= (targetIdx - curIdx) * rowHeightPx
+                                            }
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                    } else Modifier
+
+                    Box(
+                        modifier = Modifier
+                            .padding(horizontal = 8.dp)
+                            .zIndex(if (isBeingDragged) 10f else 0f)
+                            .graphicsLayer {
+                                translationY = if (isBeingDragged) dragOffsetY else 0f
+                                scaleX = if (isBeingDragged) 1.02f else 1f
+                                scaleY = if (isBeingDragged) 1.02f else 1f
+                            }
+                    ) {
                         TrackRowItem(
                             track = track,
                             isOffline = track.id in state.offlineTrackIds,
@@ -1498,12 +1757,10 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                             isPlayingCurrent = state.currentTrack?.id == track.id,
                             isAudioPlaying = state.isPlaying,
                             isUnavailable = isUnavailable,
-                            showDownloadButton = !isLocalPlaylist && track.source != StreamSource.LOCAL,
-                            isEditOrderMode = editOrderMode && isUserOwned && searchInPl.isBlank(),
-                            canMoveUp = realIdx > 0,
-                            canMoveDown = realIdx in 0 until playlist.tracks.lastIndex,
-                            onMoveUp = { if (realIdx > 0) vm.movePlaylistTrack(playlist.id, realIdx, realIdx - 1) },
-                            onMoveDown = { if (realIdx in 0 until playlist.tracks.lastIndex) vm.movePlaylistTrack(playlist.id, realIdx, realIdx + 1) },
+                            showDownloadButton = !isLocalPlaylist && track.source != StreamSource.LOCAL && !state.settings.offlineMode,
+                            isEditOrderMode = canDragReorder,
+                            dragHandleModifier = handleMod,
+                            isBeingDragged = isBeingDragged,
                             onRemoveFromPlaylist = if (isUserOwned) { { vm.removeTrackFromPlaylist(playlist.id, track.id) } } else null,
                             onKeepSmartClick = if (track.isSmartInjected) { { vm.keepSmartTrackInPlaylist(playlist.id, track) } } else null,
                             onClick = { vm.playTrack(track, playlist.tracks) },
@@ -1514,7 +1771,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                 }
             }
 
-            if (!playlist.id.startsWith("virtual_") && !isAlbum) {
+            if (!playlist.id.startsWith("virtual_") && !isAlbum && !state.settings.offlineMode) {
                 item(key = "pl_load_more") {
                     val moreLabel = when {
                         playlist.isAudiobookPlaylist -> str.t("טען עוד ספרי שמע", "Load more audiobooks")
@@ -1534,6 +1791,66 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
         }
     }
 
+    // Complete Liked Songs Options Sheet
+    if (showLikedOptions && isLikedPlaylist) {
+        ModalBottomSheet(onDismissRequest = { showLikedOptions = false }, containerColor = SpotifyDarkSurface, contentColor = SpotifyWhite) {
+            Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp)) {
+                Text(str.likedSongs, fontWeight = FontWeight.ExtraBold, fontSize = 19.sp)
+                Text("${playlist.tracks.size} ${str.songs}", color = SpotifySubtle, fontSize = 12.sp)
+                HorizontalDivider(color = SpotifyCard, modifier = Modifier.padding(vertical = 12.dp))
+                OptionSheetRow(Icons.Rounded.PlaylistAdd, str.t("ייצוא לפלייליסט חדש", "Export to New Playlist"), tint = SpotifyGreen) { showLikedOptions = false; showExportLikedDialog = true }
+                OptionSheetRow(Icons.Rounded.AccessTime, str.t("מיין לפי תאריך הוספה (חדש לישן)", "Sort: Recently Added")) { showLikedOptions = false; vm.sortLikedSongs("recent") }
+                OptionSheetRow(Icons.Rounded.History, str.t("מיין לפי ותק (ישן לחדש)", "Sort: Oldest First")) { showLikedOptions = false; vm.sortLikedSongs("oldest") }
+                OptionSheetRow(Icons.Rounded.SortByAlpha, str.t("מיין א'-ב' לפי שם שיר", "Sort: Title A-Z")) { showLikedOptions = false; vm.sortLikedSongs("title") }
+                OptionSheetRow(Icons.Rounded.Person, str.t("מיין א'-ב' לפי אמן", "Sort: Artist A-Z")) { showLikedOptions = false; vm.sortLikedSongs("artist") }
+                OptionSheetRow(Icons.Rounded.Shuffle, str.t("ערבב סדר רשימה קבוע", "Shuffle Order Permanently")) { showLikedOptions = false; vm.sortLikedSongs("shuffle") }
+                OptionSheetRow(Icons.Rounded.AutoFixHigh, str.t("נקה כפילויות", "Remove Duplicates")) { showLikedOptions = false; vm.removeDuplicatesFromLikedSongs() }
+                if (!state.settings.offlineMode && playlist.tracks.isNotEmpty()) {
+                    OptionSheetRow(Icons.Rounded.DownloadForOffline, str.t("הורד את כל השירים שאהבת לאופליין", "Download All Liked Offline")) { showLikedOptions = false; vm.downloadEntirePlaylist(playlist) }
+                }
+                if (playlist.tracks.isNotEmpty()) {
+                    OptionSheetRow(Icons.Rounded.Share, str.t("שתף אוסף כקישור אמיתי", "Share Collection Link")) {
+                        val link = SonifyShareLinks.playlistUrl(playlist)
+                        clipboard.setText(AnnotatedString(link))
+                        showLikedOptions = false
+                        context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"; putExtra(Intent.EXTRA_TEXT, "השירים שאהבתי ב-Sonify:\n$link")
+                        }, str.t("שתף", "Share")))
+                    }
+                    HorizontalDivider(color = SpotifyCard, modifier = Modifier.padding(vertical = 8.dp))
+                    OptionSheetRow(Icons.Rounded.DeleteSweep, str.t("נקה את כל השירים שאהבת", "Clear All Liked Songs"), tint = Color(0xFFFF6B6B)) { showLikedOptions = false; showClearLikedConfirm = true }
+                }
+                Spacer(Modifier.height(16.dp))
+            }
+        }
+    }
+
+    if (showExportLikedDialog) {
+        AlertDialog(
+            onDismissRequest = { showExportLikedDialog = false },
+            containerColor = SpotifyDarkSurface,
+            title = { Text(str.t("ייצוא השירים שאהבת לפלייליסט", "Export Liked Songs to Playlist"), color = SpotifyWhite) },
+            text = { OutlinedTextField(value = exportLikedName, onValueChange = { exportLikedName = it }, label = { Text(str.t("שם הפלייליסט החדש", "New Playlist Name")) }, singleLine = true) },
+            confirmButton = {
+                TextButton(onClick = { vm.exportLikedSongsToPlaylist(exportLikedName); showExportLikedDialog = false }) {
+                    Text(str.t("ייצא", "Export"), color = SpotifyGreen, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = { TextButton(onClick = { showExportLikedDialog = false }) { Text(str.cancel, color = SpotifySubtle) } }
+        )
+    }
+
+    if (showClearLikedConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearLikedConfirm = false },
+            containerColor = SpotifyDarkSurface,
+            title = { Text(str.t("ניקוי השירים שאהבת", "Clear Liked Songs?"), color = SpotifyWhite) },
+            text = { Text(str.t("פעולה זו תסיר את כל השירים מרשימת האהובים. ניתן לייצא לפלייליסט קודם.", "This removes all songs from Liked Songs. You can export to a playlist first."), color = SpotifySubtle) },
+            confirmButton = { TextButton(onClick = { vm.clearAllLikedSongs(); showClearLikedConfirm = false }) { Text(str.t("נקה הכל", "Clear All"), color = Color(0xFFFF6B6B), fontWeight = FontWeight.Bold) } },
+            dismissButton = { TextButton(onClick = { showClearLikedConfirm = false }) { Text(str.cancel, color = SpotifySubtle) } }
+        )
+    }
+
     if (showPlOptions && isUserOwned) {
         ModalBottomSheet(onDismissRequest = { showPlOptions = false }, containerColor = SpotifyDarkSurface, contentColor = SpotifyWhite) {
             Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp)) {
@@ -1543,28 +1860,24 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                 if (showFolderPickerInSheet) {
                     Text(str.t("בחר תיקייה לפלייליסט:", "Assign to folder:"), color = SpotifySubtle, fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
-                    OptionSheetRow(Icons.Rounded.FolderOff, str.t("ללא תיקייה (ראשי)", "No Folder (Root)"), tint = if (playlist.folderId == null) SpotifyGreen else SpotifyWhite) {
-                        vm.assignPlaylistToFolder(playlist.id, null); showPlOptions = false
-                    }
+                    OptionSheetRow(Icons.Rounded.FolderOff, str.t("ללא תיקייה (ראשי)", "No Folder (Root)"), tint = if (playlist.folderId == null) SpotifyGreen else SpotifyWhite) { vm.assignPlaylistToFolder(playlist.id, null); showPlOptions = false }
                     state.folders.forEach { f ->
-                        OptionSheetRow(Icons.Rounded.Folder, f.name, tint = if (playlist.folderId == f.id) SpotifyGreen else SpotifyWhite) {
-                            vm.assignPlaylistToFolder(playlist.id, f.id); showPlOptions = false
-                        }
+                        OptionSheetRow(Icons.Rounded.Folder, f.name, tint = if (playlist.folderId == f.id) SpotifyGreen else SpotifyWhite) { vm.assignPlaylistToFolder(playlist.id, f.id); showPlOptions = false }
                     }
                 } else {
                     OptionSheetRow(Icons.Rounded.Edit, str.t("שנה שם פלייליסט", "Rename Playlist")) { showPlOptions = false; showRenameDialog = true }
-                    OptionSheetRow(Icons.Rounded.SwapVert, str.t("ערוך סדר שירים / מחק שירים", "Reorder / Remove Tracks")) { showPlOptions = false; editOrderMode = !editOrderMode }
-                    OptionSheetRow(Icons.Rounded.Palette, str.t("ערוך עטיפת פלייליסט", "Edit Cover Art")) { showPlOptions = false; vm.setEditingCoverPlaylist(playlist.id) }
+                    OptionSheetRow(Icons.Rounded.DragHandle, str.t("סדר שירים בגרירה / מחיקה", "Drag-Reorder / Remove Tracks")) { showPlOptions = false; editOrderMode = !editOrderMode }
+                    OptionSheetRow(Icons.Rounded.Palette, str.t("סטודיו עטיפות (כולל אמן בלבד)", "Cover Art Studio (Artist Only & More)")) { showPlOptions = false; vm.setEditingCoverPlaylist(playlist.id) }
                     if (state.folders.isNotEmpty()) {
                         OptionSheetRow(Icons.Rounded.Folder, str.t("העבר לתיקייה", "Move to Folder")) { showFolderPickerInSheet = true }
                     }
-                    OptionSheetRow(Icons.Rounded.Share, str.t("שתף פלייליסט לחבר (קוד ללא ענן)", "Share Playlist Code (No Cloud)"), tint = SpotifyGreen) {
-                        val token = vm.buildSharedPlaylistCode(playlist)
-                        clipboard.setText(AnnotatedString(token))
+                    OptionSheetRow(Icons.Rounded.Share, str.t("שתף קישור אמיתי לחבר", "Share Clickable Link"), tint = SpotifyGreen) {
+                        val link = SonifyShareLinks.playlistUrl(playlist)
+                        clipboard.setText(AnnotatedString(link))
                         showPlOptions = false
                         context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
                             type = "text/plain"
-                            putExtra(Intent.EXTRA_TEXT, "הפלייליסט שלי \"${playlist.name}\" ב-Sonify! הדבק בסורק/ייבוא:\n$token")
+                            putExtra(Intent.EXTRA_TEXT, "הפלייליסט שלי \"${playlist.name}\" ב-Sonify — לחץ לפתיחה באפליקציה:\n$link")
                         }, str.t("שתף פלייליסט", "Share Playlist")))
                     }
                     OptionSheetRow(Icons.Rounded.PushPin, if (playlist.isPinned) str.t("הסר נעיצה", "Unpin") else str.t("נעץ לראש הספרייה", "Pin to Top")) { showPlOptions = false; vm.togglePinPlaylist(playlist.id) }
@@ -1732,7 +2045,7 @@ fun LibraryScreen(state: UiState, vm: AppViewModel) {
                     if (state.libraryFilter != LibraryFilter.OFFLINE) {
                         LibrarySpecialRow(str.likedSongs, "${state.likedTracks.size} ${str.songs}", 0xFF503750, Icons.Rounded.Favorite) { vm.openLikedSongsPlaylist() }
                     }
-                    LibrarySpecialRow(str.offlineDownloads, "${state.offlineTrackIds.size} ${str.songs}", 0xFF006450, Icons.Rounded.DownloadDone) { vm.openOfflineDownloadsPlaylist() }
+                    LibrarySpecialRow(str.offlineDownloads, "${state.offlineTrackIds.size} ${str.songs} • ${String.format("%.1f", vm.repo.getOfflineSizeMb())} MB", 0xFF006450, Icons.Rounded.DownloadDone) { vm.openOfflineDownloadsPlaylist() }
                     LibrarySpecialRow(
                         str.t("קבצי שמע במכשיר", "Device Audio Files"),
                         "${state.localAudioTracks.size} ${str.songs} • ${str.t("אחסון מקומי", "Local Storage")}",
@@ -1763,9 +2076,7 @@ fun LibraryScreen(state: UiState, vm: AppViewModel) {
                         Text(folder.name, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                         Text("$count ${str.t("פלייליסטים", "playlists")}", color = SpotifySubtle, fontSize = 12.sp)
                     }
-                    IconButton(onClick = { vm.deleteFolder(folder.id) }) {
-                        Icon(Icons.Rounded.Delete, "Delete Folder", tint = SpotifyMuted, modifier = Modifier.size(18.dp))
-                    }
+                    IconButton(onClick = { vm.deleteFolder(folder.id) }) { Icon(Icons.Rounded.Delete, "Delete Folder", tint = SpotifyMuted, modifier = Modifier.size(18.dp)) }
                 }
             }
         }
@@ -1838,7 +2149,7 @@ fun LibraryScreen(state: UiState, vm: AppViewModel) {
                     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         row.forEach { pl ->
                             Column(modifier = Modifier.weight(1f).spotifyPressClickable { vm.openPlaylist(pl) }) {
-                                AiPlaylistCoverArt(pl, state.settings.aiUniqueCovers, Modifier.fillMaxWidth().aspectRatio(1f))
+                                EnhancedPlaylistCoverArt(pl, state.settings.aiUniqueCovers, Modifier.fillMaxWidth().aspectRatio(1f))
                                 Spacer(Modifier.height(6.dp))
                                 Text(pl.name, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(pl.countLabel(str), color = SpotifySubtle, fontSize = 11.sp)
@@ -1854,7 +2165,7 @@ fun LibraryScreen(state: UiState, vm: AppViewModel) {
                             .padding(horizontal = 16.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        AiPlaylistCoverArt(pl, state.settings.aiUniqueCovers, Modifier.size(58.dp))
+                        EnhancedPlaylistCoverArt(pl, state.settings.aiUniqueCovers, Modifier.size(58.dp))
                         Spacer(Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1910,7 +2221,7 @@ private fun LibrarySpecialRow(title: String, subtitle: String, bgHex: Long, icon
 }
 
 // =====================================================================
-// 6. DEDICATED AI DJ STUDIO OVERLAY (Zero ModalBottomSheet Conflicts!)
+// 6. DEDICATED AI DJ STUDIO OVERLAY
 // =====================================================================
 @Composable
 fun AiDjStudioOverlay(state: UiState, vm: AppViewModel) {
@@ -1952,11 +2263,7 @@ fun AiDjStudioOverlay(state: UiState, vm: AppViewModel) {
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 18.dp)
             ) {
-                // Drag Handle
-                Box(
-                    modifier = Modifier.align(Alignment.CenterHorizontally)
-                        .width(40.dp).height(4.dp).clip(RoundedCornerShape(50)).background(SpotifyMuted)
-                )
+                Box(modifier = Modifier.align(Alignment.CenterHorizontally).width(40.dp).height(4.dp).clip(RoundedCornerShape(50)).background(SpotifyMuted))
                 Spacer(Modifier.height(14.dp))
 
                 Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
@@ -1970,9 +2277,7 @@ fun AiDjStudioOverlay(state: UiState, vm: AppViewModel) {
                             Text(str.t("בחר סגנון מוכן או תאר ל-AI איזה סט לנגן", "Pick a vibe or write your own AI DJ set"), color = SpotifySubtle, fontSize = 12.sp)
                         }
                     }
-                    IconButton(onClick = { vm.setShowDjStudioSheet(false) }) {
-                        Icon(Icons.Rounded.Close, "Close", tint = SpotifySubtle)
-                    }
+                    IconButton(onClick = { vm.setShowDjStudioSheet(false) }) { Icon(Icons.Rounded.Close, "Close", tint = SpotifySubtle) }
                 }
 
                 Spacer(Modifier.height(16.dp))
@@ -1990,9 +2295,7 @@ fun AiDjStudioOverlay(state: UiState, vm: AppViewModel) {
                                     .clickable { selectedPresetIdx = idx; customStyleInput = "" }
                                     .padding(horizontal = 8.dp, vertical = 10.dp),
                                 contentAlignment = Alignment.Center
-                            ) {
-                                Text(label, color = if (sel) Color.Black else SpotifyWhite, fontSize = 11.5.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
+                            ) { Text(label, color = if (sel) Color.Black else SpotifyWhite, fontSize = 11.5.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                         }
                         repeat(3 - rowItems.size) { Spacer(Modifier.weight(1f)) }
                     }
@@ -2052,7 +2355,7 @@ fun AiDjStudioOverlay(state: UiState, vm: AppViewModel) {
 }
 
 // =====================================================================
-// 7. CREATE (+) HUB SHEET (Uniform White Color + No New Folder Option!)
+// 7. COMPLETE CREATE (+) HUB SHEET (Uniform White + Full New Playlist + Auto AI Count!)
 // =====================================================================
 @Composable
 fun CreateHubSheet(state: UiState, vm: AppViewModel) {
@@ -2061,11 +2364,18 @@ fun CreateHubSheet(state: UiState, vm: AppViewModel) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
 
-    // 0=Menu, 1=New Playlist, 2=AI Studio, 3=Cloudless Blend, 5=Live Jam
+    // 0=Menu, 1=New Playlist (Complete!), 2=AI Studio (Auto Count!), 3=Cloudless Blend, 5=Live Jam
     var tab by remember { mutableIntStateOf(0) }
     var plName by remember { mutableStateOf("") }
+    var plDesc by remember { mutableStateOf("") }
+    var plPublic by remember { mutableStateOf(true) }
     var plCollab by remember { mutableStateOf(false) }
+    var plCoverMode by remember { mutableStateOf("AUTO") }
+    var plBgHex by remember { mutableLongStateOf(0xFF1DB954) }
+    var plSeedLikedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+
     var aiPrompt by remember { mutableStateOf("") }
+    var aiAutoCount by remember { mutableStateOf(true) }
     var aiCount by remember { mutableIntStateOf(25) }
     var aiLang by remember { mutableStateOf("משולב") }
     var aiEnergy by remember { mutableStateOf("מאוזן") }
@@ -2095,32 +2405,103 @@ fun CreateHubSheet(state: UiState, vm: AppViewModel) {
                     OptionSheetRow(Icons.Rounded.GraphicEq, str.t("AI DJ אישי — בחירת סגנון וקול", "Personal AI DJ — Style & Voice"), tint = SpotifyWhite) { vm.startAiDj() }
                     OptionSheetRow(Icons.Rounded.Groups, str.t("סשן Jam חי (פתיחה / הצטרפות ללא חשבון)", "Live Jam Room (Host or Join — No Cloud)"), tint = SpotifyWhite) { tab = 5 }
                     OptionSheetRow(Icons.Rounded.Diversity2, str.t("Blend עם חבר (קוד טעם ללא ענן)", "Blend with Friend (Cloudless Taste Code)"), tint = SpotifyWhite) { tab = 3 }
-                    OptionSheetRow(Icons.Rounded.FileDownload, str.t("ייבוא פלייליסט מקישור / קוד / טקסט", "Import Playlist (Link / Code / Text)"), tint = SpotifyWhite) { vm.setShowCreateSheet(false); vm.setShowImportSheet(true) }
+                    OptionSheetRow(Icons.Rounded.FileDownload, str.t("ייבוא פלייליסט (YouTube / Spotify / טקסט)", "Import Playlist (YouTube / Spotify / Text)"), tint = SpotifyWhite) { vm.setShowCreateSheet(false); vm.setShowImportSheet(true) }
                 }
                 1 -> {
-                    Text(str.t("פלייליסט חדש", "New Playlist"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text(str.t("פלייליסט חדש", "New Playlist"), fontSize = 19.sp, fontWeight = FontWeight.ExtraBold)
                     Spacer(Modifier.height(10.dp))
                     OutlinedTextField(value = plName, onValueChange = { plName = it }, label = { Text(str.t("שם הפלייליסט", "Playlist Name")) }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(value = plDesc, onValueChange = { plDesc = it }, label = { Text(str.t("תיאור (אופציונלי)", "Description (optional)")) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(10.dp))
+
+                    Text(str.t("סגנון עטיפה:", "Cover Style:"), color = SpotifySubtle, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    val coverModes = listOf("AUTO" to str.t("אוטומטי", "Auto"), "ARTIST_ONLY" to str.t("אמן בלבד", "Artist Only"), "COLLAGE" to str.t("קולאז'", "Collage"), "MINIMAL" to str.t("מינימליסטי", "Minimal"))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(coverModes) { (key, lbl) ->
+                            FilterChip(selected = plCoverMode == key, onClick = { plCoverMode = key }, label = { Text(lbl, fontSize = 12.sp) })
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    val colors = listOf(0xFF1DB954L, 0xFF503750L, 0xFF1E3264L, 0xFFE8115BL, 0xFFBC5900L, 0xFF006450L)
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        items(colors) { hex ->
+                            Box(
+                                modifier = Modifier.size(30.dp).clip(CircleShape).background(Color(hex))
+                                    .then(if (plBgHex == hex) Modifier.border(2.5.dp, SpotifyWhite, CircleShape) else Modifier)
+                                    .clickable { plBgHex = hex }
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text(str.t("פלייליסט ציבורי", "Public Playlist"), color = SpotifyWhite, fontSize = 14.sp)
+                        Switch(checked = plPublic, onCheckedChange = { plPublic = it }, colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = SpotifyGreen))
+                    }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
-                            Text(str.t("פלייליסט שיתופי", "Collaborative Playlist"), color = SpotifyWhite, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            Text(str.t("ניתן לשתף עם חברים דרך קוד QR או העתקה", "Shareable with friends via code or QR"), color = SpotifySubtle, fontSize = 11.sp)
+                            Text(str.t("פלייליסט שיתופי", "Collaborative Playlist"), color = SpotifyWhite, fontSize = 14.sp)
+                            Text(str.t("ניתן לשתף בקישור אמיתי או QR", "Shareable via real link or QR"), color = SpotifySubtle, fontSize = 11.sp)
                         }
                         Switch(checked = plCollab, onCheckedChange = { plCollab = it }, colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = SpotifyGreen))
                     }
-                    Spacer(Modifier.height(14.dp))
-                    Button(onClick = { vm.createPlaylist(plName, isCollaborative = plCollab) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), shape = RoundedCornerShape(50), modifier = Modifier.fillMaxWidth()) {
-                        Text(str.create, fontWeight = FontWeight.Bold)
+
+                    if (state.likedTracks.isNotEmpty()) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(str.t("הוספה מהירה מהשירים שאהבת (${plSeedLikedIds.size} נבחרו):", "Quick-add from Liked (${plSeedLikedIds.size} selected):"), color = SpotifySubtle, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(6.dp))
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(state.likedTracks.take(15), key = { "seed_${it.id}" }) { trk ->
+                                val picked = trk.id in plSeedLikedIds
+                                FilterChip(
+                                    selected = picked,
+                                    onClick = { plSeedLikedIds = if (picked) plSeedLikedIds - trk.id else plSeedLikedIds + trk.id },
+                                    label = { Text(trk.title.take(18), fontSize = 11.5.sp, maxLines = 1) }
+                                )
+                            }
+                        }
                     }
+
+                    Spacer(Modifier.height(14.dp))
+                    Button(
+                        onClick = {
+                            val chosenTracks = state.likedTracks.filter { it.id in plSeedLikedIds }
+                            vm.createPlaylist(plName, initialTracks = chosenTracks, isCollaborative = plCollab, description = plDesc, isPublic = plPublic, coverBgHex = plBgHex, coverMode = plCoverMode)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
+                        shape = RoundedCornerShape(50),
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(str.create, fontWeight = FontWeight.ExtraBold) }
                 }
                 2 -> {
                     Text(str.aiStudioTitle, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold, color = SpotifyGreen)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(value = aiPrompt, onValueChange = { aiPrompt = it }, label = { Text(str.t("תאר סגנון, אווירה, אמן או פעילות...", "Describe vibe, genre, artist or activity...")) }, minLines = 2, modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(10.dp))
-                    Text("${str.t("מספר שירים:", "Track count:")} $aiCount", color = SpotifySubtle, fontSize = 12.sp)
-                    Slider(value = aiCount.toFloat(), onValueChange = { aiCount = it.toInt() }, valueRange = 10f..50f, colors = SliderDefaults.colors(thumbColor = SpotifyGreen, activeTrackColor = SpotifyGreen))
+
+                    // Auto Track Count by AI Switch!
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(SpotifyCard).padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(str.t("ה-AI יבחר את מספר השירים", "Let AI Choose Track Count"), color = SpotifyWhite, fontSize = 13.5.sp, fontWeight = FontWeight.Bold)
+                            Text(str.t("מתאים אוטומטית את אורך הפלייליסט לפעילות ולאווירה", "Automatically matches length to your vibe"), color = SpotifySubtle, fontSize = 11.sp)
+                        }
+                        Switch(checked = aiAutoCount, onCheckedChange = { aiAutoCount = it }, colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = SpotifyGreen))
+                    }
+
+                    if (!aiAutoCount) {
+                        Spacer(Modifier.height(8.dp))
+                        Text("${str.t("מספר שירים ידני:", "Manual track count:")} $aiCount", color = SpotifySubtle, fontSize = 12.sp)
+                        Slider(value = aiCount.toFloat(), onValueChange = { aiCount = it.toInt() }, valueRange = 10f..50f, colors = SliderDefaults.colors(thumbColor = SpotifyGreen, activeTrackColor = SpotifyGreen))
+                    }
+
+                    Spacer(Modifier.height(8.dp))
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(listOf("משולב", "עברית", "אנגלית")) { l -> FilterChip(selected = aiLang == l, onClick = { aiLang = l }, label = { Text(l) }) }
                     }
@@ -2132,7 +2513,7 @@ fun CreateHubSheet(state: UiState, vm: AppViewModel) {
                     }
                     Spacer(Modifier.height(12.dp))
                     Button(
-                        onClick = { vm.createAiPlaylist(AiPlaylistConfig(aiPrompt, aiCount, aiLang, aiEnergy, aiEra)) },
+                        onClick = { vm.createAiPlaylist(AiPlaylistConfig(aiPrompt, aiCount, aiAutoCount, aiLang, aiEnergy, aiEra)) },
                         colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
                         shape = RoundedCornerShape(50),
                         modifier = Modifier.fillMaxWidth()
@@ -2140,55 +2521,45 @@ fun CreateHubSheet(state: UiState, vm: AppViewModel) {
                 }
                 3 -> {
                     val myTasteCode = remember { vm.buildMyBlendTasteCode() }
-                    val isPastedCode = friendCodeOrName.trim().startsWith("sonify:blend:", true)
+                    val myBlendLink = remember(myTasteCode) { SonifyShareLinks.blendUrl(myTasteCode) }
+                    val isPastedCode = friendCodeOrName.trim().contains("sonify:blend:", true) || friendCodeOrName.trim().contains("/blend/", true)
                     Text(str.t("Blend עם חבר (ללא חשבון ענן)", "Friend Blend (Zero Cloud Accounts)"), fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, color = SpotifyGreen)
                     Spacer(Modifier.height(6.dp))
-                    Text(
-                        str.t("בלי שרת חשבונות: כל אחד שולח קוד טעם קצר שמכיל את האמנים האהובים עליו — או מזינים ידנית את האמנים של החבר.", "No cloud accounts needed: exchange a short Taste Code containing your favorite artists, or enter your friend's artists manually."),
-                        color = SpotifySubtle, fontSize = 12.sp
-                    )
+                    Text(str.t("שלח קישור Blend לחבר — לחיצה עליו תפתח אצלו מיד את Sonify ותמזג את הטעם שלכם.", "Send your Blend link — tapping it launches Sonify directly and merges your tastes."), color = SpotifySubtle, fontSize = 12.sp)
                     Spacer(Modifier.height(12.dp))
                     Card(colors = CardDefaults.cardColors(containerColor = SpotifyCard), shape = RoundedCornerShape(12.dp)) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            Text(str.t("1. שלח לחבר את קוד הטעם שלך:", "1. Send your Taste Code to a friend:"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text(str.t("1. שלח לחבר את קישור הטעם שלך:", "1. Send your Blend link to a friend:"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                             Spacer(Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(myTasteCode)) }, modifier = Modifier.weight(1f)) {
+                                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(myBlendLink)) }, modifier = Modifier.weight(1f)) {
                                     Icon(Icons.Rounded.ContentCopy, null, tint = SpotifyWhite, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(4.dp)); Text(str.t("העתק", "Copy"), color = SpotifyWhite, fontSize = 12.sp)
                                 }
                                 OutlinedButton(onClick = {
                                     context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
                                         type = "text/plain"
-                                        putExtra(Intent.EXTRA_TEXT, "בוא ניצור Blend ב-Sonify! הדבק את קוד הטעם שלי:\n$myTasteCode")
+                                        putExtra(Intent.EXTRA_TEXT, "בוא ניצור Blend ב-Sonify! לחץ על הקישור:\n$myBlendLink")
                                     }, "Blend"))
                                 }, modifier = Modifier.weight(1f)) {
                                     Icon(Icons.Rounded.Share, null, tint = SpotifyGreen, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(4.dp)); Text(str.t("שתף", "Share"), color = SpotifyWhite, fontSize = 12.sp)
                                 }
-                                IconButton(onClick = { vm.setShowCreateSheet(false); vm.setShowCodeFor("Blend Taste Code" to myTasteCode) }) {
+                                IconButton(onClick = { vm.setShowCreateSheet(false); vm.setShowCodeFor("Blend" to myBlendLink) }) {
                                     Icon(Icons.Rounded.QrCode2, "QR", tint = SpotifyWhite)
                                 }
                             }
                         }
                     }
                     Spacer(Modifier.height(14.dp))
-                    Text(str.t("2. הדבק קוד של חבר (או הזן שם ואמנים):", "2. Paste friend's Taste Code (or enter manually):"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text(str.t("2. הדבק קישור/קוד של חבר (או הזן שם ואמנים):", "2. Paste friend's link/code (or enter manually):"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     Spacer(Modifier.height(6.dp))
-                    OutlinedTextField(
-                        value = friendCodeOrName,
-                        onValueChange = { friendCodeOrName = it },
-                        label = { Text(str.t("קוד sonify:blend:... או שם החבר", "sonify:blend:... code or Friend Name")) },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                    OutlinedTextField(value = friendCodeOrName, onValueChange = { friendCodeOrName = it }, label = { Text(str.t("קישור Blend או שם החבר", "Blend link/code or Friend Name")) }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     if (!isPastedCode) {
                         Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
-                            value = friendManualArtists,
-                            onValueChange = { friendManualArtists = it },
+                            value = friendManualArtists, onValueChange = { friendManualArtists = it },
                             label = { Text(str.t("אמנים שהחבר אוהב (מופרד בפסיקים, אופציונלי)", "Friend's favorite artists (comma separated, optional)")) },
                             placeholder = { Text(str.t("למשל: עומר אדם, The Weeknd, אושר כהן", "e.g. Drake, The Weeknd, Imagine Dragons")) },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
+                            singleLine = true, modifier = Modifier.fillMaxWidth()
                         )
                     }
                     Spacer(Modifier.height(12.dp))
@@ -2202,29 +2573,20 @@ fun CreateHubSheet(state: UiState, vm: AppViewModel) {
                 5 -> {
                     Text(str.t("Jam חי — האזנה משותפת ללא חשבון", "Live Jam — Shared Listening (No Cloud Account)"), fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, color = SpotifyGreen)
                     Spacer(Modifier.height(6.dp))
-                    Text(str.t("פתח חדר משותף ושלח קוד או QR לחברים — השיר, ההשהיה והזמן יסתנכרנו בזמן אמת.", "Start a room and share the code or QR — track, play/pause & timeline sync in real time."), color = SpotifySubtle, fontSize = 12.sp)
+                    Text(str.t("פתח חדר משותף ושלח קישור אמיתי או QR לחברים — השיר, ההשהיה והזמן יסתנכרנו בזמן אמת.", "Start a room and share a clickable link or QR — track, play/pause & timeline sync in real time."), color = SpotifySubtle, fontSize = 12.sp)
                     Spacer(Modifier.height(12.dp))
-                    Button(
-                        onClick = { vm.startJamSession() },
-                        colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
-                        shape = RoundedCornerShape(50),
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text(str.startJam, fontWeight = FontWeight.ExtraBold) }
+                    Button(onClick = { vm.startJamSession() }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black), shape = RoundedCornerShape(50), modifier = Modifier.fillMaxWidth()) {
+                        Text(str.startJam, fontWeight = FontWeight.ExtraBold)
+                    }
                     HorizontalDivider(color = SpotifyCard, modifier = Modifier.padding(vertical = 14.dp))
                     Text(str.t("או הצטרף לחדר קיים של חבר:", "Or join a friend's room:"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(value = jamJoinInput, onValueChange = { jamJoinInput = it }, placeholder = { Text(str.joinJam) }, singleLine = true, modifier = Modifier.weight(1f))
-                        Button(onClick = { vm.joinJamByCode(jamJoinInput) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyCard)) {
-                            Text(str.t("הצטרף", "Join"), color = SpotifyWhite, fontWeight = FontWeight.Bold)
-                        }
+                        Button(onClick = { vm.joinJamByCode(jamJoinInput) }, colors = ButtonDefaults.buttonColors(containerColor = SpotifyCard)) { Text(str.t("הצטרף", "Join"), color = SpotifyWhite, fontWeight = FontWeight.Bold) }
                     }
                     Spacer(Modifier.height(8.dp))
-                    OutlinedButton(
-                        onClick = { vm.setShowCreateSheet(false); vm.setShowCodeFor(str.t("סרוק QR של Jam", "Scan Jam QR") to "") },
-                        shape = RoundedCornerShape(50),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
+                    OutlinedButton(onClick = { vm.setShowCreateSheet(false); vm.setShowCodeFor(str.t("סרוק QR של Jam", "Scan Jam QR") to "") }, shape = RoundedCornerShape(50), modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Rounded.QrCodeScanner, null, tint = SpotifyGreen, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(str.t("סרוק קוד QR להצטרפות", "Scan QR Code to Join"), color = SpotifyWhite)
@@ -2242,6 +2604,7 @@ fun CreateHubSheet(state: UiState, vm: AppViewModel) {
 @Composable
 fun TrackOptionsBottomSheet(track: Track, state: UiState, vm: AppViewModel) {
     val str = state.strings
+    val context = LocalContext.current
     val isLiked = state.likedTracks.any { it.id == track.id }
     val isHidden = track.id in state.hiddenTrackIds
     val isLocal = track.source == StreamSource.LOCAL
@@ -2301,10 +2664,21 @@ fun TrackOptionsBottomSheet(track: Track, state: UiState, vm: AppViewModel) {
                     }
                     OptionSheetRow(Icons.Rounded.QueueMusic, str.t("הוסף לתור ההשמעה", "Add to Queue")) { vm.addToQueue(track); vm.openTrackOptions(null) }
                     OptionSheetRow(Icons.Rounded.Person, str.t("עבור לדף האמן", "Go to Artist")) { vm.openTrackOptions(null); vm.openArtistPage(track.artist, track.artworkUrl) }
-                    OptionSheetRow(Icons.Rounded.Radio, str.startRadio) { vm.startSongOrArtistRadio(track) }
+                    if (!state.settings.offlineMode) {
+                        OptionSheetRow(Icons.Rounded.Radio, str.startRadio) { vm.startSongOrArtistRadio(track) }
+                    }
                     if (!isLocal) {
-                        OptionSheetRow(Icons.Rounded.Download, str.t("הורד להאזנה אופליין", "Download Offline")) { vm.downloadOffline(track); vm.openTrackOptions(null) }
-                        OptionSheetRow(Icons.Rounded.QrCode2, str.t("קוד QR ושיתוף שיר", "QR Code & Share")) { vm.openTrackOptions(null); vm.setShowCodeFor(track.title to SonifyLinkCodec.buildSmartTrackLink(track, 0L)) }
+                        if (!state.settings.offlineMode) {
+                            OptionSheetRow(Icons.Rounded.Download, str.t("הורד אודיו להאזנה אופליין", "Download Audio Offline")) { vm.downloadOffline(track); vm.openTrackOptions(null) }
+                        }
+                        OptionSheetRow(Icons.Rounded.Share, str.t("שתף קישור אמיתי לשיר", "Share Clickable Track Link")) {
+                            val link = SonifyShareLinks.trackUrl(track, 0L)
+                            vm.openTrackOptions(null)
+                            context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"; putExtra(Intent.EXTRA_TEXT, "${track.title} - ${track.artist}\n$link")
+                            }, str.t("שתף שיר", "Share Track")))
+                        }
+                        OptionSheetRow(Icons.Rounded.QrCode2, str.t("קוד QR לשיר", "Track QR Code")) { vm.openTrackOptions(null); vm.setShowCodeFor(track.title to SonifyShareLinks.trackUrl(track, 0L)) }
                     }
                     OptionSheetRow(Icons.Rounded.Send, str.t("שלח לחבר בצ'אט", "Send to Friend")) { subMode = 2 }
                     OptionSheetRow(Icons.Rounded.Block, str.t("החרג את ${track.artist} מהמלצות", "Exclude ${track.artist} from taste")) { vm.toggleExcludeArtistFromTaste(track.artist); vm.openTrackOptions(null) }
