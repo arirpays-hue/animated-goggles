@@ -1,6 +1,7 @@
 package com.sonify.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -37,16 +38,41 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 class MainActivity : ComponentActivity() {
 
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+    private val pendingDeepLinkState = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         requestStartupPermissions()
+        extractDeepLink(intent)?.let { pendingDeepLinkState.value = it }
 
         setContent {
             val vm: AppViewModel = viewModel()
             val state by vm.uiState.collectAsState()
+            val incomingLink by pendingDeepLinkState
+
+            LaunchedEffect(incomingLink) {
+                val link = incomingLink ?: return@LaunchedEffect
+                pendingDeepLinkState.value = null
+                vm.handleIncomingDeepLink(link)
+            }
+
             SonifyRootApp(state = state, vm = vm)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        extractDeepLink(intent)?.let { pendingDeepLinkState.value = it }
+    }
+
+    private fun extractDeepLink(intent: Intent?): String? {
+        if (intent == null) return null
+        return when (intent.action) {
+            Intent.ACTION_VIEW -> intent.dataString?.takeIf { it.isNotBlank() }
+            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
+            else -> null
         }
     }
 
@@ -110,7 +136,6 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
         MaterialTheme(colorScheme = darkColors) {
             Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
 
-                // Keeps WebPlaybackEngine permanently attached for seamless audio & screen-off playback
                 if (!(state.showNowPlaying && state.isVideoMode)) {
                     AndroidView(
                         factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
@@ -119,7 +144,6 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
                     )
                 }
 
-                // Main Content Layer
                 when {
                     state.showSettings -> SettingsScreen(state, vm)
                     state.openedArtist != null -> ArtistPageScreen(state.openedArtist, state, vm)
@@ -131,7 +155,6 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
                     }
                 }
 
-                // Bottom Overlay: Floating Mini-Player + Spotify Custom Navigation Bar
                 if (!state.showSettings && !state.showNowPlaying) {
                     Column(
                         modifier = Modifier
@@ -153,7 +176,6 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
                     }
                 }
 
-                // Smooth Spotify Slide-Up Now Playing Screen
                 AnimatedVisibility(
                     visible = state.showNowPlaying && state.currentTrack != null,
                     enter = slideInVertically(initialOffsetY = { it / 2 }) + fadeIn(),
@@ -162,7 +184,6 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
                     NowPlayingScreen(state = state, vm = vm)
                 }
 
-                // Global Modals & Sheets
                 if (state.showDevicesSheet) DevicesBottomSheet(state, vm)
                 if (state.showCreateSheet) CreateHubSheet(state, vm)
                 if (state.showStatsSheet) StatsWrappedSheet(state, vm)
@@ -178,7 +199,6 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
                     state.playlists.firstOrNull { it.id == plId }?.let { pl -> CoverArtCreatorSheet(pl, vm, str) }
                 }
 
-                // Dedicated AI DJ Studio Overlay rendered at top Z-index (always opens above Home, Create & Now Playing!)
                 AnimatedVisibility(
                     visible = state.showDjStudioSheet,
                     enter = slideInVertically(initialOffsetY = { it / 2 }) + fadeIn(),
