@@ -207,7 +207,7 @@ class StreamRepository(private val context: Context) {
     suspend fun searchArtists(query: String, maxResults: Int = 8): List<SearchArtistResult> = withContext(Dispatchers.IO) {
         val clean = query.trim()
         if (clean.isBlank()) return@withContext emptyList()
-        val found = runCatching {
+        runCatching {
             val bodyJson = JSONObject().apply {
                 put("query", clean)
                 put("params", "EgWKAQIgAWoKEAkQBRAKEAMQBA==")
@@ -232,7 +232,6 @@ class StreamRepository(private val context: Context) {
                     }
             }
         }.getOrDefault(emptyList())
-        found
     }
 
     suspend fun searchArtistTracks(artistName: String, settings: AppSettings): List<Track> = withContext(Dispatchers.IO) {
@@ -241,7 +240,7 @@ class StreamRepository(private val context: Context) {
         (s1 + s2).distinctBy { it.id }.take(35)
     }
 
-    // ---------- 1B. Real Artist Photo + Full Now Playing Extras (Spotify-Grade!) ----------
+    // ---------- 1B. Real Artist Photo + Full Now Playing Extras (Spotify-Grade) ----------
     suspend fun fetchArtistPhotoUrl(artistName: String): String = withContext(Dispatchers.IO) {
         val clean = cleanArtistName(artistName).ifBlank { artistName.trim() }
         if (clean.isBlank() || clean.equals("YouTube", true) || clean.equals("אמן", true)) return@withContext ""
@@ -929,7 +928,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 2. Playlists Search, Browse & Complete Multi-Source Import (YouTube + Spotify + Text!) ----------
+    // ---------- 2. Playlists Search, Browse & Complete Multi-Source Import (YouTube + Spotify + Text) ----------
     suspend fun searchPlaylists(query: String): List<RemotePlaylist> = withContext(Dispatchers.IO) {
         val combined = mutableListOf<RemotePlaylist>()
 
@@ -1101,13 +1100,6 @@ class StreamRepository(private val context: Context) {
         emptyList()
     }
 
-    /**
-     * Full multi-source playlist importer:
-     * 1. YouTube / YouTube Music playlist links (`list=...`)
-     * 2. Spotify playlist / album / track links (scrapes Spotify embed JSON — zero API key needed!)
-     * 3. Single YouTube / youtu.be video links
-     * 4. Multi-line song lists (up to 60 lines, resolved in parallel 4x batches!)
-     */
     suspend fun importPlaylistFromTextOrUrl(rawInput: String, settings: AppSettings): Pair<String?, List<Track>> = withContext(Dispatchers.IO) {
         val trimmed = rawInput.trim()
 
@@ -1141,7 +1133,7 @@ class StreamRepository(private val context: Context) {
             if (tracks.isNotEmpty()) return@withContext null to tracks
         }
 
-        // 4. Plain-Text Song List (one song per line, parallel batches of 4!)
+        // 4. Plain-Text Song List (parallel batches of 4)
         val lines = trimmed.lines()
             .map { it.replace(Regex("^\\d+[.)\\s-]+"), "").trim() }
             .filter { it.length >= 2 && !it.startsWith("http", true) }
@@ -1201,7 +1193,7 @@ class StreamRepository(private val context: Context) {
 
     private fun ytMusicContext(): JSONObject = JSONObject().apply {
         put("client", JSONObject().apply {
-            put("clientName", "WEB_REMIX"); put("clientVersion", "1.20250219.01.00"); put("hl", "he"); put("gl", "IL")
+            put("clientName", "WEB_REMIX"); put("clientVersion", "1.20260401.01.00"); put("hl", "he"); put("gl", "IL")
         })
     }
 
@@ -1490,30 +1482,30 @@ class StreamRepository(private val context: Context) {
         val (clientObj, ua, idHeader, verHeader) = when (clientType) {
             "ANDROID_VR" -> Quad(
                 JSONObject().apply {
+                    put("clientName", "ANDROID_VR"); put("clientVersion", "1.65.10")
+                    put("androidSdkVersion", 32); put("osName", "Android"); put("osVersion", "12L")
+                    put("deviceMake", "Oculus"); put("deviceModel", "Quest 3"); put("hl", "he"); put("gl", "IL")
+                },
+                "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                "28", "1.65.10"
+            )
+            "IOS" -> Quad(
+                JSONObject().apply {
+                    put("clientName", "IOS"); put("clientVersion", "20.14.2")
+                    put("deviceMake", "Apple"); put("deviceModel", "iPhone16,2")
+                    put("osName", "iPhone"); put("osVersion", "18.4.0.22E240"); put("hl", "he"); put("gl", "IL")
+                },
+                "com.google.ios.youtube/20.14.2 (iPhone16,2; U; CPU iOS 18_4_0 like Mac OS X)",
+                "5", "20.14.2"
+            )
+            else -> Quad(
+                JSONObject().apply {
                     put("clientName", "ANDROID_VR"); put("clientVersion", "1.62.27")
                     put("androidSdkVersion", 32); put("osName", "Android"); put("osVersion", "12L")
                     put("deviceMake", "Oculus"); put("deviceModel", "Quest 3"); put("hl", "he"); put("gl", "IL")
                 },
                 "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
                 "28", "1.62.27"
-            )
-            "IOS" -> Quad(
-                JSONObject().apply {
-                    put("clientName", "IOS"); put("clientVersion", "20.11.6")
-                    put("deviceMake", "Apple"); put("deviceModel", "iPhone16,2")
-                    put("osName", "iPhone"); put("osVersion", "18.3.2.22D82"); put("hl", "he"); put("gl", "IL")
-                },
-                "com.google.ios.youtube/20.11.6 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)",
-                "5", "20.11.6"
-            )
-            else -> Quad(
-                JSONObject().apply {
-                    put("clientName", "ANDROID_VR"); put("clientVersion", "1.56.21")
-                    put("androidSdkVersion", 32); put("osName", "Android"); put("osVersion", "12L")
-                    put("deviceMake", "Oculus"); put("deviceModel", "Quest 3"); put("hl", "he"); put("gl", "IL")
-                },
-                "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-                "28", "1.56.21"
             )
         }
         val bodyJson = JSONObject().apply {
@@ -1673,7 +1665,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 4. Upgraded Multi-Provider AI Engine (Deep Taste Profile + YouTube Mixes + Auto Count!) ----------
+    // ---------- 4. Upgraded Multi-Provider AI Engine (Deep Taste Profile + YouTube Mixes + Auto Count) ----------
     private fun computeWeightedTasteArtists(
         likedTracks: List<Track>,
         recentTracks: List<Track>,
@@ -1715,7 +1707,6 @@ class StreamRepository(private val context: Context) {
 
         val tasteArtists = computeWeightedTasteArtists(likedTracks, recentTracks, followedArtists, stats, excludedArtists)
 
-        // Taste-aware YouTube Music Playlists every 2nd/3rd scroll batch!
         if (!isPod && !isBook && settings.showYoutubePlaylistsHome && pageIndex % 2 == 1) {
             val idxA = (pageIndex / 2) % tasteArtists.size.coerceAtLeast(1)
             val a1 = tasteArtists.getOrNull(idxA)
@@ -2106,10 +2097,20 @@ class StreamRepository(private val context: Context) {
         else result.toList() to null
     }
 
-    // ---------- 6. 6-Source Synced Lyrics Engine + Offline Lyrics Cache ----------
+    // ---------- 6. 7-Source Parallel Synced Lyrics Engine + Offline Lyrics Cache ----------
+    private fun JSONObject.safeStr(key: String): String {
+        if (isNull(key)) return ""
+        val v = optString(key, "").trim()
+        return if (v.equals("null", true)) "" else v
+    }
+
     private fun lyricsCacheFile(trackId: String): File {
         val safe = trackId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
         return File(lyricsCacheDir, "$safe.json")
+    }
+
+    fun clearLyricsCache() {
+        runCatching { lyricsCacheDir.listFiles()?.forEach { it.delete() } }
     }
 
     fun getCachedLyrics(trackId: String): List<LyricLine> {
@@ -2119,7 +2120,7 @@ class StreamRepository(private val context: Context) {
             val arr = JSONArray(f.readText())
             List(arr.length()) { i ->
                 val o = arr.optJSONObject(i)
-                LyricLine(o.optLong("t", 0L), o.optString("x", ""))
+                LyricLine(o.optLong("t", 0L), o.safeStr("x"))
             }.filter { it.text.isNotBlank() }
         }.getOrDefault(emptyList())
     }
@@ -2146,6 +2147,7 @@ class StreamRepository(private val context: Context) {
             .replace(Regex("\\s+"), " ")
             .trim()
     }
+
     private fun cleanArtistName(artist: String): String {
         return artist
             .replace("- Topic", "", true)
@@ -2162,7 +2164,6 @@ class StreamRepository(private val context: Context) {
         manualOverrideQuery: String? = null,
         offlineOnly: Boolean = false
     ): List<LyricLine> = withContext(Dispatchers.IO) {
-        // Source 0: Local Offline Lyrics Cache (works with zero internet!)
         if (manualOverrideQuery.isNullOrBlank()) {
             val cached = getCachedLyrics(track.id)
             if (cached.isNotEmpty()) return@withContext cached
@@ -2175,93 +2176,106 @@ class StreamRepository(private val context: Context) {
         val encArtist = URLEncoder.encode(cleanArtist, "UTF-8")
         val encTitle = URLEncoder.encode(cleanTitle, "UTF-8")
         val encTitleNoP = URLEncoder.encode(titleNoParens, "UTF-8")
+        val lrcUa = "Sonify v11.1.0 ([https://sonify.link](https://sonify.link))"
 
-        // Source 1: LRCLIB Exact Match (Full title + Parentheses-free title)
-        if (cleanArtist.isNotBlank()) {
-            for (tEnc in listOf(encTitle, encTitleNoP).distinct()) {
-                val exact = runCatching {
-                    val url = "[https://lrclib.net/api/get?artist_name=$encArtist&track_name=$tEnc](https://lrclib.net/api/get?artist_name=$encArtist&track_name=$tEnc)"
-                    client.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/11.0").build()).execute().use { resp ->
-                        if (!resp.isSuccessful) return@use emptyList()
-                        parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
-                    }
-                }.getOrDefault(emptyList())
-                if (exact.isNotEmpty()) {
-                    saveLyricsToCache(track.id, exact)
-                    return@withContext exact
-                }
-            }
-        }
-
-        // Source 2: LRCLIB Smart Multi-Query Search
         val searchQueries = listOfNotNull(
             "$cleanArtist $cleanTitle".trim().takeIf { it.isNotBlank() },
             "$cleanArtist $titleNoParens".trim().takeIf { it.isNotBlank() },
-            titleNoParens.takeIf { it.length >= 3 && cleanArtist.isNotBlank() },
-            cleanTitle.takeIf { it.length >= 3 && cleanArtist.isNotBlank() }
+            titleNoParens.takeIf { it.length >= 2 && cleanArtist.isNotBlank() },
+            cleanTitle.takeIf { it.length >= 2 && cleanArtist.isNotBlank() }
         ).distinct()
 
-        for (sq in searchQueries) {
-            val found = runCatching {
-                val encQ = URLEncoder.encode(sq, "UTF-8")
-                client.newCall(Request.Builder().url("[https://lrclib.net/api/search?q=$encQ](https://lrclib.net/api/search?q=$encQ)").header("User-Agent", "Sonify/11.0").build()).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use emptyList()
-                    val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
-                    for (i in 0 until arr.length().coerceAtMost(8)) {
-                        val obj = arr.optJSONObject(i) ?: continue
-                        if (obj.optString("syncedLyrics").isNotBlank()) {
-                            val parsed = parseLyricsJson(obj)
-                            if (parsed.isNotEmpty()) return@use parsed
-                        }
+        // Wave 1: Race the 3 strongest synced-lyrics sources in parallel
+        val (simpRes, lrcExactRes, lrcSearchRes) = coroutineScope {
+            val simpJob = async {
+                if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
+                    runCatching { fetchSimpMusicLyrics(track.id) }.getOrDefault(emptyList())
+                } else emptyList()
+            }
+            val exactJob = async {
+                if (cleanArtist.isBlank()) emptyList()
+                else {
+                    var best: List<LyricLine> = emptyList()
+                    for (tEnc in listOf(encTitle, encTitleNoP).distinct()) {
+                        val found = runCatching {
+                            val url = "[https://lrclib.net/api/get?artist_name=$encArtist&track_name=$tEnc](https://lrclib.net/api/get?artist_name=$encArtist&track_name=$tEnc)"
+                            client.newCall(Request.Builder().url(url).header("User-Agent", lrcUa).build()).execute().use { resp ->
+                                if (!resp.isSuccessful) return@use emptyList()
+                                parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
+                            }
+                        }.getOrDefault(emptyList())
+                        if (found.isNotEmpty()) { best = found; break }
                     }
-                    for (i in 0 until arr.length().coerceAtMost(8)) {
-                        val parsed = parseLyricsJson(arr.optJSONObject(i) ?: continue)
-                        if (parsed.isNotEmpty()) return@use parsed
-                    }
-                    emptyList()
+                    best
                 }
-            }.getOrDefault(emptyList())
-            if (found.isNotEmpty()) {
-                saveLyricsToCache(track.id, found)
-                return@withContext found
             }
+            val searchJob = async {
+                var best: List<LyricLine> = emptyList()
+                for (sq in searchQueries.take(3)) {
+                    val found = runCatching {
+                        val encQ = URLEncoder.encode(sq, "UTF-8")
+                        client.newCall(Request.Builder().url("[https://lrclib.net/api/search?q=$encQ](https://lrclib.net/api/search?q=$encQ)").header("User-Agent", lrcUa).build()).execute().use { resp ->
+                            if (!resp.isSuccessful) return@use emptyList()
+                            val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
+                            for (i in 0 until arr.length().coerceAtMost(8)) {
+                                val obj = arr.optJSONObject(i) ?: continue
+                                if (obj.safeStr("syncedLyrics").isNotBlank()) {
+                                    val parsed = parseLyricsJson(obj)
+                                    if (parsed.isNotEmpty()) return@use parsed
+                                }
+                            }
+                            for (i in 0 until arr.length().coerceAtMost(8)) {
+                                val parsed = parseLyricsJson(arr.optJSONObject(i) ?: continue)
+                                if (parsed.isNotEmpty()) return@use parsed
+                            }
+                            emptyList()
+                        }
+                    }.getOrDefault(emptyList())
+                    if (found.isNotEmpty()) { best = found; break }
+                }
+                best
+            }
+            Triple(simpJob.await(), exactJob.await(), searchJob.await())
         }
 
-        // Source 3: NetEase Cloud Music Synced LRC Database (massive global synced lyrics catalog!)
-        val netEaseQuery = searchQueries.firstOrNull().orEmpty()
-        if (netEaseQuery.isNotBlank()) {
-            val netEase = runCatching { fetchNetEaseSyncedLyrics(netEaseQuery) }.getOrDefault(emptyList())
-            if (netEase.isNotEmpty()) {
-                saveLyricsToCache(track.id, netEase)
-                return@withContext netEase
-            }
+        val fastWinner = listOf(lrcExactRes, simpRes, lrcSearchRes).firstOrNull { it.isNotEmpty() }
+        if (fastWinner != null) {
+            saveLyricsToCache(track.id, fastWinner)
+            return@withContext fastWinner
         }
 
-        // Source 4: YouTube Music Native Lyrics Tab (MPLYt)
-        if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
-            val ytmNative = runCatching { fetchYouTubeMusicNativeLyrics(track.id) }.getOrDefault(emptyList())
-            if (ytmNative.isNotEmpty()) {
-                saveLyricsToCache(track.id, ytmNative)
-                return@withContext ytmNative
+        // Wave 2: YouTube Music Native Lyrics + NetEase + YouTube Captions in parallel
+        val (ytmRes, netEaseRes, ytCapRes) = coroutineScope {
+            val ytmJob = async {
+                if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
+                    runCatching { fetchYouTubeMusicNativeLyrics(track.id) }.getOrDefault(emptyList())
+                } else emptyList()
             }
+            val neJob = async {
+                val q = searchQueries.firstOrNull().orEmpty()
+                if (q.isNotBlank()) runCatching { fetchNetEaseSyncedLyrics(q) }.getOrDefault(emptyList()) else emptyList()
+            }
+            val capJob = async {
+                if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
+                    runCatching { fetchYouTubeCaptions(track.id) }.getOrDefault(emptyList())
+                } else emptyList()
+            }
+            Triple(ytmJob.await(), neJob.await(), capJob.await())
         }
 
-        // Source 5: YouTube TimedText Captions
-        if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
-            val ytCaptions = runCatching { fetchYouTubeCaptions(track.id) }.getOrDefault(emptyList())
-            if (ytCaptions.isNotEmpty()) {
-                saveLyricsToCache(track.id, ytCaptions)
-                return@withContext ytCaptions
-            }
+        val secondWinner = listOf(netEaseRes, ytmRes, ytCapRes).firstOrNull { it.isNotEmpty() }
+        if (secondWinner != null) {
+            saveLyricsToCache(track.id, secondWinner)
+            return@withContext secondWinner
         }
 
-        // Source 6: Lyrics.ovh Fallback
+        // Wave 3: Lyrics.ovh Fallback
         if (cleanArtist.isNotBlank() && titleNoParens.isNotBlank()) {
             val ovh = runCatching {
                 val url = "[https://api.lyrics.ovh/v1/$encArtist/$encTitleNoP](https://api.lyrics.ovh/v1/$encArtist/$encTitleNoP)"
-                probeClient.newCall(Request.Builder().url(url).header("User-Agent", "Sonify/11.0").build()).execute().use { resp ->
+                probeClient.newCall(Request.Builder().url(url).header("User-Agent", lrcUa).build()).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList()
-                    val plain = JSONObject(resp.body?.string() ?: return@use emptyList()).optString("lyrics")
+                    val plain = JSONObject(resp.body?.string() ?: return@use emptyList()).safeStr("lyrics")
                     plain.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("Paroles de", true) }
                         .mapIndexed { idx, line -> LyricLine(idx * 3200L, line) }
                 }
@@ -2273,6 +2287,36 @@ class StreamRepository(private val context: Context) {
         }
 
         emptyList()
+    }
+
+    private fun fetchSimpMusicLyrics(videoId: String): List<LyricLine> {
+        val req = Request.Builder()
+            .url("[https://api-lyrics.simpmusic.org/v1/$videoId](https://api-lyrics.simpmusic.org/v1/$videoId)")
+            .header("User-Agent", "Sonify/11.1")
+            .header("Accept", "application/json")
+            .build()
+        return fastProxyClient.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return emptyList()
+            val body = resp.body?.string() ?: return emptyList()
+            val root = JSONObject(body)
+            val dataArr = root.optJSONArray("data")
+            if (dataArr != null && dataArr.length() > 0) {
+                for (i in 0 until dataArr.length()) {
+                    val item = dataArr.optJSONObject(i) ?: continue
+                    val synced = item.safeStr("syncedLyrics")
+                    if (synced.isNotBlank()) {
+                        val parsed = parseLrc(synced)
+                        if (parsed.isNotEmpty()) return parsed
+                    }
+                    val plain = item.safeStr("plainLyrics")
+                    if (plain.isNotBlank()) {
+                        return plain.lines().map { it.trim() }.filter { it.isNotBlank() }
+                            .mapIndexed { idx, l -> LyricLine(idx * 3400L, l) }
+                    }
+                }
+            }
+            emptyList()
+        }
     }
 
     private fun fetchNetEaseSyncedLyrics(query: String): List<LyricLine> {
@@ -2302,7 +2346,7 @@ class StreamRepository(private val context: Context) {
             if (!resp.isSuccessful) return emptyList()
             val lrc = JSONObject(resp.body?.string() ?: return emptyList())
                 .optJSONObject("lrc")
-                ?.optString("lyric")
+                ?.safeStr("lyric")
                 .orEmpty()
             if (lrc.isBlank()) return emptyList()
             val parsed = parseLrc(lrc)
@@ -2366,14 +2410,15 @@ class StreamRepository(private val context: Context) {
             put("videoId", videoId)
             put("context", JSONObject().apply {
                 put("client", JSONObject().apply {
-                    put("clientName", "WEB"); put("clientVersion", "2.20250219.01.00"); put("hl", "he"); put("gl", "IL")
+                    put("clientName", "ANDROID_VR"); put("clientVersion", "1.65.10")
+                    put("androidSdkVersion", 32); put("hl", "he"); put("gl", "IL")
                 })
             })
         }
         val req = Request.Builder()
             .url("[https://www.youtube.com/youtubei/v1/player?prettyPrint=false](https://www.youtube.com/youtubei/v1/player?prettyPrint=false)")
             .post(body.toString().toRequestBody("application/json".toMediaType()))
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .header("User-Agent", "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L) gzip")
             .build()
 
         val captionUrl = client.newCall(req).execute().use { resp ->
@@ -2385,9 +2430,9 @@ class StreamRepository(private val context: Context) {
             var bestUrl: String? = null
             for (i in 0 until tracks.length()) {
                 val ct = tracks.optJSONObject(i) ?: continue
-                val base = ct.optString("baseUrl")
-                val lang = ct.optString("languageCode")
-                val kind = ct.optString("kind")
+                val base = ct.safeStr("baseUrl")
+                val lang = ct.safeStr("languageCode")
+                val kind = ct.safeStr("kind")
                 if (base.startsWith("http")) {
                     if (kind.isBlank() && (lang.startsWith("he") || lang.startsWith("iw") || lang.startsWith("en"))) {
                         bestUrl = base; break
@@ -2398,7 +2443,8 @@ class StreamRepository(private val context: Context) {
             bestUrl
         } ?: return emptyList()
 
-        val xml = client.newCall(Request.Builder().url(captionUrl).header("User-Agent", "Mozilla/5.0").build()).execute().use { r ->
+        val finalCapUrl = if (captionUrl.contains("fmt=")) captionUrl else "$captionUrl&fmt=srv1"
+        val xml = client.newCall(Request.Builder().url(finalCapUrl).header("User-Agent", "Mozilla/5.0").build()).execute().use { r ->
             if (!r.isSuccessful) return emptyList()
             r.body?.string().orEmpty()
         }
@@ -2412,10 +2458,15 @@ class StreamRepository(private val context: Context) {
     }
 
     private fun parseLyricsJson(json: JSONObject): List<LyricLine> {
-        val synced = json.optString("syncedLyrics")
-        if (synced.isNotBlank()) return parseLrc(synced)
-        val plain = json.optString("plainLyrics")
-        if (plain.isNotBlank()) return plain.lines().filter { it.isNotBlank() }.mapIndexed { idx, line -> LyricLine(idx * 3500L, line.trim()) }
+        val synced = json.safeStr("syncedLyrics")
+        if (synced.isNotBlank()) {
+            val parsed = parseLrc(synced)
+            if (parsed.isNotEmpty()) return parsed
+        }
+        val plain = json.safeStr("plainLyrics")
+        if (plain.isNotBlank()) {
+            return plain.lines().filter { it.isNotBlank() }.mapIndexed { idx, line -> LyricLine(idx * 3500L, line.trim()) }
+        }
         return emptyList()
     }
 
@@ -2431,7 +2482,7 @@ class StreamRepository(private val context: Context) {
         }.sortedBy { it.timeMs }
     }
 
-    // ---------- OpenSubsonic & Local Audio ----------
+    // ---------- 7. OpenSubsonic & Local Audio ----------
     suspend fun testSubsonicConnection(settings: AppSettings): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         if (settings.subsonicUrl.isBlank()) return@withContext false to "יש להזין כתובת שרת"
         runCatching {
