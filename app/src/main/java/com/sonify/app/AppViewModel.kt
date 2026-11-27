@@ -101,7 +101,7 @@ class CloudlessChatSync {
                         }
                         onConnectedChanged(true)
                         val reader = BufferedReader(InputStreamReader(resp.body?.byteStream() ?: return@use))
-                        var line: String?
+                        var line: String? = null
                         while (isActive && reader.readLine().also { line = it } != null) {
                             val l = line ?: continue
                             if (!l.startsWith("data:")) continue
