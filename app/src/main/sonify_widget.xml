@@ -5,6 +5,7 @@
     android:layout_height="match_parent"
     android:layoutDirection="ltr">
 
+    <!-- Dynamic rounded Spotify-style colored card background (rendered via Canvas) -->
     <ImageView
         android:id="@+id/widget_bg_image"
         android:layout_width="match_parent"
@@ -17,6 +18,7 @@
         android:layout_height="match_parent"
         android:orientation="vertical">
 
+        <!-- TOP PLAYER SECTION -->
         <LinearLayout
             android:id="@+id/widget_player_row"
             android:layout_width="match_parent"
@@ -29,6 +31,7 @@
             android:paddingTop="10dp"
             android:paddingBottom="10dp">
 
+            <!-- LEFT SIDE: Logo + Controls (Compact 4x1 OR Expanded 4x2 layout) -->
             <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="match_parent"
@@ -36,6 +39,7 @@
                 android:orientation="vertical"
                 android:gravity="center_vertical">
 
+                <!-- Top Row: Sonify Waves Logo (left) + Title/Artist (right-aligned next to cover) -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -49,6 +53,7 @@
                         android:scaleType="fitCenter"
                         android:contentDescription="Sonify" />
 
+                    <!-- Compact inline controls (shown only in 4x1 compact mode) -->
                     <LinearLayout
                         android:id="@+id/widget_compact_controls"
                         android:layout_width="wrap_content"
@@ -74,6 +79,7 @@
                             android:contentDescription="Next" />
                     </LinearLayout>
 
+                    <!-- Title & Artist aligned cleanly next to album art -->
                     <LinearLayout
                         android:id="@+id/widget_text_box"
                         android:layout_width="0dp"
@@ -109,6 +115,7 @@
                     </LinearLayout>
                 </LinearLayout>
 
+                <!-- Expanded 4x2 Controls Row: Prev + Big White Circle Play/Pause + Next -->
                 <LinearLayout
                     android:id="@+id/widget_expanded_controls"
                     android:layout_width="match_parent"
@@ -145,6 +152,7 @@
                 </LinearLayout>
             </LinearLayout>
 
+            <!-- RIGHT SIDE: Rounded Album Artwork -->
             <ImageView
                 android:id="@+id/widget_artwork"
                 android:layout_width="56dp"
@@ -153,6 +161,7 @@
                 android:contentDescription="Album Art" />
         </LinearLayout>
 
+        <!-- BOTTOM QUICK-SHORTCUTS SHELF (Auto-visible when widget is resized to 4x2, just like Spotify!) -->
         <LinearLayout
             android:id="@+id/widget_shelf"
             android:layout_width="match_parent"
