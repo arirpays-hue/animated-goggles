@@ -1216,7 +1216,7 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
 }
 
 // =====================================================================
-// 4. PLAYLIST DETAIL SCREEN
+// 4. PLAYLIST / ALBUM DETAIL SCREEN (No "Load More" in Albums!)
 // =====================================================================
 @Composable
 fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
@@ -1232,6 +1232,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
         else playlist.tracks.filter { it.title.contains(searchInPl, true) || it.artist.contains(searchInPl, true) }
     }
     val isSmartOn = playlist.id in state.smartShuffledPlaylistIds
+    val isAlbum = playlist.id.startsWith("MPRE") || playlist.id.startsWith("OLAK")
     val isBulkDownloadingThis = state.activeBulkDownloadPlaylistId == playlist.id
     val allDownloaded = playlist.tracks.isNotEmpty() && playlist.tracks.all { it.id in state.offlineTrackIds || it.source == StreamSource.LOCAL }
 
@@ -1345,25 +1346,27 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                             }
                         }
 
-                        Box(
-                            modifier = Modifier.clip(RoundedCornerShape(50))
-                                .background(if (isSmartOn) SpotifyGreen else SpotifyCard)
-                                .spotifyPressClickable(enabled = !state.isLoadingSmartPlaylist) { vm.toggleSmartShuffleForPlaylist(playlist) }
-                                .padding(horizontal = 12.dp, vertical = 8.dp)
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (state.isLoadingSmartPlaylist) {
-                                    CircularProgressIndicator(color = if (isSmartOn) Color.Black else SpotifyGreen, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
-                                } else {
-                                    Icon(Icons.Rounded.AutoAwesome, null, tint = if (isSmartOn) Color.Black else SpotifyGreen, modifier = Modifier.size(15.dp))
+                        if (!isAlbum) {
+                            Box(
+                                modifier = Modifier.clip(RoundedCornerShape(50))
+                                    .background(if (isSmartOn) SpotifyGreen else SpotifyCard)
+                                    .spotifyPressClickable(enabled = !state.isLoadingSmartPlaylist) { vm.toggleSmartShuffleForPlaylist(playlist) }
+                                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (state.isLoadingSmartPlaylist) {
+                                        CircularProgressIndicator(color = if (isSmartOn) Color.Black else SpotifyGreen, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
+                                    } else {
+                                        Icon(Icons.Rounded.AutoAwesome, null, tint = if (isSmartOn) Color.Black else SpotifyGreen, modifier = Modifier.size(15.dp))
+                                    }
+                                    Spacer(Modifier.width(5.dp))
+                                    Text(
+                                        str.t("ערבוב חכם", "Smart Shuffle"),
+                                        color = if (isSmartOn) Color.Black else SpotifyWhite,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
                                 }
-                                Spacer(Modifier.width(5.dp))
-                                Text(
-                                    str.t("ערבוב חכם", "Smart Shuffle"),
-                                    color = if (isSmartOn) Color.Black else SpotifyWhite,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
                             }
                         }
                     }
@@ -1399,23 +1402,29 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                 ) {
                     Icon(Icons.Rounded.QueueMusic, null, tint = SpotifyMuted, modifier = Modifier.size(52.dp))
                     Spacer(Modifier.height(10.dp))
-                    Text(str.t("הפלייליסט עדיין ריק", "This playlist is empty"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Spacer(Modifier.height(4.dp))
-                    Text(str.t("חפש שירים להוסיף או תן ל-AI למלא אותו בשבילך.", "Search songs to add or let AI fill it for you."), color = SpotifySubtle, fontSize = 13.sp)
-                    Spacer(Modifier.height(16.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Button(
-                            onClick = { vm.openPlaylist(null); vm.selectTab(MainTab.SEARCH) },
-                            colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
-                            shape = RoundedCornerShape(50)
-                        ) { Text(str.t("הוסף שירים", "Add Songs"), fontWeight = FontWeight.Bold) }
-                        OutlinedButton(
-                            onClick = { vm.loadMoreTracksForPlaylist(playlist) },
-                            shape = RoundedCornerShape(50)
-                        ) {
-                            Icon(Icons.Rounded.AutoAwesome, null, tint = SpotifyGreen, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(5.dp))
-                            Text(str.t("מלא עם AI", "Fill with AI"), color = SpotifyWhite, fontWeight = FontWeight.Bold)
+                    Text(
+                        if (isAlbum) str.t("לא נמצאו רצועות באלבום זה", "No tracks found in this album")
+                        else str.t("הפלייליסט עדיין ריק", "This playlist is empty"),
+                        color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 16.sp
+                    )
+                    if (!isAlbum) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(str.t("חפש שירים להוסיף או תן ל-AI למלא אותו בשבילך.", "Search songs to add or let AI fill it for you."), color = SpotifySubtle, fontSize = 13.sp)
+                        Spacer(Modifier.height(16.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = { vm.openPlaylist(null); vm.selectTab(MainTab.SEARCH) },
+                                colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen, contentColor = Color.Black),
+                                shape = RoundedCornerShape(50)
+                            ) { Text(str.t("הוסף שירים", "Add Songs"), fontWeight = FontWeight.Bold) }
+                            OutlinedButton(
+                                onClick = { vm.loadMoreTracksForPlaylist(playlist) },
+                                shape = RoundedCornerShape(50)
+                            ) {
+                                Icon(Icons.Rounded.AutoAwesome, null, tint = SpotifyGreen, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(5.dp))
+                                Text(str.t("מלא עם AI", "Fill with AI"), color = SpotifyWhite, fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 }
@@ -1442,7 +1451,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                 }
             }
 
-            if (!playlist.id.startsWith("virtual_")) {
+            if (!playlist.id.startsWith("virtual_") && !isAlbum) {
                 item(key = "pl_load_more") {
                     Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
                         OutlinedButton(onClick = { vm.loadMoreTracksForPlaylist(playlist) }, enabled = !state.isExpandingPlaylist, shape = RoundedCornerShape(50)) {
