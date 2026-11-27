@@ -1,5 +1,6 @@
 package com.sonify.app
 
+import android.net.Uri
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
@@ -181,6 +182,40 @@ data class RemotePlaylist(
     val artworkUrl: String
 )
 
+data class SearchArtistResult(
+    val name: String,
+    val browseId: String = "",
+    val artworkUrl: String = "",
+    val subscribers: String = ""
+)
+
+data class TrackCreditEntry(
+    val name: String,
+    val roles: String,
+    val isMainArtist: Boolean = false
+)
+
+data class NowPlayingExtras(
+    val trackId: String,
+    val artistPhotoUrl: String = "",
+    val artistBio: String = "",
+    val artistSubscribers: String = "",
+    val credits: List<TrackCreditEntry> = emptyList(),
+    val artistEpisodes: List<Track> = emptyList(),
+    val artistTopTrack: Track? = null,
+    val similarArtistTrack: Track? = null,
+    val similarSongTrack: Track? = null
+)
+
+data class WidgetQuickTile(
+    val id: String,
+    val label: String,
+    val artworkUrl: String,
+    val isLikedTile: Boolean = false,
+    val playlistId: String? = null,
+    val trackId: String? = null
+)
+
 data class CapturedMediaStream(
     val videoId: String,
     val url: String,
@@ -220,6 +255,8 @@ data class Playlist(
     val customCoverBgHex: Long? = null,
     val customCoverText: String = "",
     val customCoverSticker: String = "",
+    val coverMode: String = "AUTO", // AUTO, ARTIST_ONLY, COLLAGE, MINIMAL
+    val artistCoverUrl: String = "",
     val tracks: List<Track> = emptyList(),
     val isBlend: Boolean = false,
     val blendMatchPercent: Int? = null,
@@ -280,7 +317,8 @@ data class DeletedPlaylistRecord(
 data class FriendProfile(
     val name: String,
     val currentActivity: String = "",
-    val isOnline: Boolean = true
+    val isOnline: Boolean = true,
+    val roomCode: String = "" // Optional live cloudless chat room code (via ntfy.sh)
 )
 
 data class ChatMessage(
@@ -290,6 +328,7 @@ data class ChatMessage(
     val text: String,
     val sharedTrack: Track? = null,
     val sharedPlaylistName: String? = null,
+    val sharedPlaylistCode: String? = null,
     val sharedJamCode: String? = null,
     val trackTimestampSec: Int? = null,
     val timestampMs: Long = System.currentTimeMillis()
@@ -311,6 +350,7 @@ data class ArtistPageState(
 data class AiPlaylistConfig(
     val prompt: String,
     val targetCount: Int = 25,
+    val autoCountByAi: Boolean = false,
     val languagePref: String = "משולב",
     val energyPref: String = "מאוזן",
     val eraPref: String = "הכל"
@@ -347,10 +387,13 @@ object BlendTasteCodec {
     }
 
     fun decodeTaste(raw: String): FriendTasteProfile? {
-        val trimmed = raw.trim()
-        if (!trimmed.startsWith("sonify:blend:", ignoreCase = true)) return null
+        val cleaned = raw.trim()
+        val b64 = when {
+            cleaned.contains("sonify:blend:", true) -> cleaned.substringAfter("sonify:blend:").substringBefore(" ").substringBefore("\n").trim()
+            cleaned.contains("/blend/", true) -> cleaned.substringAfter("/blend/").substringBefore("?").substringBefore(" ").trim()
+            else -> return null
+        }
         return runCatching {
-            val b64 = trimmed.substringAfter("sonify:blend:").trim()
             val json = JSONObject(String(Base64.decode(b64, Base64.URL_SAFE), Charsets.UTF_8))
             val name = json.optString("n", "חבר")
             val artistsArr = json.optJSONArray("a") ?: JSONArray()
@@ -374,10 +417,13 @@ object BlendTasteCodec {
     }
 
     fun decodeSharedPlaylist(raw: String): SharedPlaylistToken? {
-        val trimmed = raw.trim()
-        if (!trimmed.startsWith("sonify:plshare:", ignoreCase = true)) return null
+        val cleaned = raw.trim()
+        val b64 = when {
+            cleaned.contains("sonify:plshare:", true) -> cleaned.substringAfter("sonify:plshare:").substringBefore(" ").substringBefore("\n").trim()
+            cleaned.contains("/plshare/", true) -> cleaned.substringAfter("/plshare/").substringBefore("?").substringBefore(" ").trim()
+            else -> return null
+        }
         return runCatching {
-            val b64 = trimmed.substringAfter("sonify:plshare:").trim()
             val json = JSONObject(String(Base64.decode(b64, Base64.URL_SAFE), Charsets.UTF_8))
             val name = json.optString("n", "פלייליסט משותף")
             val creator = json.optString("c", "חבר")
@@ -385,6 +431,50 @@ object BlendTasteCodec {
             val ids = List(arr.length()) { arr.optString(it) }.filter { it.length == 11 }
             if (ids.isEmpty()) null else SharedPlaylistToken(name, creator, ids)
         }.getOrNull()
+    }
+}
+
+/**
+ * Real clickable HTTPS + custom-scheme deep links that launch Sonify directly on the linked item!
+ */
+object SonifyShareLinks {
+    fun trackUrl(track: Track, posMs: Long = 0L): String {
+        val sec = (posMs / 1000L).toInt().coerceAtLeast(0)
+        val q = if (sec > 5) "?t=$sec" else ""
+        return "https://sonify.link/track/${track.id}$q"
+    }
+
+    fun playlistUrl(pl: Playlist): String {
+        return if (pl.isRemote && !pl.id.startsWith("virtual_")) {
+            "https://sonify.link/playlist/${pl.id}"
+        } else {
+            val token = BlendTasteCodec.encodeSharedPlaylist(pl).removePrefix("sonify:plshare:")
+            "https://sonify.link/plshare/$token"
+        }
+    }
+
+    fun jamUrl(code: String, track: Track? = null, posMs: Long = 0L): String {
+        val sec = (posMs / 1000L).toInt().coerceAtLeast(0)
+        val params = buildList {
+            if (track != null && track.id.length == 11) add("v=${track.id}")
+            if (sec > 3) add("t=$sec")
+        }.joinToString("&")
+        return if (params.isNotBlank()) "https://sonify.link/jam/$code?$params" else "https://sonify.link/jam/$code"
+    }
+
+    fun blendUrl(tasteCode: String): String {
+        val b64 = tasteCode.removePrefix("sonify:blend:")
+        return "https://sonify.link/blend/$b64"
+    }
+
+    fun chatRoomUrl(roomCode: String, hostName: String): String {
+        val encName = Uri.encode(hostName.trim().ifBlank { "חבר" })
+        return "https://sonify.link/chat/$roomCode?name=$encName"
+    }
+
+    fun extractFirstLinkFromSharedText(rawText: String): String {
+        val m = Regex("(https?://[^\\s]+|sonify://[^\\s]+|sonify:[a-zA-Z0-9_:\\-+=/?.&]+)").find(rawText)
+        return m?.value?.trim() ?: rawText.trim()
     }
 }
 
@@ -396,11 +486,14 @@ data class AppSettings(
     val ytEngineMode: YouTubeEngineMode = YouTubeEngineMode.AUTO,
     val wifiQuality: AudioQuality = AudioQuality.VERY_HIGH,
     val cellularQuality: AudioQuality = AudioQuality.HIGH,
-    val downloadQuality: AudioQuality = AudioQuality.VERY_HIGH,
+    val downloadQuality: AudioQuality = AudioQuality.HIGH,
     val autoAdjustQuality: Boolean = true,
     val subsonicUrl: String = "",
     val subsonicUser: String = "",
     val subsonicPass: String = "",
+    val aiProvider: AiProvider = AiProvider.GEMINI,
+    val aiModelId: String = "",
+    val aiCustomEndpoint: String = "",
     val geminiApiKey: String = "",
     val djVoiceEnabled: Boolean = true,
     val djIntroVoice: Boolean = true,
