@@ -8,7 +8,9 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.net.Uri
 import android.widget.FrameLayout
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode as AnimRepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
@@ -17,16 +19,22 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -45,11 +53,13 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -192,7 +202,6 @@ fun SpotifySeekBar(progress: Float, onScrubChange: (Float) -> Unit, onScrubFinis
     }
 }
 
-// Helper to detect instrumental gaps for Spotify melody dots (• • •)
 private fun isInInstrumentalBreak(lyrics: List<LyricLine>, positionMs: Long): Boolean {
     if (lyrics.isEmpty()) return false
     val first = lyrics.first()
@@ -207,6 +216,108 @@ private fun isInInstrumentalBreak(lyrics: List<LyricLine>, positionMs: Long): Bo
     val gap = next.timeMs - lyrics[idx].timeMs
     val elapsedSinceLine = positionMs - lyrics[idx].timeMs
     return gap >= 9000L && elapsedSinceLine >= 4500L && (next.timeMs - positionMs) >= 1200L
+}
+
+// Smooth Spotify-like gliding scroll to active lyric line (520ms FastOutSlowIn glide instead of abrupt jump)
+private suspend fun smoothGlideToLyric(listState: LazyListState, targetIndex: Int, topOffsetPx: Int) {
+    val visible = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }
+    if (visible != null) {
+        val delta = (visible.offset - topOffsetPx).toFloat()
+        if (kotlin.math.abs(delta) > 4f) {
+            listState.animateScrollBy(
+                value = delta,
+                animationSpec = tween(durationMillis = 520, easing = FastOutSlowInEasing)
+            )
+        }
+    } else {
+        listState.animateScrollToItem(index = targetIndex.coerceAtLeast(0), scrollOffset = -topOffsetPx)
+    }
+}
+
+@Composable
+private fun SpotifyAnimatedLyricLine(
+    line: LyricLine,
+    isCurrent: Boolean,
+    isPast: Boolean,
+    showTranslation: Boolean,
+    fontScale: Float,
+    baseFontSp: Float,
+    activeFontSp: Float,
+    onClick: () -> Unit
+) {
+    val isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    val density = LocalDensity.current
+
+    val lineColor by animateColorAsState(
+        targetValue = when {
+            isCurrent -> Color.White
+            isPast -> Color.White.copy(alpha = 0.62f)
+            else -> Color.Black.copy(alpha = 0.52f)
+        },
+        animationSpec = tween(durationMillis = 360, easing = FastOutSlowInEasing),
+        label = "sp_lyric_color"
+    )
+    val lineScale by animateFloatAsState(
+        targetValue = if (isCurrent) 1.045f else 0.985f,
+        animationSpec = spring(dampingRatio = 0.80f, stiffness = 260f),
+        label = "sp_lyric_scale"
+    )
+    val nudgeY by animateFloatAsState(
+        targetValue = when {
+            isPast -> with(density) { (-3).dp.toPx() }
+            isCurrent -> 0f
+            else -> with(density) { 4.dp.toPx() }
+        },
+        animationSpec = spring(dampingRatio = 0.82f, stiffness = 240f),
+        label = "sp_lyric_nudge"
+    )
+    val lineAlpha by animateFloatAsState(
+        targetValue = when {
+            isCurrent -> 1f
+            isPast -> 0.88f
+            else -> 0.78f
+        },
+        animationSpec = tween(durationMillis = 340, easing = FastOutSlowInEasing),
+        label = "sp_lyric_alpha"
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .graphicsLayer {
+                transformOrigin = TransformOrigin(if (isRtl) 1f else 0f, 0.5f)
+                scaleX = lineScale
+                scaleY = lineScale
+                translationY = nudgeY
+                alpha = lineAlpha
+            }
+            .clickable(onClick = onClick)
+            .padding(vertical = 7.dp)
+    ) {
+        Text(
+            text = line.text,
+            color = lineColor,
+            fontWeight = FontWeight.ExtraBold,
+            fontFamily = FontFamily.SansSerif,
+            letterSpacing = (-0.35).sp,
+            lineHeight = ((if (isCurrent) activeFontSp else baseFontSp) * 1.32f * fontScale).sp,
+            fontSize = ((if (isCurrent) activeFontSp else baseFontSp) * fontScale).sp
+        )
+        AnimatedVisibility(
+            visible = showTranslation && !line.translatedText.isNullOrBlank(),
+            enter = fadeIn(tween(260)) + expandVertically(tween(260)),
+            exit = fadeOut(tween(180)) + shrinkVertically(tween(180))
+        ) {
+            Text(
+                text = line.translatedText.orEmpty(),
+                color = if (isCurrent) Color.White.copy(alpha = 0.90f) else lineColor.copy(alpha = 0.84f),
+                fontWeight = FontWeight.SemiBold,
+                fontSize = ((baseFontSp * 0.74f) * fontScale).sp,
+                lineHeight = ((baseFontSp * 1.02f) * fontScale).sp,
+                modifier = Modifier.padding(top = 3.dp)
+            )
+        }
+    }
 }
 
 @Composable
@@ -251,7 +362,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
     var showSpeedSheet by remember { mutableStateOf(false) }
     var showFullLyrics by remember { mutableStateOf(false) }
 
-    // Automatically close full-screen lyrics if user switches to Video Clip mode
     LaunchedEffect(state.isVideoMode) {
         if (state.isVideoMode) showFullLyrics = false
     }
@@ -311,7 +421,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
             .statusBarsPadding().navigationBarsPadding()
     ) {
         Column(modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(horizontal = 22.dp, vertical = 8.dp)) {
-            // Top Bar
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                 IconButton(onClick = { vm.setShowNowPlaying(false) }) { Icon(Icons.Rounded.KeyboardArrowDown, "Minimize", tint = SpotifyWhite, modifier = Modifier.size(30.dp)) }
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -337,7 +446,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(10.dp))
 
-            // 16:9 Official Music Video OR 1:1 HD Album Art
             Box(
                 modifier = Modifier.fillMaxWidth().aspectRatio(if (state.isVideoMode) 16f / 9f else 1f)
                     .clip(RoundedCornerShape(12.dp)).background(Color.Black),
@@ -430,7 +538,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(20.dp))
 
-            // Track Title + Spotify-Style Clickable Artist + Like & Download
             val likeScale by animateFloatAsState(if (isLiked) 1.12f else 1f, spring(dampingRatio = Spring.DampingRatioMediumBouncy), label = "like_btn")
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
@@ -480,7 +587,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(14.dp))
 
-            // Seek Bar & Spotify Tactile Controls
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 val duration = state.durationMs.coerceAtLeast(1L)
                 val progressFrac = if (isScrubbing) scrubFraction else (state.positionMs.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
@@ -526,7 +632,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(14.dp))
 
-            // Spotify Connect Device Pill + Share / QR / Queue Row
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Row(
                     modifier = Modifier.clip(RoundedCornerShape(50))
@@ -569,7 +674,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // HIDDEN IN VIDEO CLIP MODE! Shown ONLY in Audio Mode with Spotify Lyrics Typography, Animations, Melody Dots & Gemini Translation
+            // Spotify Animated Synced Lyrics Card (Hidden in Video Clip mode!)
             if (!state.isVideoMode) {
                 Spacer(Modifier.height(18.dp))
                 val lyricsCardBg by animateColorAsState(
@@ -583,6 +688,21 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                     label = "lyrics_card_bg"
                 )
                 val inBreak = remember(state.lyrics, state.positionMs) { isInInstrumentalBreak(state.lyrics, state.positionMs) }
+                val activeIdx = remember(state.lyrics, state.positionMs) {
+                    state.lyrics.indexOfLast { it.timeMs <= state.positionMs }.coerceAtLeast(0)
+                }
+                val inlineLyricsState = rememberLazyListState()
+                val density = LocalDensity.current
+                val inlineTopOffsetPx = remember(density) { with(density) { 46.dp.roundToPx() } }
+
+                LaunchedEffect(track.id) {
+                    runCatching { inlineLyricsState.scrollToItem(0) }
+                }
+                LaunchedEffect(activeIdx, state.lyrics.size) {
+                    if (state.lyrics.isNotEmpty() && activeIdx in state.lyrics.indices) {
+                        runCatching { smoothGlideToLyric(inlineLyricsState, activeIdx, inlineTopOffsetPx) }
+                    }
+                }
 
                 Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = lyricsCardBg)) {
                     Column(modifier = Modifier.padding(18.dp)) {
@@ -590,7 +710,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                             Text(str.syncedLyrics, color = SpotifyWhite, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, fontFamily = FontFamily.SansSerif)
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 if (state.lyrics.isNotEmpty()) {
-                                    // Translate Lyrics Button (Gemini API)
                                     Box(
                                         modifier = Modifier.clip(RoundedCornerShape(50))
                                             .background(if (state.showTranslatedLyrics) SpotifyWhite else Color.Black.copy(alpha = 0.32f))
@@ -628,10 +747,10 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                             }
                         }
 
-                        Spacer(Modifier.height(14.dp))
+                        Spacer(Modifier.height(10.dp))
 
                         if (state.isLoadingLyrics) {
-                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 12.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 16.dp)) {
                                 SpotifyMelodyDots(isPlaying = true, tint = SpotifyWhite, dotSize = 9.dp)
                                 Spacer(Modifier.width(12.dp))
                                 Text(str.t("טוען מילים מסונכרנות...", "Loading synced lyrics..."), color = SpotifyWhite.copy(alpha = 0.85f), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
@@ -642,56 +761,55 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                                 TextButton(onClick = { showFullLyrics = true }) { Text(str.t("חיפוש ידני", "Manual Search"), color = SpotifyWhite, fontWeight = FontWeight.Bold) }
                             }
                         } else {
-                            if (inBreak) {
-                                SpotifyMelodyDots(isPlaying = state.isPlaying, tint = SpotifyWhite, dotSize = 11.dp, modifier = Modifier.padding(vertical = 10.dp))
-                            }
-                            val activeIdx = state.lyrics.indexOfLast { it.timeMs <= state.positionMs }.coerceAtLeast(0)
-                            val startIdx = (activeIdx - 1).coerceAtLeast(0)
-                            val endIdx = (activeIdx + 5).coerceAtMost(state.lyrics.size)
-                            for (i in startIdx until endIdx) {
-                                val line = state.lyrics[i]
-                                val isCurrent = i == activeIdx && state.positionMs >= line.timeMs && !inBreak
-                                val isPast = i < activeIdx || (i == activeIdx && inBreak)
-                                val lineColor by animateColorAsState(
-                                    targetValue = when {
-                                        isCurrent -> Color.White
-                                        isPast -> Color.White.copy(alpha = 0.65f)
-                                        else -> Color.Black.copy(alpha = 0.58f)
-                                    },
-                                    animationSpec = tween(260),
-                                    label = "lyric_color_$i"
-                                )
-                                val lineScale by animateFloatAsState(
-                                    targetValue = if (isCurrent) 1.03f else 1f,
-                                    animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
-                                    label = "lyric_scale_$i"
-                                )
-                                Column(
-                                    modifier = Modifier.fillMaxWidth()
-                                        .graphicsLayer { scaleX = lineScale; scaleY = lineScale }
-                                        .clickable { vm.seekTo(line.timeMs) }
-                                        .padding(vertical = 5.dp)
+                            // Smooth gliding viewport with Spotify edge fade masks
+                            Box(modifier = Modifier.fillMaxWidth().height(235.dp)) {
+                                LazyColumn(
+                                    state = inlineLyricsState,
+                                    userScrollEnabled = false,
+                                    contentPadding = PaddingValues(top = 10.dp, bottom = 110.dp),
+                                    modifier = Modifier.fillMaxSize()
                                 ) {
-                                    Text(
-                                        text = line.text,
-                                        color = lineColor,
-                                        fontWeight = FontWeight.ExtraBold,
-                                        fontFamily = FontFamily.SansSerif,
-                                        letterSpacing = (-0.35).sp,
-                                        lineHeight = (27f * state.lyricsFontScale).sp,
-                                        fontSize = ((if (isCurrent) 21f else 18.5f) * state.lyricsFontScale).sp
-                                    )
-                                    if (state.showTranslatedLyrics && !line.translatedText.isNullOrBlank()) {
-                                        Text(
-                                            text = line.translatedText,
-                                            color = if (isCurrent) Color.White.copy(alpha = 0.88f) else lineColor.copy(alpha = 0.8f),
-                                            fontWeight = FontWeight.SemiBold,
-                                            fontSize = (14f * state.lyricsFontScale).sp,
-                                            lineHeight = (20f * state.lyricsFontScale).sp,
-                                            modifier = Modifier.padding(top = 2.dp)
-                                        )
+                                    itemsIndexed(state.lyrics, key = { idx, item -> "in_${idx}_${item.timeMs}" }) { idx, line ->
+                                        val isCurrent = idx == activeIdx && state.positionMs >= line.timeMs && !inBreak
+                                        val isPast = idx < activeIdx || (idx == activeIdx && inBreak)
+
+                                        Column {
+                                            AnimatedVisibility(
+                                                visible = idx == 0 && state.positionMs < state.lyrics.first().timeMs - 1500L,
+                                                enter = fadeIn(tween(300)) + expandVertically(tween(300)),
+                                                exit = fadeOut(tween(240)) + shrinkVertically(tween(240))
+                                            ) {
+                                                SpotifyMelodyDots(isPlaying = state.isPlaying, tint = SpotifyWhite, dotSize = 10.dp, modifier = Modifier.padding(vertical = 8.dp))
+                                            }
+                                            SpotifyAnimatedLyricLine(
+                                                line = line,
+                                                isCurrent = isCurrent,
+                                                isPast = isPast,
+                                                showTranslation = state.showTranslatedLyrics,
+                                                fontScale = state.lyricsFontScale,
+                                                baseFontSp = 18.5f,
+                                                activeFontSp = 20.5f,
+                                                onClick = { vm.seekTo(line.timeMs) }
+                                            )
+                                            AnimatedVisibility(
+                                                visible = idx == activeIdx && inBreak && state.positionMs >= line.timeMs,
+                                                enter = fadeIn(tween(320)) + expandVertically(tween(320)),
+                                                exit = fadeOut(tween(240)) + shrinkVertically(tween(240))
+                                            ) {
+                                                SpotifyMelodyDots(isPlaying = state.isPlaying, tint = SpotifyWhite, dotSize = 10.dp, modifier = Modifier.padding(vertical = 8.dp))
+                                            }
+                                        }
                                     }
                                 }
+                                // Top & Bottom soft gradient masks so lines glide cleanly in/out
+                                Box(
+                                    modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(20.dp)
+                                        .background(Brush.verticalGradient(listOf(lyricsCardBg, Color.Transparent)))
+                                )
+                                Box(
+                                    modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(34.dp)
+                                        .background(Brush.verticalGradient(listOf(Color.Transparent, lyricsCardBg)))
+                                )
                             }
                         }
                     }
@@ -700,7 +818,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(16.dp))
 
-            // Spotify-Style "About the artist" Hero Card (Real Visual Card + Follow Pill + Bio + Tap for Full Artist Page!)
+            // Spotify-Style "About the artist" Hero Card
             Card(
                 modifier = Modifier.fillMaxWidth().spotifyPressClickable { vm.openArtistPage(track.artist, track.artworkUrl) },
                 shape = RoundedCornerShape(16.dp),
@@ -786,7 +904,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
             Spacer(Modifier.height(14.dp))
 
-            // SongDNA Card
             Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = SpotifyDarkSurface)) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     Text(str.t("קרדיטים ואיכות שמע", "Credits & Audio Specs"), color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp)
@@ -865,12 +982,15 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
         }
     }
 
-    // Full-Screen Spotify Synced Lyrics Sheet (with Melody Dots + Gemini API Translation + Language Picker)
+    // Full-Screen Spotify Synced Lyrics Sheet with Smooth 520ms Glide & Line Spring Animations
     if (showFullLyrics && !state.isVideoMode) {
         var manualQuery by remember(track.id) { mutableStateOf("${track.artist} ${track.title}") }
         val activeIdx = state.lyrics.indexOfLast { it.timeMs <= state.positionMs }.coerceAtLeast(0)
         val inBreak = isInInstrumentalBreak(state.lyrics, state.positionMs)
         val lyricsListState = rememberLazyListState()
+        val density = LocalDensity.current
+        val fullTopOffsetPx = remember(density) { with(density) { 120.dp.roundToPx() } }
+
         val fullBg = Color(
             red = (accent.red * 1.4f).coerceAtMost(0.84f),
             green = (accent.green * 1.4f).coerceAtMost(0.84f),
@@ -880,7 +1000,7 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
 
         LaunchedEffect(activeIdx, state.lyrics.size) {
             if (state.lyrics.isNotEmpty() && activeIdx in state.lyrics.indices) {
-                runCatching { lyricsListState.animateScrollToItem((activeIdx - 2).coerceAtLeast(0)) }
+                runCatching { smoothGlideToLyric(lyricsListState, activeIdx, fullTopOffsetPx) }
             }
         }
 
@@ -897,7 +1017,6 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
 
-                // Gemini Translation Language Strip
                 if (state.lyrics.isNotEmpty()) {
                     Spacer(Modifier.height(10.dp))
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -944,59 +1063,48 @@ fun NowPlayingScreen(state: UiState, vm: AppViewModel) {
                     }
                     Spacer(Modifier.height(24.dp))
                 } else {
-                    LazyColumn(state = lyricsListState, modifier = Modifier.fillMaxWidth().heightIn(max = 540.dp), contentPadding = PaddingValues(bottom = 36.dp)) {
-                        if (state.positionMs < state.lyrics.first().timeMs - 1500L) {
-                            item(key = "intro_dots") {
-                                SpotifyMelodyDots(isPlaying = state.isPlaying, tint = SpotifyWhite, dotSize = 13.dp, modifier = Modifier.padding(vertical = 14.dp))
-                            }
-                        }
-                        itemsIndexed(state.lyrics) { idx, line ->
-                            val isCurrent = idx == activeIdx && state.positionMs >= line.timeMs && !inBreak
-                            val isPast = idx < activeIdx || (idx == activeIdx && inBreak)
-                            val txtColor by animateColorAsState(
-                                targetValue = when {
-                                    isCurrent -> Color.White
-                                    isPast -> Color.White.copy(alpha = 0.68f)
-                                    else -> Color.Black.copy(alpha = 0.56f)
-                                },
-                                animationSpec = tween(250),
-                                label = "fl_c_$idx"
-                            )
-                            val scale by animateFloatAsState(
-                                targetValue = if (isCurrent) 1.035f else 1f,
-                                animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy),
-                                label = "fl_s_$idx"
-                            )
-                            Column(
-                                modifier = Modifier.fillMaxWidth()
-                                    .graphicsLayer { scaleX = scale; scaleY = scale }
-                                    .clickable { vm.seekTo(line.timeMs) }
-                                    .padding(vertical = 8.dp)
-                            ) {
-                                Text(
-                                    text = line.text,
-                                    color = txtColor,
-                                    fontFamily = FontFamily.SansSerif,
-                                    letterSpacing = (-0.4).sp,
-                                    lineHeight = (33f * state.lyricsFontScale).sp,
-                                    fontSize = ((if (isCurrent) 26f else 22f) * state.lyricsFontScale).sp,
-                                    fontWeight = FontWeight.ExtraBold
-                                )
-                                if (state.showTranslatedLyrics && !line.translatedText.isNullOrBlank()) {
-                                    Text(
-                                        text = line.translatedText,
-                                        color = if (isCurrent) Color.White.copy(alpha = 0.90f) else txtColor.copy(alpha = 0.85f),
-                                        fontSize = (16f * state.lyricsFontScale).sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        lineHeight = (22f * state.lyricsFontScale).sp,
-                                        modifier = Modifier.padding(top = 3.dp)
+                    Box(modifier = Modifier.fillMaxWidth().heightIn(max = 540.dp)) {
+                        LazyColumn(state = lyricsListState, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(top = 18.dp, bottom = 180.dp)) {
+                            itemsIndexed(state.lyrics, key = { idx, item -> "fl_${idx}_${item.timeMs}" }) { idx, line ->
+                                val isCurrent = idx == activeIdx && state.positionMs >= line.timeMs && !inBreak
+                                val isPast = idx < activeIdx || (idx == activeIdx && inBreak)
+
+                                Column {
+                                    AnimatedVisibility(
+                                        visible = idx == 0 && state.positionMs < state.lyrics.first().timeMs - 1500L,
+                                        enter = fadeIn(tween(300)) + expandVertically(tween(300)),
+                                        exit = fadeOut(tween(240)) + shrinkVertically(tween(240))
+                                    ) {
+                                        SpotifyMelodyDots(isPlaying = state.isPlaying, tint = SpotifyWhite, dotSize = 13.dp, modifier = Modifier.padding(vertical = 12.dp))
+                                    }
+                                    SpotifyAnimatedLyricLine(
+                                        line = line,
+                                        isCurrent = isCurrent,
+                                        isPast = isPast,
+                                        showTranslation = state.showTranslatedLyrics,
+                                        fontScale = state.lyricsFontScale,
+                                        baseFontSp = 22f,
+                                        activeFontSp = 25.5f,
+                                        onClick = { vm.seekTo(line.timeMs) }
                                     )
+                                    AnimatedVisibility(
+                                        visible = idx == activeIdx && inBreak && state.positionMs >= line.timeMs,
+                                        enter = fadeIn(tween(320)) + expandVertically(tween(320)),
+                                        exit = fadeOut(tween(240)) + shrinkVertically(tween(240))
+                                    ) {
+                                        SpotifyMelodyDots(isPlaying = state.isPlaying, tint = SpotifyWhite, dotSize = 12.dp, modifier = Modifier.padding(vertical = 10.dp))
+                                    }
                                 }
                             }
-                            if (idx == activeIdx && inBreak) {
-                                SpotifyMelodyDots(isPlaying = state.isPlaying, tint = SpotifyWhite, dotSize = 12.dp, modifier = Modifier.padding(vertical = 10.dp))
-                            }
                         }
+                        Box(
+                            modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(22.dp)
+                                .background(Brush.verticalGradient(listOf(fullBg, Color.Transparent)))
+                        )
+                        Box(
+                            modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(42.dp)
+                                .background(Brush.verticalGradient(listOf(Color.Transparent, fullBg)))
+                        )
                     }
                 }
             }
@@ -1022,7 +1130,6 @@ fun DevicesBottomSheet(state: UiState, vm: AppViewModel) {
             }
             Spacer(Modifier.height(14.dp))
 
-            // Redesigned Connected Device Rows with Custom Vector Device Artwork!
             devices.forEach { d ->
                 Row(
                     modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
@@ -1074,7 +1181,6 @@ fun DevicesBottomSheet(state: UiState, vm: AppViewModel) {
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp), color = SpotifyCard)
 
-            // Live Room-Based Jam Section (No Cloud Accounts!)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                 Text("Jam • ${str.t("האזנה משותפת חיה", "Live Shared Listening")}", color = SpotifyGreen, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
                 if (state.jamState.active) {
