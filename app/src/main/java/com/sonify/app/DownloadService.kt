@@ -52,13 +52,14 @@ object OfflineDownloadCoordinator {
     private var bulkJob: Job? = null
     private val songSemaphore = Semaphore(2)
 
+    @Volatile private var engineRef: OfflineDownloadEngine? = null
     @Volatile private var repoRef: StreamRepository? = null
     @Volatile private var appCtxRef: Context? = null
     @Volatile private var serviceCallbacks: ((String, String, Int, Int, Boolean) -> Unit)? = null
 
     fun attachService(context: Context, onNotify: (title: String, sub: String, progress: Int, max: Int, finished: Boolean) -> Unit) {
         appCtxRef = context.applicationContext
-        if (repoRef == null) repoRef = StreamRepository(context.applicationContext)
+        getEngine(context)
         serviceCallbacks = onNotify
     }
 
@@ -70,8 +71,14 @@ object OfflineDownloadCoordinator {
         _state.update { it.copy(lastMessage = null) }
     }
 
-    private fun getRepo(context: Context): StreamRepository {
+    fun getEngine(context: Context): OfflineDownloadEngine {
         appCtxRef = context.applicationContext
+        return engineRef ?: synchronized(this) {
+            engineRef ?: OfflineDownloadEngine(context.applicationContext).also { engineRef = it }
+        }
+    }
+
+    private fun getRepo(context: Context): StreamRepository {
         return repoRef ?: synchronized(this) {
             repoRef ?: StreamRepository(context.applicationContext).also { repoRef = it }
         }
@@ -88,8 +95,7 @@ object OfflineDownloadCoordinator {
 
     private fun notifyOrStopIfIdle() {
         val st = _state.value
-        val activeCount = st.downloadingIds.size
-        if (activeCount == 0 && st.activeBulkPlaylistId == null) {
+        if (st.downloadingIds.isEmpty() && st.activeBulkPlaylistId == null) {
             serviceCallbacks?.invoke("Sonify", "", 0, 0, true)
             appCtxRef?.let { ctx ->
                 runCatching {
@@ -99,18 +105,18 @@ object OfflineDownloadCoordinator {
         }
     }
 
-    fun enqueueSingle(context: Context, track: Track, settings: AppSettings) {
+    fun enqueueSingle(context: Context, track: Track, settings: AppSettings, captured: List<CapturedMediaStream> = emptyList()) {
         if (track.source == StreamSource.LOCAL) return
         if (activeSingleJobs.containsKey(track.id) || track.id in _state.value.downloadingIds) return
 
-        val repo = getRepo(context)
+        val engine = getEngine(context)
         startForegroundServiceSafe(context)
 
         _state.update {
             it.copy(
                 downloadingIds = it.downloadingIds + track.id,
-                downloadProgress = it.downloadProgress + (track.id to 1),
-                lastMessage = if (settings.language == AppLanguage.ENGLISH) "Downloading \"${track.title}\"..." else "מוריד \"${track.title}\"..."
+                downloadProgress = it.downloadProgress + (track.id to 2),
+                lastMessage = if (settings.language == AppLanguage.ENGLISH) "Downloading audio \"${track.title}\"..." else "מוריד אודיו \"${track.title}\"..."
             )
         }
 
@@ -118,14 +124,24 @@ object OfflineDownloadCoordinator {
             try {
                 songSemaphore.withPermit {
                     serviceCallbacks?.invoke(track.title, track.artist, 5, 100, false)
-                    val (_, msg) = repo.downloadTrackOffline(
+                    val nonYtResolver: (suspend () -> ResolvedStreams?)? = if (track.source != StreamSource.YOUTUBE) {
+                        { getRepo(context).resolveStreams(track, settings, forDownload = true) }
+                    } else null
+
+                    val (ok, msg) = engine.downloadAudioTrack(
                         track = track,
                         settings = settings,
+                        nonYouTubeResolver = nonYtResolver,
+                        capturedStreams = captured,
                         onProgress = { pct ->
                             _state.update { cur -> cur.copy(downloadProgress = cur.downloadProgress + (track.id to pct)) }
                             serviceCallbacks?.invoke(track.title, "${track.artist} • $pct%", pct, 100, false)
                         }
                     )
+                    if (ok) {
+                        // Also cache synced lyrics offline alongside the audio track!
+                        runCatching { getRepo(context).fetchSyncedLyrics(track) }
+                    }
                     _state.update { cur ->
                         cur.copy(
                             completedVersion = cur.completedVersion + 1,
@@ -152,8 +168,8 @@ object OfflineDownloadCoordinator {
     }
 
     fun enqueuePlaylist(context: Context, playlistId: String, playlistName: String, tracks: List<Track>, settings: AppSettings) {
-        val repo = getRepo(context)
-        val offlineIds = repo.getOfflineTrackIds()
+        val engine = getEngine(context)
+        val offlineIds = engine.getOfflineTrackIds()
         val toDownload = tracks.distinctBy { it.id }.filter { it.id !in offlineIds && it.source != StreamSource.LOCAL }
         val isEn = settings.language == AppLanguage.ENGLISH
 
@@ -178,7 +194,7 @@ object OfflineDownloadCoordinator {
                 activeBulkPlaylistId = playlistId,
                 bulkDone = 0,
                 bulkTotal = total,
-                lastMessage = if (isEn) "Downloading $total items in background..." else "מוריד $total פריטים ברקע (פעיל גם ביציאה מהאפליקציה)..."
+                lastMessage = if (isEn) "Downloading $total pure-audio items..." else "מוריד $total קובצי אודיו ברקע..."
             )
         }
         serviceCallbacks?.invoke(playlistName, "0 / $total", 0, total, false)
@@ -196,18 +212,24 @@ object OfflineDownloadCoordinator {
                                     )
                                 }
                                 try {
-                                    val (ok, _) = repo.downloadTrackOffline(
+                                    val nonYtResolver: (suspend () -> ResolvedStreams?)? = if (trk.source != StreamSource.YOUTUBE) {
+                                        { getRepo(context).resolveStreams(trk, settings, forDownload = true) }
+                                    } else null
+                                    val (ok, _) = engine.downloadAudioTrack(
                                         track = trk,
                                         settings = settings,
+                                        nonYouTubeResolver = nonYtResolver,
                                         onProgress = { pct ->
                                             _state.update { cur -> cur.copy(downloadProgress = cur.downloadProgress + (trk.id to pct)) }
                                         }
                                     )
-                                    if (ok) okCounter.incrementAndGet()
+                                    if (ok) {
+                                        okCounter.incrementAndGet()
+                                        runCatching { getRepo(context).fetchSyncedLyrics(trk) }
+                                    }
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (_: Throwable) {
-                                    // Continue with remaining tracks without crashing!
                                 } finally {
                                     val done = doneCounter.incrementAndGet()
                                     _state.update { cur ->
@@ -231,7 +253,7 @@ object OfflineDownloadCoordinator {
                         bulkDone = 0,
                         bulkTotal = 0,
                         completedVersion = cur.completedVersion + 1,
-                        lastMessage = if (isEn) "Downloaded $okCount / $total items!" else "ירדו $okCount מתוך $total לאופליין!"
+                        lastMessage = if (isEn) "Downloaded $okCount / $total audio items!" else "ירדו $okCount מתוך $total קובצי אודיו לאופליין!"
                     )
                 }
             } catch (e: CancellationException) {
@@ -324,7 +346,7 @@ class DownloadService : Service() {
             }
             else -> {
                 acquireLocks()
-                val notif = buildNotification("Sonify", "מוריד לאופליין...", 0, 100)
+                val notif = buildNotification("Sonify", "מוריד אודיו לאופליין...", 0, 100)
                 runCatching {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
