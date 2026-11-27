@@ -23,14 +23,38 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+
+private data class SettingsSearchEntry(
+    val titleHe: String,
+    val titleEn: String,
+    val keywords: String,
+    val section: SettingsSection,
+    val icon: ImageVector
+)
 
 @Composable
 fun SettingsScreen(state: UiState, vm: AppViewModel) {
     val str = state.strings
     val isEn = str.isEn
     val s = state.settings
+    var settingsSearch by remember { mutableStateOf("") }
+    var showResetConfirm by remember { mutableStateOf(false) }
+
+    val searchableIndex = remember {
+        listOf(
+            SettingsSearchEntry("ספק AI, מפתח API ומודלים", "AI Provider, API Key & Models", "api gemini openai groq claude deepseek openrouter מודל מפתח בינה מלאכותית תרגום מילים dj", SettingsSection.AI_NOTIFICATIONS, Icons.Rounded.AutoAwesome),
+            SettingsSearchEntry("מקור שמע (YouTube / שרת / קבצים)", "Stream Source (YouTube / Server / Local)", "youtube subsonic navidrome lossless flac local מקור שרת איכות wifi סלולר", SettingsSection.STREAM_QUALITY, Icons.Rounded.HighQuality),
+            SettingsSearchEntry("אחסון, אופליין, מטמון והורדות", "Storage, Offline, Cache & Downloads", "אופליין הורדה אחסון מטמון cache מילים סריקת קבצים ייבוא שחזור offline download", SettingsSection.STORAGE_OFFLINE, Icons.Rounded.Storage),
+            SettingsSearchEntry("מהירות ניגון, Crossfade והגנת רשת", "Playback Speed, Crossfade & Buffer", "מהירות speed crossfade gapless automix autoplay mono איזון canvas קליפ וידאו wakelock buffer", SettingsSection.PLAYBACK_AUDIO, Icons.Rounded.PlayCircleOutline),
+            SettingsSearchEntry("אקולייזר 10 ערוצים (EQ)", "10-Band Equalizer (EQ)", "אקולייזר באס bass vocal pop rock eq flat צליל", SettingsSection.EQUALIZER, Icons.Rounded.Equalizer),
+            SettingsSearchEntry("Jam חי, שם תצוגה וצ'אט ללא ענן", "Live Jam, Display Name & Chat", "jam צ'אט חברים ntfy סנכרון שם תצוגה relay", SettingsSection.JAM_SOCIAL, Icons.Rounded.Groups),
+            SettingsSearchEntry("שפה, ממשק, פיד AI ומצב נהיגה", "Language, UI, Infinite Feed & Car Mode", "שפה עברית אנגלית ממשק נהיגה car עטיפות פיד כפתור יצירה", SettingsSection.UI_LANGUAGE, Icons.Rounded.Translate),
+            SettingsSearchEntry("פרטיות, תוכן בוטה ופרופיל טעם", "Privacy, Explicit & Taste Profile", "פרטיות סשן פרטי explicit מוסתרים היסטוריה אמנים אחרונים טעם", SettingsSection.PRIVACY_TASTE, Icons.Rounded.Lock)
+        )
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().background(SpotifyBlack).statusBarsPadding().navigationBarsPadding()
@@ -52,10 +76,10 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                     SettingsSection.ROOT -> str.settings
                     SettingsSection.UI_LANGUAGE -> str.t("שפה וממשק", "Language & UI")
                     SettingsSection.STREAM_QUALITY -> str.t("מקור שמע ואיכות", "Audio Source & Quality")
-                    SettingsSection.PLAYBACK_AUDIO -> str.t("ניגון והגנת רשת", "Playback & Weak-Network Shield")
+                    SettingsSection.PLAYBACK_AUDIO -> str.t("ניגון, מהירות והגנת רשת", "Playback, Speed & Buffer")
                     SettingsSection.EQUALIZER -> str.t("אקולייזר 10 ערוצים", "10-Band Equalizer")
                     SettingsSection.PRIVACY_TASTE -> str.t("פרטיות ופרופיל טעם", "Privacy & Taste Profile")
-                    SettingsSection.STORAGE_OFFLINE -> str.t("אחסון ומהירות הורדה", "Storage & Download Engine")
+                    SettingsSection.STORAGE_OFFLINE -> str.t("אחסון, אופליין והורדות", "Storage, Offline & Downloads")
                     SettingsSection.AI_NOTIFICATIONS -> str.t("בינה מלאכותית, API והתראות", "AI API, Models & Notifications")
                     SettingsSection.JAM_SOCIAL -> str.t("Jam חי וצ'אט חברים", "Live Jam & Cloudless Chat")
                 },
@@ -69,24 +93,78 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
         ) {
             when (state.settingsSection) {
                 SettingsSection.ROOT -> {
-                    SettingsNavTile(Icons.Rounded.AutoAwesome, str.t("בינה מלאכותית, API ומודלים", "AI API, Multi-Provider & Models"), "${s.aiProvider.label(isEn)} • ${s.aiModelId.ifBlank { s.aiProvider.defaultModel }}") { vm.setSettingsSection(SettingsSection.AI_NOTIFICATIONS) }
-                    SettingsNavTile(Icons.Rounded.HighQuality, str.t("מקור שמע ואיכות הזרמה", "Stream Source & Audio Quality"), "${s.streamSource.label(isEn).substringBefore(" (")} • ${s.wifiQuality.shortLabel(isEn, s.streamSource)}") { vm.setSettingsSection(SettingsSection.STREAM_QUALITY) }
-                    SettingsNavTile(Icons.Rounded.Storage, str.t("אחסון, אופליין ומהירות הורדה", "Storage, Offline & Download Engine"), "${state.offlineTrackIds.size} ${str.songs} • ${String.format("%.1f", vm.repo.getOfflineSizeMb())} MB") { vm.setSettingsSection(SettingsSection.STORAGE_OFFLINE) }
-                    SettingsNavTile(Icons.Rounded.PlayCircleOutline, str.t("ניגון, Crossfade והגנת רשת חלשה", "Playback, Crossfade & Buffer"), s.audioBufferProfile.label(isEn)) { vm.setSettingsSection(SettingsSection.PLAYBACK_AUDIO) }
-                    SettingsNavTile(Icons.Rounded.Equalizer, str.t("אקולייזר 10 ערוצים", "10-Band Equalizer"), if (s.eqEnabled) str.t("פעיל", "ON") else str.t("כבוי", "OFF")) { vm.setSettingsSection(SettingsSection.EQUALIZER) }
-                    SettingsNavTile(Icons.Rounded.Groups, str.t("Jam חי וצ'אט ללא ענן", "Live Jam & Cloudless Chat"), s.jamUserDisplayName.ifBlank { str.t("הגדר שם תצוגה ושרת סנכרון", "Set display name & relay") }) { vm.setSettingsSection(SettingsSection.JAM_SOCIAL) }
-                    SettingsNavTile(Icons.Rounded.Translate, str.t("שפה, ממשק ופיד AI אינסופי", "Language, UI & Infinite AI Feed"), s.language.label) { vm.setSettingsSection(SettingsSection.UI_LANGUAGE) }
-                    SettingsNavTile(Icons.Rounded.Lock, str.t("פרטיות ופרופיל טעם", "Privacy & Taste Profile"), "${state.hiddenTrackIds.size} ${str.t("מוסתרים", "hidden")}") { vm.setSettingsSection(SettingsSection.PRIVACY_TASTE) }
-                    Spacer(Modifier.height(8.dp))
-                    Text("Sonify v11.0.0 • Pure-Audio Engine & Multi-Model AI", color = SpotifyMuted, fontSize = 11.5.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+                    // Restored Settings Search Bar!
+                    OutlinedTextField(
+                        value = settingsSearch,
+                        onValueChange = { settingsSearch = it },
+                        placeholder = { Text(str.t("חפש בהגדרות (API, אקולייזר, אופליין, מהירות...)", "Search settings (API, EQ, offline, speed...)"), fontSize = 13.sp) },
+                        leadingIcon = { Icon(Icons.Rounded.Search, null, tint = SpotifySubtle) },
+                        trailingIcon = {
+                            if (settingsSearch.isNotBlank()) {
+                                IconButton(onClick = { settingsSearch = "" }) {
+                                    Icon(Icons.Rounded.Close, "Clear", tint = SpotifySubtle, modifier = Modifier.size(18.dp))
+                                }
+                            }
+                        },
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    val q = settingsSearch.trim()
+                    if (q.isNotBlank()) {
+                        val hits = searchableIndex.filter {
+                            it.titleHe.contains(q, true) || it.titleEn.contains(q, true) || it.keywords.contains(q, true)
+                        }
+                        if (hits.isEmpty()) {
+                            Text(str.t("לא נמצאו הגדרות תואמות.", "No matching settings found."), color = SpotifySubtle, fontSize = 13.sp, modifier = Modifier.padding(8.dp))
+                        } else {
+                            hits.forEach { hit ->
+                                SettingsNavTile(hit.icon, if (isEn) hit.titleEn else hit.titleHe, "", isEn) {
+                                    settingsSearch = ""
+                                    vm.setSettingsSection(hit.section)
+                                }
+                            }
+                        }
+                    } else {
+                        // Restored Quick-Access Shortcuts Row (Wrapped Stats / Devices / History)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            QuickSettingsChip(Icons.Rounded.BarChart, str.t("סטטיסטיקות", "Wrapped"), Modifier.weight(1f)) { vm.setShowStatsSheet(true) }
+                            QuickSettingsChip(Icons.Rounded.Devices, str.t("מכשירים ו-Jam", "Devices"), Modifier.weight(1f)) { vm.setShowDevicesSheet(true) }
+                            QuickSettingsChip(Icons.Rounded.History, str.t("היסטוריה", "History"), Modifier.weight(1f)) { vm.setShowHistorySheet(true) }
+                        }
+
+                        SettingsNavTile(Icons.Rounded.AutoAwesome, str.t("בינה מלאכותית, API ומודלים", "AI API, Multi-Provider & Models"), "${s.aiProvider.label(isEn)} • ${vm.repo.aiClient.activeModelFor(s)}", isEn) { vm.setSettingsSection(SettingsSection.AI_NOTIFICATIONS) }
+                        SettingsNavTile(Icons.Rounded.HighQuality, str.t("מקור שמע ואיכות הזרמה", "Stream Source & Audio Quality"), "${s.streamSource.label(isEn).substringBefore(" (")} • ${s.wifiQuality.shortLabel(isEn, s.streamSource)}", isEn) { vm.setSettingsSection(SettingsSection.STREAM_QUALITY) }
+                        SettingsNavTile(Icons.Rounded.Storage, str.t("אחסון, אופליין ומהירות הורדה", "Storage, Offline & Download Engine"), "${state.offlineTrackIds.size} ${str.songs} • ${String.format("%.1f", vm.repo.getOfflineSizeMb())} MB", isEn) { vm.setSettingsSection(SettingsSection.STORAGE_OFFLINE) }
+                        SettingsNavTile(Icons.Rounded.PlayCircleOutline, str.t("ניגון, מהירות, Crossfade ורשת חלשה", "Playback, Speed, Crossfade & Buffer"), "${s.playbackSpeed}x • ${s.audioBufferProfile.label(isEn)}", isEn) { vm.setSettingsSection(SettingsSection.PLAYBACK_AUDIO) }
+                        SettingsNavTile(Icons.Rounded.Equalizer, str.t("אקולייזר 10 ערוצים", "10-Band Equalizer"), if (s.eqEnabled) str.t("פעיל", "ON") else str.t("כבוי", "OFF"), isEn) { vm.setSettingsSection(SettingsSection.EQUALIZER) }
+                        SettingsNavTile(Icons.Rounded.Groups, str.t("Jam חי וצ'אט ללא ענן", "Live Jam & Cloudless Chat"), s.jamUserDisplayName.ifBlank { str.t("הגדר שם תצוגה ושרת סנכרון", "Set display name & relay") }, isEn) { vm.setSettingsSection(SettingsSection.JAM_SOCIAL) }
+                        SettingsNavTile(Icons.Rounded.Translate, str.t("שפה, ממשק ופיד AI אינסופי", "Language, UI & Infinite AI Feed"), s.language.label, isEn) { vm.setSettingsSection(SettingsSection.UI_LANGUAGE) }
+                        SettingsNavTile(Icons.Rounded.Lock, str.t("פרטיות ופרופיל טעם", "Privacy & Taste Profile"), "${state.hiddenTrackIds.size} ${str.t("מוסתרים", "hidden")}", isEn) { vm.setSettingsSection(SettingsSection.PRIVACY_TASTE) }
+
+                        Spacer(Modifier.height(4.dp))
+                        OutlinedButton(
+                            onClick = { showResetConfirm = true },
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(1.dp, SpotifyCard),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Rounded.RestartAlt, null, tint = SpotifySubtle, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(str.t("אפס הגדרות לברירת מחדל", "Reset Settings to Defaults"), color = SpotifySubtle, fontSize = 13.sp)
+                        }
+                        Text("Sonify v11.0.0 • Pure-Audio Engine & Live Multi-Model AI", color = SpotifyMuted, fontSize = 11.5.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+                    }
                 }
 
                 SettingsSection.AI_NOTIFICATIONS -> {
                     val clipboard = LocalClipboardManager.current
                     var showKey by remember { mutableStateOf(false) }
-                    var customModelInput by remember(s.aiProvider, s.aiModelId) { mutableStateOf(s.aiModelId) }
+                    var customModelInput by remember(s.aiProvider, s.aiModelId) { mutableStateOf(vm.repo.aiClient.activeModelFor(s)) }
                     var endpointInput by remember(s.aiProvider, s.aiCustomEndpoint) { mutableStateOf(s.aiCustomEndpoint) }
                     var apiKeyInput by remember(s.geminiApiKey) { mutableStateOf(s.geminiApiKey) }
+                    var modelFilter by remember { mutableStateOf("") }
 
                     SettingsSectionCard(str.t("ספק AI ומודלים (לפלייליסטים, תרגום מילים ופיד חכם)", "AI Provider & Models (Playlists, Lyrics & Taste)")) {
                         Text(str.t("בחר ספק API:", "Select AI Provider:"), color = SpotifySubtle, fontSize = 12.sp, fontWeight = FontWeight.Bold)
@@ -99,50 +177,12 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                                     onClick = {
                                         customModelInput = prov.defaultModel
                                         endpointInput = prov.defaultEndpoint
+                                        modelFilter = ""
                                         vm.updateSettings(s.copy(aiProvider = prov, aiModelId = prov.defaultModel, aiCustomEndpoint = if (prov == AiProvider.CUSTOM_COMPAT) s.aiCustomEndpoint else ""))
                                     },
                                     label = { Text(prov.label(isEn), fontSize = 12.sp) }
                                 )
                             }
-                        }
-
-                        Spacer(Modifier.height(10.dp))
-                        Text(str.t("מודלים מומלצים ל-${s.aiProvider.labelHe}:", "Preset models for ${s.aiProvider.labelEn}:"), color = SpotifySubtle, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.height(6.dp))
-                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            items(s.aiProvider.presetModels) { mId ->
-                                val active = s.aiModelId.ifBlank { s.aiProvider.defaultModel } == mId
-                                FilterChip(
-                                    selected = active,
-                                    onClick = {
-                                        customModelInput = mId
-                                        vm.updateSettings(s.copy(aiModelId = mId))
-                                    },
-                                    label = { Text(mId, fontSize = 11.sp) }
-                                )
-                            }
-                        }
-
-                        Spacer(Modifier.height(10.dp))
-                        OutlinedTextField(
-                            value = customModelInput,
-                            onValueChange = { customModelInput = it; vm.updateSettings(s.copy(aiModelId = it.trim())) },
-                            label = { Text(str.t("מזהה מודל (ניתן להקליד כל מודל חדש)", "Model ID (enter any custom model)")) },
-                            placeholder = { Text(s.aiProvider.defaultModel) },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        if (s.aiProvider == AiProvider.CUSTOM_COMPAT || s.aiProvider == AiProvider.OPENROUTER) {
-                            Spacer(Modifier.height(8.dp))
-                            OutlinedTextField(
-                                value = endpointInput,
-                                onValueChange = { endpointInput = it; vm.updateSettings(s.copy(aiCustomEndpoint = it.trim())) },
-                                label = { Text(str.t("כתובת Endpoint (תואם OpenAI)", "API Endpoint URL (OpenAI-compatible)")) },
-                                placeholder = { Text(s.aiProvider.defaultEndpoint) },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth()
-                            )
                         }
 
                         Spacer(Modifier.height(10.dp))
@@ -162,6 +202,92 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                                     }
                                 }
                             },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        if (s.aiProvider == AiProvider.CUSTOM_COMPAT || s.aiProvider == AiProvider.OPENROUTER) {
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedTextField(
+                                value = endpointInput,
+                                onValueChange = { endpointInput = it; vm.updateSettings(s.copy(aiCustomEndpoint = it.trim())) },
+                                label = { Text(str.t("כתובת Endpoint (תואם OpenAI)", "API Endpoint URL (OpenAI-compatible)")) },
+                                placeholder = { Text(s.aiProvider.defaultEndpoint) },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+
+                        Spacer(Modifier.height(10.dp))
+                        // Fetch ALL Live Models directly from the provider's /models endpoint!
+                        OutlinedButton(
+                            onClick = { vm.fetchLiveAiModels() },
+                            enabled = !state.isFetchingAiModels,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(1.dp, SpotifyGreen),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            if (state.isFetchingAiModels) {
+                                CircularProgressIndicator(color = SpotifyGreen, strokeWidth = 2.dp, modifier = Modifier.size(15.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(str.t("טוען את כל המודלים הזמינים מהשרת...", "Fetching all live models..."), color = SpotifyWhite, fontSize = 12.sp)
+                            } else {
+                                Icon(Icons.Rounded.Refresh, null, tint = SpotifyGreen, modifier = Modifier.size(17.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(str.t("טען את כל המודלים החיים מה-API", "Fetch All Live Models from API"), color = SpotifyGreen, fontWeight = FontWeight.Bold, fontSize = 12.5.sp)
+                            }
+                        }
+
+                        state.aiModelsError?.let { err ->
+                            Spacer(Modifier.height(6.dp))
+                            Text(err, color = Color(0xFFFF8A80), fontSize = 11.5.sp)
+                        }
+
+                        val allModels = remember(state.liveAiModels, s.aiProvider) {
+                            (state.liveAiModels + s.aiProvider.presetModels).distinct()
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                if (state.liveAiModels.isNotEmpty()) str.t("כל המודלים הזמינים בחשבון (${state.liveAiModels.size}):", "Live models available (${state.liveAiModels.size}):")
+                                else str.t("מודלים מומלצים ל-${s.aiProvider.labelHe} (${s.aiProvider.presetModels.size}):", "Preset models (${s.aiProvider.presetModels.size}):"),
+                                color = SpotifySubtle, fontSize = 12.sp, fontWeight = FontWeight.Bold
+                            )
+                        }
+                        if (allModels.size > 10) {
+                            Spacer(Modifier.height(6.dp))
+                            OutlinedTextField(
+                                value = modelFilter,
+                                onValueChange = { modelFilter = it },
+                                placeholder = { Text(str.t("סנן מודלים (למשל flash, pro, gpt, llama)...", "Filter models (e.g. flash, pro, gpt, llama)..."), fontSize = 12.sp) },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        val filteredModels = remember(allModels, modelFilter) {
+                            if (modelFilter.isBlank()) allModels else allModels.filter { it.contains(modelFilter.trim(), true) }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            items(filteredModels.take(60)) { mId ->
+                                val active = vm.repo.aiClient.activeModelFor(s) == mId
+                                FilterChip(
+                                    selected = active,
+                                    onClick = {
+                                        customModelInput = mId
+                                        vm.updateSettings(s.copy(aiModelId = mId))
+                                    },
+                                    label = { Text(mId, fontSize = 11.sp, maxLines = 1) }
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = customModelInput,
+                            onValueChange = { customModelInput = it; vm.updateSettings(s.copy(aiModelId = it.trim())) },
+                            label = { Text(str.t("מזהה מודל פעיל (או הקלד כל מודל חדש)", "Active Model ID (or type any model)")) },
+                            placeholder = { Text(s.aiProvider.defaultModel) },
+                            singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )
 
@@ -236,7 +362,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                         SettingsSwitchRow(str.t("הורדה דרך רשת סלולרית", "Download over Cellular"), str.t("מאפשר הורדות גם ללא Wi-Fi", "Allows downloads without Wi-Fi"), s.downloadUsingCellular) { vm.updateSettings(s.copy(downloadUsingCellular = it)) }
                     }
 
-                    SettingsSectionCard(str.t("ניהול אחסון", "Storage Management")) {
+                    SettingsSectionCard(str.t("ניהול אחסון ומטמונים", "Storage & Cache Management")) {
                         val cacheMb = remember(state.storageRefreshKey) { vm.repo.getCacheSizeMb() }
                         val offlineMb = remember(state.storageRefreshKey, state.offlineTrackIds.size) { vm.repo.getOfflineSizeMb() }
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -249,12 +375,21 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                             Text("${String.format("%.1f", offlineMb)} MB", color = SpotifyGreen, fontWeight = FontWeight.Bold)
                         }
                         Spacer(Modifier.height(12.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                             OutlinedButton(onClick = { vm.clearAppCache() }, shape = RoundedCornerShape(50), modifier = Modifier.weight(1f)) {
                                 Text(str.t("נקה מטמון", "Clear Cache"), color = SpotifyWhite, fontSize = 12.sp)
                             }
+                            OutlinedButton(onClick = { vm.clearLyricsCache() }, shape = RoundedCornerShape(50), modifier = Modifier.weight(1f)) {
+                                Text(str.t("נקה מטמון מילים", "Clear Lyrics"), color = SpotifyWhite, fontSize = 12.sp)
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                            OutlinedButton(onClick = { vm.scanLocalFiles() }, shape = RoundedCornerShape(50), modifier = Modifier.weight(1f)) {
+                                Icon(Icons.Rounded.FolderOpen, null, tint = SpotifyGreen, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(4.dp)); Text(str.t("סרוק קובצי מכשיר", "Scan Device"), color = SpotifyWhite, fontSize = 11.5.sp)
+                            }
                             OutlinedButton(onClick = { vm.removeAllDownloads() }, shape = RoundedCornerShape(50), border = BorderStroke(1.dp, Color(0xFFFF6B6B)), modifier = Modifier.weight(1f)) {
-                                Text(str.t("מחק הורדות", "Delete Downloads"), color = Color(0xFFFF8A80), fontSize = 12.sp)
+                                Text(str.t("מחק הורדות", "Delete Downloads"), color = Color(0xFFFF8A80), fontSize = 11.5.sp)
                             }
                         }
                     }
@@ -317,7 +452,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                         SettingsSectionCard(str.t("איכות שמע והורדות", "Audio & Download Quality")) {
                             QualityRow(str.t("הזרמה ב-Wi-Fi", "Wi-Fi Streaming"), quals, s.wifiQuality, isEn, s.streamSource) { vm.updateSettings(s.copy(wifiQuality = it)) }
                             QualityRow(str.t("הזרמה בסלולר", "Cellular Streaming"), quals, s.cellularQuality, isEn, s.streamSource) { vm.updateSettings(s.copy(cellularQuality = it)) }
-                            QualityRow(str.t("איכות הורדה לאופליין", "Offline Download Quality"), quals, s.downloadQuality, isEn, s.streamSource) { vm.updateSettings(s.copy(downloadQuality = it)) }
+                            QualityRow(str.t("איכות הורדה לאופליין (~2–4.5MB לשיר)", "Offline Download Quality (~2–4.5MB/song)"), quals, s.downloadQuality, isEn, s.streamSource) { vm.updateSettings(s.copy(downloadQuality = it)) }
                             SettingsSwitchRow(str.t("התאמת איכות אוטומטית ברשת חלשה", "Auto-Adjust Quality on Weak Signal"), "", s.autoAdjustQuality) { vm.updateSettings(s.copy(autoAdjustQuality = it)) }
                         }
                     }
@@ -344,6 +479,19 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                 }
 
                 SettingsSection.PLAYBACK_AUDIO -> {
+                    SettingsSectionCard(str.t("מהירות ניגון", "Playback Speed")) {
+                        val speeds = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f, 3.5f)
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            items(speeds) { spd ->
+                                FilterChip(
+                                    selected = s.playbackSpeed == spd,
+                                    onClick = { vm.updateSettings(s.copy(playbackSpeed = spd)) },
+                                    label = { Text("${spd}x", fontSize = 12.sp) }
+                                )
+                            }
+                        }
+                    }
+
                     SettingsSectionCard(str.t("הגנת רשת חלשה ומטמון ניגון", "Weak-Network Shield & Buffer")) {
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             items(AudioBufferProfile.entries) { p ->
@@ -352,6 +500,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                         }
                         SettingsSwitchRow(str.t("שמור WakeLock בניגון ברקע", "Keep WakeLock in Background"), str.t("מונע קטיעות בכיבוי מסך", "Prevents screen-off stutters"), s.keepWakeLockAudio) { vm.updateSettings(s.copy(keepWakeLockAudio = it)) }
                     }
+
                     SettingsSectionCard(str.t("עוצמה ומעברים", "Volume & Transitions")) {
                         SettingsSwitchRow(str.t("נרמול עוצמת קול", "Normalize Volume"), "", s.normalizeVolume) { vm.updateSettings(s.copy(normalizeVolume = it)) }
                         if (s.normalizeVolume) {
@@ -420,6 +569,12 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                                 Text("${if (v > 0) "+" else ""}${v}dB", color = SpotifyWhite, fontSize = 11.sp, modifier = Modifier.width(38.dp))
                             }
                         }
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { vm.updateSettings(s.copy(eqPresetIndex = 0, eqBands = List(10) { 0 })) },
+                            shape = RoundedCornerShape(50),
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text(str.t("אפס אקולייזר (Flat)", "Reset Equalizer (Flat)"), color = SpotifyWhite, fontSize = 12.5.sp) }
                     }
                 }
 
@@ -446,6 +601,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                         SettingsSwitchRow(str.t("אפשר תוכן בוטה (Explicit)", "Allow Explicit Content"), "", s.allowExplicit) { vm.updateSettings(s.copy(allowExplicit = it)) }
                         SettingsSwitchRow(str.t("סשן פרטי", "Private Session"), str.t("לא שומר היסטוריה וסטטיסטיקות", "Pauses history & stats"), s.privateSession) { vm.updateSettings(s.copy(privateSession = it)) }
                         SettingsSwitchRow(str.t("שתף פעילות האזנה", "Share Listening Activity"), "", s.shareListeningActivity) { vm.updateSettings(s.copy(shareListeningActivity = it)) }
+                        SettingsSwitchRow(str.t("הצג אמנים שהושמעו לאחרונה", "Show Recently Played Artists"), "", s.showRecentlyPlayedArtists) { vm.updateSettings(s.copy(showRecentlyPlayedArtists = it)) }
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                             OutlinedButton(onClick = { vm.clearRecentHistory() }, shape = RoundedCornerShape(50), modifier = Modifier.weight(1f)) {
@@ -495,10 +651,39 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
             }
         }
     }
+
+    if (showResetConfirm) {
+        AlertDialog(
+            onDismissRequest = { showResetConfirm = false },
+            containerColor = SpotifyDarkSurface,
+            title = { Text(str.t("איפוס הגדרות", "Reset Settings?"), color = SpotifyWhite) },
+            text = { Text(str.t("יאפס את כל ההגדרות לברירת המחדל (הפלייליסטים, השירים שאהבת, ההורדות ומפתח ה-API יישמרו).", "Resets settings to defaults (playlists, liked songs, downloads & API key are kept)."), color = SpotifySubtle) },
+            confirmButton = {
+                TextButton(onClick = { vm.resetSettingsToDefaults(); showResetConfirm = false }) {
+                    Text(str.t("אפס", "Reset"), color = SpotifyGreen, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = { TextButton(onClick = { showResetConfirm = false }) { Text(str.cancel, color = SpotifySubtle) } }
+        )
+    }
 }
 
 @Composable
-private fun SettingsNavTile(icon: ImageVector, title: String, subtitle: String, onClick: () -> Unit) {
+private fun QuickSettingsChip(icon: ImageVector, label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    Row(
+        modifier = modifier.clip(RoundedCornerShape(12.dp)).background(SpotifyDarkSurface)
+            .clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Icon(icon, null, tint = SpotifyGreen, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.width(5.dp))
+        Text(label, color = SpotifyWhite, fontSize = 11.5.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+private fun SettingsNavTile(icon: ImageVector, title: String, subtitle: String, isEn: Boolean, onClick: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(SpotifyDarkSurface)
             .clickable(onClick = onClick).padding(14.dp),
@@ -510,9 +695,9 @@ private fun SettingsNavTile(icon: ImageVector, title: String, subtitle: String, 
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(title, color = SpotifyWhite, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-            Text(subtitle, color = SpotifySubtle, fontSize = 12.sp, maxLines = 1)
+            if (subtitle.isNotBlank()) Text(subtitle, color = SpotifySubtle, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        Icon(Icons.Rounded.ChevronLeft, null, tint = SpotifyMuted)
+        Icon(if (isEn) Icons.Rounded.ChevronRight else Icons.Rounded.ChevronLeft, null, tint = SpotifyMuted)
     }
 }
 
