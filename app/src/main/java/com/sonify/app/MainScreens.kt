@@ -274,7 +274,7 @@ fun TrackRowItem(
     ) {
         if (isEditOrderMode) {
             Box(
-                modifier = dragHandleModifier.size(36.dp),
+                modifier = dragHandleModifier.size(38.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
@@ -465,7 +465,6 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
             }
         }
 
-        // Dedicated Offline Mode Banner (clean, functional, 1-tap exit!)
         if (state.settings.offlineMode) {
             item(key = "home_offline_banner") {
                 Card(
@@ -760,7 +759,7 @@ fun HomeScreen(state: UiState, vm: AppViewModel) {
 }
 
 // =====================================================================
-// 2. SEARCH SCREEN (Shows Artists + Live Type-Ahead + Offline Search!)
+// 2. SEARCH SCREEN (Shows Artists + Live Type-Ahead + Offline Search)
 // =====================================================================
 @Composable
 fun SearchScreen(state: UiState, vm: AppViewModel) {
@@ -932,7 +931,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                 }
             }
 
-            // Live Artists Matches!
             if (instantArtists.isNotEmpty()) {
                 items(instantArtists, key = { "lart_${it.name}_${it.browseId}" }) { art ->
                     SearchArtistRow(artist = art, str = str) {
@@ -1026,7 +1024,6 @@ fun SearchScreen(state: UiState, vm: AppViewModel) {
                     }
                 }
             } else {
-                // Dedicated Artists Results Section (Spotify-style!)
                 if (state.searchArtists.isNotEmpty()) {
                     item(key = "search_artists_hdr") {
                         Text(str.t("אמנים", "Artists"), color = SpotifyWhite, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
@@ -1430,7 +1427,7 @@ fun ArtistPageScreen(artist: ArtistPageState, state: UiState, vm: AppViewModel) 
 }
 
 // =====================================================================
-// 4. PLAYLIST / LIKED SONGS / ALBUM / LOCAL DETAIL SCREEN (Drag-to-Reorder + Full Liked Tools!)
+// 4. PLAYLIST / LIKED SONGS / ALBUM / LOCAL DETAIL SCREEN (Smooth Drag-to-Reorder + Full Liked Tools)
 // =====================================================================
 @Composable
 fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
@@ -1451,16 +1448,25 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
     var showFolderPickerInSheet by remember { mutableStateOf(false) }
     var editOrderMode by remember(playlist.id) { mutableStateOf(false) }
 
-    // Smooth Spotify drag-to-reorder state
+    // Smooth Spotify drag-to-reorder state with stable keys and scroll locking
     val rowHeightPx = remember(density) { with(density) { 68.dp.toPx() } }
     var draggedTrackId by remember(playlist.id) { mutableStateOf<String?>(null) }
     var dragOffsetY by remember(playlist.id) { mutableFloatStateOf(0f) }
-    val latestTracks by rememberUpdatedState(playlist.tracks)
 
     val filteredTracks = remember(playlist.tracks, searchInPl) {
         if (searchInPl.isBlank()) playlist.tracks
         else playlist.tracks.filter { it.title.contains(searchInPl, true) || it.artist.contains(searchInPl, true) }
     }
+    val keyedFiltered = remember(filteredTracks) {
+        val counts = HashMap<String, Int>()
+        filteredTracks.map { trk ->
+            val occ = counts.getOrDefault(trk.id, 0)
+            counts[trk.id] = occ + 1
+            "${trk.id}_${trk.isSmartInjected}#$occ" to trk
+        }
+    }
+    val latestKeyedPl by rememberUpdatedState(keyedFiltered)
+
     val isSmartOn = playlist.id in state.smartShuffledPlaylistIds
     val isAlbum = playlist.id.startsWith("MPRE") || playlist.id.startsWith("OLAK")
     val isLocalPlaylist = playlist.id == "virtual_local"
@@ -1470,6 +1476,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
     val allDownloaded = playlist.tracks.isNotEmpty() && playlist.tracks.all { it.id in state.offlineTrackIds || it.source == StreamSource.LOCAL }
 
     LazyColumn(
+        userScrollEnabled = draggedTrackId == null,
         modifier = Modifier.fillMaxSize().background(SpotifyBlack).statusBarsPadding(),
         contentPadding = PaddingValues(bottom = 165.dp)
     ) {
@@ -1484,7 +1491,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (editOrderMode) {
-                        TextButton(onClick = { editOrderMode = false }) {
+                        TextButton(onClick = { draggedTrackId = null; editOrderMode = false }) {
                             Text(str.t("סיום עריכה", "Done"), color = SpotifyGreen, fontWeight = FontWeight.Bold)
                         }
                     }
@@ -1710,14 +1717,14 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
             }
         } else {
             val canDragReorder = editOrderMode && isUserOwned && searchInPl.isBlank()
-            itemsIndexed(filteredTracks, key = { idx, it -> "plt_${it.id}_${it.isSmartInjected}_$idx" }) { _, track ->
+            itemsIndexed(keyedFiltered, key = { _, pair -> pair.first }) { _, (rowKey, track) ->
                 val isUnavailable = (state.settings.offlineMode && track.id !in state.offlineTrackIds && track.source != StreamSource.LOCAL) || track.id in state.hiddenTrackIds
                 if (!isUnavailable || state.settings.showUnplayableSongs) {
-                    val isBeingDragged = canDragReorder && draggedTrackId == track.id
+                    val isBeingDragged = canDragReorder && draggedTrackId == rowKey
                     val handleMod = if (canDragReorder) {
-                        Modifier.pointerInput(track.id) {
+                        Modifier.pointerInput(rowKey) {
                             detectDragGestures(
-                                onDragStart = { draggedTrackId = track.id; dragOffsetY = 0f },
+                                onDragStart = { draggedTrackId = rowKey; dragOffsetY = 0f },
                                 onDragEnd = { draggedTrackId = null; dragOffsetY = 0f },
                                 onDragCancel = { draggedTrackId = null; dragOffsetY = 0f },
                                 onDrag = { change, dragAmount ->
@@ -1725,9 +1732,10 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                                     dragOffsetY += dragAmount.y
                                     val steps = (dragOffsetY / rowHeightPx).roundToInt()
                                     if (steps != 0) {
-                                        val curIdx = latestTracks.indexOfFirst { it.id == track.id }
+                                        val curList = latestKeyedPl
+                                        val curIdx = curList.indexOfFirst { it.first == rowKey }
                                         if (curIdx >= 0) {
-                                            val targetIdx = (curIdx + steps).coerceIn(0, latestTracks.lastIndex)
+                                            val targetIdx = (curIdx + steps).coerceIn(0, curList.lastIndex)
                                             if (targetIdx != curIdx) {
                                                 vm.movePlaylistTrack(playlist.id, curIdx, targetIdx)
                                                 dragOffsetY -= (targetIdx - curIdx) * rowHeightPx
@@ -1763,7 +1771,7 @@ fun PlaylistDetailScreen(playlist: Playlist, state: UiState, vm: AppViewModel) {
                             isBeingDragged = isBeingDragged,
                             onRemoveFromPlaylist = if (isUserOwned) { { vm.removeTrackFromPlaylist(playlist.id, track.id) } } else null,
                             onKeepSmartClick = if (track.isSmartInjected) { { vm.keepSmartTrackInPlaylist(playlist.id, track) } } else null,
-                            onClick = { vm.playTrack(track, playlist.tracks) },
+                            onClick = { if (draggedTrackId == null) vm.playTrack(track, playlist.tracks) },
                             onDownloadClick = { vm.downloadOffline(track) },
                             onMoreClick = { vm.openTrackOptions(track) }
                         )
@@ -2355,7 +2363,7 @@ fun AiDjStudioOverlay(state: UiState, vm: AppViewModel) {
 }
 
 // =====================================================================
-// 7. COMPLETE CREATE (+) HUB SHEET (Uniform White + Full New Playlist + Auto AI Count!)
+// 7. COMPLETE CREATE (+) HUB SHEET (Uniform White + Full New Playlist + Auto AI Count)
 // =====================================================================
 @Composable
 fun CreateHubSheet(state: UiState, vm: AppViewModel) {
@@ -2364,7 +2372,7 @@ fun CreateHubSheet(state: UiState, vm: AppViewModel) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
 
-    // 0=Menu, 1=New Playlist (Complete!), 2=AI Studio (Auto Count!), 3=Cloudless Blend, 5=Live Jam
+    // 0=Menu, 1=New Playlist, 2=AI Studio, 3=Cloudless Blend, 5=Live Jam
     var tab by remember { mutableIntStateOf(0) }
     var plName by remember { mutableStateOf("") }
     var plDesc by remember { mutableStateOf("") }
@@ -2482,7 +2490,6 @@ fun CreateHubSheet(state: UiState, vm: AppViewModel) {
                     OutlinedTextField(value = aiPrompt, onValueChange = { aiPrompt = it }, label = { Text(str.t("תאר סגנון, אווירה, אמן או פעילות...", "Describe vibe, genre, artist or activity...")) }, minLines = 2, modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(10.dp))
 
-                    // Auto Track Count by AI Switch!
                     Row(
                         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(SpotifyCard).padding(horizontal = 12.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
