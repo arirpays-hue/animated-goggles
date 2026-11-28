@@ -63,20 +63,21 @@ class OfflineDownloadEngine(private val context: Context) {
 
     private val proxyClient = OkHttpClient.Builder()
         .connectTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(4, TimeUnit.SECONDS)
-        .callTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .callTimeout(7, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
+    // High-concurrency download pool so 8–12 parallel HLS / Micro-Burst chunks fly at full line speed!
     private val downloadClient = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
-            maxRequests = 48
-            maxRequestsPerHost = 12
+            maxRequests = 64
+            maxRequestsPerHost = 16
         })
-        .connectionPool(ConnectionPool(12, 5, TimeUnit.MINUTES))
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .callTimeout(60, TimeUnit.SECONDS)
+        .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .callTimeout(45, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .followRedirects(true)
         .build()
@@ -179,11 +180,14 @@ class OfflineDownloadEngine(private val context: Context) {
             var totalBytes = 0L
             files.forEachIndexed { idx, f ->
                 totalBytes += f.length()
-                if (idx >= 8 || totalBytes > 50L * 1024L * 1024L) f.delete()
+                if (idx >= 12 || totalBytes > 75L * 1024L * 1024L) f.delete()
             }
         }
     }
 
+    /**
+     * Fast background audio pre-cacher for upcoming queue tracks so track-to-track transitions are 0ms instant!
+     */
     suspend fun precacheAudioTrack(track: Track, quality: AudioQuality): Boolean = withContext(Dispatchers.IO) {
         if (track.source != StreamSource.YOUTUBE) return@withContext false
         if (getOfflineFile(track.id).let { it.exists() && it.length() > 16_384 }) return@withContext true
@@ -192,18 +196,26 @@ class OfflineDownloadEngine(private val context: Context) {
             target.setLastModified(System.currentTimeMillis())
             return@withContext true
         }
-        val audioStream = runCatching { fetchPureInnerTubeAudio(track.id, "ANDROID_VR", quality, preferHls = false) }.getOrNull()
-            ?: runCatching { fetchPureInnerTubeAudio(track.id, "IOS", quality, preferHls = true) }.getOrNull()
-            ?: return@withContext false
-        if (audioStream.audioUrl.contains(".m3u8", true)) return@withContext false
-        val clen = Regex("[?&]clen=(\\d+)").find(audioStream.audioUrl)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-        if (clen > 14L * 1024L * 1024L) return@withContext false
-
-        val ok = downloadAudioSmart(audioStream.audioUrl, audioStream.userAgent, audioStream.cookie, emptyMap(), target, false, 3) {}
-        if (ok) trimStreamPrecache()
-        ok
+        // Try Micro-Burst on ANDROID_VR first, then IOS HLS Turbo!
+        val vrAudio = runCatching { fetchPureInnerTubeAudio(track.id, "ANDROID_VR", quality, preferHls = false) }.getOrNull()
+        if (vrAudio != null && !vrAudio.audioUrl.contains(".m3u8", true)) {
+            val clen = Regex("[?&]clen=(\\d+)").find(vrAudio.audioUrl)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+            if (clen in 1L..(16L * 1024L * 1024L)) {
+                val ok = downloadMicroBurstToDisk(vrAudio.audioUrl, vrAudio.userAgent, vrAudio.cookie, emptyMap(), target, false, 6, 256 * 1024L) {}
+                if (ok) { trimStreamPrecache(); return@withContext true }
+            }
+        }
+        val iosAudio = runCatching { fetchPureInnerTubeAudio(track.id, "IOS", quality, preferHls = true) }.getOrNull()
+        if (iosAudio != null && iosAudio.audioUrl.contains(".m3u8", true)) {
+            val ok = downloadHlsAudioOnlyParallel(iosAudio.audioUrl, iosAudio.userAgent, iosAudio.cookie, target, 6) {}
+            if (ok) { trimStreamPrecache(); return@withContext true }
+        }
+        false
     }
 
+    /**
+     * Main pure-audio offline download entry point with user-selectable DownloadMethod!
+     */
     suspend fun downloadAudioTrack(
         track: Track,
         settings: AppSettings,
@@ -223,7 +235,6 @@ class OfflineDownloadEngine(private val context: Context) {
         }
 
         val target = getOfflineFile(track.id)
-        // Strict monotonic progress reporter — percentages NEVER jump backwards or fake completion!
         val highWaterPct = AtomicInteger(0)
         val reportRealProgress: (Int) -> Unit = { pct ->
             val clamped = pct.coerceIn(1, 100)
@@ -237,7 +248,7 @@ class OfflineDownloadEngine(private val context: Context) {
             }
         }
 
-        // Instant zero-network copy from rolling precache if already cached on disk
+        // Instant zero-network copy from rolling precache if already on disk!
         val cached = getPrecachedAudioFile(track.id)
         if (cached.exists() && cached.length() > 48_000) {
             val copied = runCatching {
@@ -247,72 +258,125 @@ class OfflineDownloadEngine(private val context: Context) {
             }.getOrDefault(false)
             if (copied) {
                 val mb = String.format("%.1f", target.length() / (1024f * 1024f))
-                return@withContext true to if (isEn) "Saved offline ($mb MB)" else "נשמר לאופליין ($mb MB)!"
+                return@withContext true to if (isEn) "Saved instantly ($mb MB)" else "נשמר מיד לאופליין ($mb MB)!"
             }
         }
 
         val parallel = settings.downloadSpeedMode.parallelChunks
         val quality = settings.streamSource.clampQuality(settings.downloadQuality)
 
-        val result = withTimeoutOrNull(150_000L) {
+        val result = withTimeoutOrNull(140_000L) {
             reportRealProgress(2)
 
             if (track.source != StreamSource.YOUTUBE) {
                 val res = nonYouTubeResolver?.invoke()
-                if (res != null && downloadAudioSmart(res.audioUrl, res.userAgent, res.cookie, emptyMap(), target, false, parallel, reportRealProgress)) {
+                if (res != null && downloadUrlToFile(res.audioUrl, res.userAgent, res.cookie, emptyMap(), target, false, reportRealProgress)) {
                     val mb = String.format("%.1f", target.length() / (1024f * 1024f))
                     return@withTimeoutOrNull true to if (isEn) "Downloaded ($mb MB)" else "השיר ירד לאופליין ($mb MB)!"
                 }
                 return@withTimeoutOrNull false to if (isEn) "Download failed from source" else "שגיאה בהורדה מהמקור שנבחר"
             }
 
-            // Layer 1: Direct InnerTube ANDROID_VR pure audio (m4a / opus)
-            val vrAudio = runCatching { fetchPureInnerTubeAudio(track.id, "ANDROID_VR", quality, preferHls = false) }.getOrNull()
-            if (vrAudio != null && downloadAudioSmart(vrAudio.audioUrl, vrAudio.userAgent, vrAudio.cookie, emptyMap(), target, false, parallel, reportRealProgress)) {
-                val mb = String.format("%.1f", target.length() / (1024f * 1024f))
-                return@withTimeoutOrNull true to if (isEn) "Downloaded audio ($mb MB)" else "השיר ירד לאופליין ($mb MB)!"
-            }
-
-            // Layer 2: InnerTube IOS HLS pure TYPE=AUDIO stream (with 3x per-segment retry!)
-            val iosAudio = runCatching { fetchPureInnerTubeAudio(track.id, "IOS", quality, preferHls = true) }.getOrNull()
-            if (iosAudio != null && downloadAudioSmart(iosAudio.audioUrl, iosAudio.userAgent, iosAudio.cookie, emptyMap(), target, false, parallel, reportRealProgress)) {
-                val mb = String.format("%.1f", target.length() / (1024f * 1024f))
-                return@withTimeoutOrNull true to if (isEn) "Downloaded audio ($mb MB)" else "השיר ירד לאופליין ($mb MB)!"
-            }
-
-            // Layer 3: Captured pure audio stream from active playback session
-            for (cap in capturedStreams.filter { it.isAudioOnly }.take(2)) {
-                val cleanBase = sanitizeYouTubePlaybackUrl(cap.url)
-                if (downloadAudioSmart(cleanBase, cap.userAgent, cap.cookie, cap.headers, target, true, parallel, reportRealProgress)) {
-                    val mb = String.format("%.1f", target.length() / (1024f * 1024f))
-                    return@withTimeoutOrNull true to if (isEn) "Downloaded audio ($mb MB)" else "השיר ירד לאופליין ($mb MB)!"
-                }
-            }
-
-            // Layer 4: Mutex-serialized yt-dlp strictly audio-only (promoted BEFORE slow public proxies!)
-            if (downloadViaYtDlpAudioOnly(track.id, quality, parallel, target, reportRealProgress)) {
-                val mb = String.format("%.1f", target.length() / (1024f * 1024f))
-                return@withTimeoutOrNull true to if (isEn) "Downloaded audio ($mb MB)" else "השיר ירד לאופליין ($mb MB)!"
-            }
-
-            // Layer 5: Fast proxy fallbacks (Cobalt / Piped / Invidious)
-            val proxyStrategies = listOf(
-                { fetchCobaltPureAudio(track.id) },
-                { fetchPipedPureAudio(track.id, quality) },
-                { fetchInvidiousPureAudio(track.id) }
+            // Build ordered execution plan prioritizing the user's chosen DownloadMethod!
+            val plan: List<suspend () -> Boolean> = buildDownloadPlan(
+                method = settings.downloadMethod,
+                videoId = track.id,
+                quality = quality,
+                parallel = parallel,
+                capturedStreams = capturedStreams,
+                target = target,
+                onProgress = reportRealProgress
             )
-            for (strategy in proxyStrategies) {
-                val resolved = runCatching { strategy() }.getOrNull() ?: continue
-                if (downloadAudioSmart(resolved.audioUrl, resolved.userAgent, resolved.cookie, emptyMap(), target, false, parallel, reportRealProgress)) {
+
+            for (step in plan) {
+                val ok = runCatching { step() }.getOrDefault(false)
+                if (ok && target.exists() && target.length() > 20_480) {
                     val mb = String.format("%.1f", target.length() / (1024f * 1024f))
                     return@withTimeoutOrNull true to if (isEn) "Downloaded audio ($mb MB)" else "השיר ירד לאופליין ($mb MB)!"
                 }
             }
 
-            false to if (isEn) "Could not download audio right now — please retry" else "ההורדה נכשלה כרגע — נסה שוב"
+            false to if (isEn) "Download failed — try switching Download Method in Settings" else "ההורדה נכשלה — נסה להחליף שיטת הורדה בהגדרות"
         }
 
         result ?: (false to if (isEn) "Download timed out — please retry" else "ההורדה לקחה יותר מדי זמן — נסה שוב")
+    }
+
+    private fun buildDownloadPlan(
+        method: DownloadMethod,
+        videoId: String,
+        quality: AudioQuality,
+        parallel: Int,
+        capturedStreams: List<CapturedMediaStream>,
+        target: File,
+        onProgress: (Int) -> Unit
+    ): List<suspend () -> Boolean> {
+        val hlsTurboStep: suspend () -> Boolean = {
+            val ios = runCatching { fetchPureInnerTubeAudio(videoId, "IOS", quality, preferHls = true) }.getOrNull()
+            if (ios != null && ios.audioUrl.contains(".m3u8", true)) {
+                downloadHlsAudioOnlyParallel(ios.audioUrl, ios.userAgent, ios.cookie, target, parallel.coerceIn(6, 12), onProgress)
+            } else false
+        }
+
+        val microBurstStep: suspend () -> Boolean = {
+            val stream = runCatching { fetchPureInnerTubeAudio(videoId, "ANDROID_VR", quality, preferHls = false) }.getOrNull()
+                ?: runCatching { fetchPureInnerTubeAudio(videoId, "TV_SIMPLY", quality, preferHls = false) }.getOrNull()
+            if (stream != null && !stream.audioUrl.contains(".m3u8", true)) {
+                val clean = sanitizeYouTubePlaybackUrl(stream.audioUrl)
+                downloadMicroBurstToDisk(clean, stream.userAgent, stream.cookie, emptyMap(), target, false, parallel.coerceIn(6, 12), 256 * 1024L, onProgress)
+            } else false
+        }
+
+        val directStreamStep: suspend () -> Boolean = {
+            val stream = runCatching { fetchPureInnerTubeAudio(videoId, "ANDROID_VR", quality, preferHls = false) }.getOrNull()
+                ?: runCatching { fetchPureInnerTubeAudio(videoId, "IOS", quality, preferHls = false) }.getOrNull()
+            if (stream != null && !stream.audioUrl.contains(".m3u8", true)) {
+                val clean = sanitizeYouTubePlaybackUrl(stream.audioUrl)
+                downloadUrlToFile(clean, stream.userAgent, stream.cookie, emptyMap(), target, false, onProgress)
+            } else false
+        }
+
+        val capturedStep: suspend () -> Boolean = {
+            var done = false
+            for (cap in capturedStreams.filter { it.isAudioOnly }.take(2)) {
+                val clean = sanitizeYouTubePlaybackUrl(cap.url)
+                if (downloadMicroBurstToDisk(clean, cap.userAgent, cap.cookie, cap.headers, target, true, parallel.coerceIn(4, 10), 256 * 1024L, onProgress) ||
+                    downloadUrlToFile(clean, cap.userAgent, cap.cookie, cap.headers, target, true, onProgress)
+                ) {
+                    done = true; break
+                }
+            }
+            done
+        }
+
+        val ytDlpStep: suspend () -> Boolean = {
+            downloadViaYtDlpAudioOnly(videoId, quality, parallel, target, onProgress)
+        }
+
+        val proxyStep: suspend () -> Boolean = {
+            var done = false
+            val mirrors = listOf(
+                { fetchCobaltPureAudio(videoId) },
+                { fetchPipedPureAudio(videoId, quality) },
+                { fetchInvidiousPureAudio(videoId) }
+            )
+            for (m in mirrors) {
+                val res = runCatching { m() }.getOrNull() ?: continue
+                if (downloadUrlToFile(res.audioUrl, res.userAgent, res.cookie, emptyMap(), target, false, onProgress)) {
+                    done = true; break
+                }
+            }
+            done
+        }
+
+        return when (method) {
+            DownloadMethod.AUTO_SMART -> listOf(hlsTurboStep, microBurstStep, capturedStep, ytDlpStep, proxyStep)
+            DownloadMethod.HLS_TURBO -> listOf(hlsTurboStep, microBurstStep, ytDlpStep)
+            DownloadMethod.MICRO_BURST -> listOf(microBurstStep, hlsTurboStep, ytDlpStep)
+            DownloadMethod.INNERTUBE_DIRECT -> listOf(directStreamStep, microBurstStep, hlsTurboStep, ytDlpStep)
+            DownloadMethod.YTDLP_ENGINE -> listOf(ytDlpStep, hlsTurboStep, microBurstStep)
+            DownloadMethod.PROXY_FAST -> listOf(proxyStep, hlsTurboStep, microBurstStep, ytDlpStep)
+        }
     }
 
     private fun fetchPureInnerTubeAudio(videoId: String, clientType: String, quality: AudioQuality, preferHls: Boolean): ResolvedStreams? {
@@ -325,6 +389,14 @@ class OfflineDownloadEngine(private val context: Context) {
                 },
                 "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
                 "28", "1.65.10"
+            )
+            "TV_SIMPLY" -> Quad(
+                JSONObject().apply {
+                    put("clientName", "TVHTML5_SIMPLY_EMBEDDED_PLAYER"); put("clientVersion", "2.0")
+                    put("hl", "he"); put("gl", "IL")
+                },
+                "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+                "85", "2.0"
             )
             else -> Quad(
                 JSONObject().apply {
@@ -373,7 +445,7 @@ class OfflineDownloadEngine(private val context: Context) {
             val ordered = if (preferHls) {
                 (listOfNotNull(hls, preferred) + audioOnly.map { it.second }).distinct()
             } else {
-                (listOfNotNull(preferred) + audioOnly.map { it.second } + listOfNotNull(hls)).distinct()
+                (listOfNotNull(preferred) + audioOnly.map { it.second }).distinct()
             }
             val chosen = ordered.firstOrNull { verifyPureAudioUrl(it, ua) } ?: return null
             val kbps = audioOnly.firstOrNull { it.second == chosen }?.first ?: 128
@@ -466,13 +538,14 @@ class OfflineDownloadEngine(private val context: Context) {
     }
 
     private fun extractHlsAudioPlaylistUrl(manifest: String): String? {
+        val audioCandidates = mutableListOf<String>()
         manifest.lines().forEach { line ->
             if (line.contains("TYPE=AUDIO", true) && line.contains("URI=", true)) {
                 val m = Regex("URI=[\"'](https?://[^\"']+)[\"']").find(line)
-                if (m != null) return m.groupValues[1]
+                if (m != null) audioCandidates.add(m.groupValues[1])
             }
         }
-        return null
+        return audioCandidates.lastOrNull()
     }
 
     private fun pickTargetBitrate(list: List<Pair<Int, String>>, quality: AudioQuality): String? {
@@ -501,7 +574,6 @@ class OfflineDownloadEngine(private val context: Context) {
                 AudioQuality.HIGH -> "bestaudio[vcodec=none][abr<=145][ext=m4a]/bestaudio[vcodec=none][abr<=145]/bestaudio[vcodec=none]"
                 AudioQuality.VERY_HIGH, AudioQuality.LOSSLESS -> "bestaudio[vcodec=none][ext=m4a]/bestaudio[vcodec=none][ext=webm]/bestaudio[vcodec=none]"
             }
-            // Attempt 1: Let yt-dlp use its up-to-date default clients; Attempt 2: explicit android_vr/ios
             val attempts = listOf(
                 qualityFormat to null,
                 "bestaudio[vcodec=none]/bestaudio[abr<=192]" to "youtube:player_client=android_vr,ios,web"
@@ -520,7 +592,7 @@ class OfflineDownloadEngine(private val context: Context) {
                     addOption("--retries", "3")
                     addOption("--fragment-retries", "3")
                     addOption("--socket-timeout", "15")
-                    addOption("--concurrent-fragments", parallelCount.coerceIn(2, 6).toString())
+                    addOption("--concurrent-fragments", parallelCount.coerceIn(4, 10).toString())
                     addOption("-f", fmt)
                     if (extractorArgs != null) addOption("--extractor-args", extractorArgs)
                     addOption("-o", tmpFile.absolutePath)
@@ -528,15 +600,10 @@ class OfflineDownloadEngine(private val context: Context) {
 
                 val ok = runCatching {
                     YoutubeDL.getInstance().execute(request, "sonify_dl_$videoId") { progress: Float, _: Long, _: String ->
-                        if (progress > 0f && progress <= 100f) {
-                            onProgress(progress.toInt().coerceIn(5, 98))
-                        }
+                        if (progress > 0f && progress <= 100f) onProgress(progress.toInt().coerceIn(5, 98))
                     }
-                    val produced = if (tmpFile.exists() && tmpFile.length() > 20_480) {
-                        tmpFile
-                    } else {
-                        target.parentFile?.listFiles()?.firstOrNull { it.name.startsWith(tmpPrefix) && it.length() > 20_480 }
-                    }
+                    val produced = if (tmpFile.exists() && tmpFile.length() > 20_480) tmpFile
+                    else target.parentFile?.listFiles()?.firstOrNull { it.name.startsWith(tmpPrefix) && it.length() > 20_480 }
                     if (produced != null) {
                         if (target.exists()) target.delete()
                         produced.renameTo(target)
@@ -589,20 +656,6 @@ class OfflineDownloadEngine(private val context: Context) {
         return rb.build()
     }
 
-    private suspend fun downloadAudioSmart(
-        url: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>,
-        target: File, isWebOrigin: Boolean, parallel: Int, onProgress: (Int) -> Unit
-    ): Boolean {
-        if (url.contains(".m3u8", true) || url.contains("manifest/hls", true)) {
-            return downloadHlsAudioOnlyParallel(url, userAgent, cookie, target, parallel, onProgress)
-        }
-        val clean = sanitizeYouTubePlaybackUrl(url)
-        if (clean.contains("googlevideo.com") && clean.contains("clen=")) {
-            if (downloadChunkedDirectToDisk(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, parallel, onProgress)) return true
-        }
-        return downloadUrlToFile(clean, userAgent, cookie, extraHeaders, target, isWebOrigin, onProgress)
-    }
-
     private suspend fun downloadHlsAudioOnlyParallel(
         manifestUrl: String, userAgent: String, cookie: String?, target: File, parallel: Int, onProgress: (Int) -> Unit
     ): Boolean {
@@ -621,13 +674,12 @@ class OfflineDownloadEngine(private val context: Context) {
             if (segments.isEmpty()) return false
 
             var completed = 0
-            val workers = parallel.coerceIn(3, 6)
+            val workers = parallel.coerceIn(4, 12)
             FileOutputStream(tmp).use { out ->
                 for (batch in segments.chunked(workers)) {
                     val fetched = coroutineScope {
                         batch.map { segUrl ->
                             async(Dispatchers.IO) {
-                                // Up to 3 retries per HLS segment so transient cellular drops never kill a download!
                                 var data: ByteArray? = null
                                 for (attempt in 0..2) {
                                     data = runCatching {
@@ -636,7 +688,7 @@ class OfflineDownloadEngine(private val context: Context) {
                                         }
                                     }.getOrNull()
                                     if (data != null && data.isNotEmpty()) break
-                                    delay(250L * (attempt + 1))
+                                    delay(200L * (attempt + 1))
                                 }
                                 data
                             }
@@ -647,7 +699,7 @@ class OfflineDownloadEngine(private val context: Context) {
                         out.write(bytes)
                         completed++
                     }
-                    onProgress((completed * 97 / segments.size).coerceIn(5, 98))
+                    onProgress((completed * 98 / segments.size).coerceIn(5, 98))
                 }
             }
             if (tmp.exists() && tmp.length() > 20_480) {
@@ -706,17 +758,21 @@ class OfflineDownloadEngine(private val context: Context) {
         }
     }
 
-    private suspend fun downloadChunkedDirectToDisk(
+    /**
+     * Micro-Burst Chunked Downloader: splits audio into small 256KB blocks across 6–12 parallel connections
+     * so every single request rides YouTube's unthrottled initial burst window!
+     */
+    private suspend fun downloadMicroBurstToDisk(
         baseUrl: String, userAgent: String, cookie: String?, extraHeaders: Map<String, String>,
-        target: File, isWebOrigin: Boolean, parallel: Int, onProgress: (Int) -> Unit
+        target: File, isWebOrigin: Boolean, parallel: Int, blockSizeBytes: Long, onProgress: (Int) -> Unit
     ): Boolean {
         val clen = Regex("[?&]clen=(\\d+)").find(baseUrl)?.groupValues?.get(1)?.toLongOrNull() ?: return false
         if (clen <= 0L || clen > 75_000_000L) return false
 
         val tmp = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
         return try {
-            val workers = parallel.coerceIn(3, 6)
-            val chunkSize = (clen / workers).coerceIn(256 * 1024L, 1_536 * 1024L)
+            val workers = parallel.coerceIn(4, 12)
+            val chunkSize = blockSizeBytes.coerceIn(192 * 1024L, 512 * 1024L)
             val ranges = mutableListOf<Pair<Long, Long>>()
             var cursor = 0L
             while (cursor < clen) {
@@ -779,7 +835,7 @@ class OfflineDownloadEngine(private val context: Context) {
                         if (result == 1) return true
                         if (writtenThisAttempt > 0) totalWritten.addAndGet(-writtenThisAttempt)
                         if (aborted.get()) return false
-                        delay(300L * (attempt + 1))
+                        delay(250L * (attempt + 1))
                     }
                     return false
                 }
