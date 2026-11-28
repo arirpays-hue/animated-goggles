@@ -9,7 +9,6 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.audiofx.Equalizer
 import android.media.audiofx.LoudnessEnhancer
-import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
@@ -17,6 +16,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -35,14 +35,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.database.StandaloneDatabaseProvider
-import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.datasource.cache.CacheDataSource
-import androidx.media3.datasource.cache.CacheWriter
-import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
-import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -54,98 +47,23 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.File
+import java.io.ByteArrayInputStream
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
-
-/**
- * 250MB Persistent ExoPlayer Disk Cache with stable per-track cache keys (`sonify_track_<id>`).
- * Because YouTube signed URLs change on every request, keying by Track ID ensures instant 0ms hits
- * when skipping to pre-warmed tracks or replaying songs!
- */
-object AudioCacheHolder {
-    private const val MAX_CACHE_BYTES = 250L * 1024L * 1024L
-
-    @Volatile private var cacheInstance: SimpleCache? = null
-    private val lock = Any()
-
-    fun cacheKeyFor(trackId: String): String = "sonify_track_${trackId.replace(Regex("[^a-zA-Z0-9_-]"), "_")}"
-
-    fun get(context: Context): SimpleCache {
-        return cacheInstance ?: synchronized(lock) {
-            cacheInstance ?: run {
-                val dir = File(context.applicationContext.cacheDir, "exo_stream_cache").apply { if (!exists()) mkdirs() }
-                val db = StandaloneDatabaseProvider(context.applicationContext)
-                SimpleCache(dir, LeastRecentlyUsedCacheEvictor(MAX_CACHE_BYTES), db).also { cacheInstance = it }
-            }
-        }
-    }
-
-    fun isTrackWarmed(context: Context, trackId: String): Boolean = runCatching {
-        val cache = get(context)
-        val key = cacheKeyFor(trackId)
-        cache.getCachedBytes(key, 0L, 1_024L * 1024L) >= 196_608L
-    }.getOrDefault(false)
-
-    fun buildCacheDataSourceFactory(context: Context, userAgent: String, cookie: String? = null): CacheDataSource.Factory {
-        val headers = mutableMapOf<String, String>()
-        if (!cookie.isNullOrBlank()) headers["Cookie"] = cookie
-        val httpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(userAgent)
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(10_000)
-            .setReadTimeoutMs(15_000)
-            .setDefaultRequestProperties(headers)
-        val upstream = DefaultDataSource.Factory(context.applicationContext, httpFactory)
-        return CacheDataSource.Factory()
-            .setCache(get(context))
-            .setUpstreamDataSourceFactory(upstream)
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-    }
-
-    /**
-     * Streams the first ~3.5MB of the upcoming track directly into ExoPlayer's SimpleCache
-     * under its stable `sonify_track_<id>` key so switching tracks is instantaneous with zero spinner!
-     */
-    fun prewarmTrackOnDisk(
-        context: Context,
-        trackId: String,
-        audioUrl: String,
-        userAgent: String,
-        cookie: String? = null,
-        maxBytes: Long = 3_500_000L
-    ): Boolean {
-        if (audioUrl.startsWith("file:") || audioUrl.startsWith("content:") || audioUrl.contains(".m3u8", true)) return false
-        if (isTrackWarmed(context, trackId)) return true
-        return runCatching {
-            val cache = get(context)
-            val key = cacheKeyFor(trackId)
-            val dataSource = buildCacheDataSourceFactory(context, userAgent, cookie).createDataSource()
-            val dataSpec = DataSpec.Builder()
-                .setUri(Uri.parse(audioUrl))
-                .setKey(key)
-                .setPosition(0L)
-                .setLength(maxBytes)
-                .build()
-            val writer = CacheWriter(dataSource, dataSpec, ByteArray(32 * 1024)) { _, _, _ -> }
-            writer.cache()
-            cache.getCachedBytes(key, 0L, maxBytes) > 128_000L
-        }.getOrDefault(false)
-    }
-
-    fun clearAllEntries() {
-        val c = cacheInstance ?: return
-        runCatching {
-            c.keys.toList().forEach { key ->
-                runCatching { c.removeResource(key) }
-            }
-        }
-    }
-}
 
 class WebYouTubeEngine(private val context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val capturedMap = ConcurrentHashMap<String, MutableList<CapturedMediaStream>>()
+
+    private val adBlockedHosts = listOf(
+        "doubleclick.net",
+        "googlesyndication.com",
+        "googleadservices.com",
+        "pagead2.",
+        "/api/stats/ads",
+        "/pagead/",
+        "adservice.google"
+    )
 
     @Volatile private var webView: WebView? = null
     @Volatile private var activeVideoId: String = ""
@@ -161,6 +79,8 @@ class WebYouTubeEngine(private val context: Context) {
     var onEnded: (() -> Unit)? = null
 
     fun isActive(): Boolean = activeMode
+    fun isPlaying(): Boolean = activeMode && isPlayingNow
+    fun currentPositionMs(): Long = currentPosMs
 
     fun getCapturedStreams(videoId: String): List<CapturedMediaStream> =
         capturedMap[videoId]?.toList().orEmpty()
@@ -183,7 +103,10 @@ class WebYouTubeEngine(private val context: Context) {
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                     val url = request?.url?.toString().orEmpty()
-                    if (url.contains("[googlevideo.com/videoplayback](https://googlevideo.com/videoplayback)", true) && activeVideoId.isNotBlank()) {
+                    if (adBlockedHosts.any { url.contains(it, ignoreCase = true) }) {
+                        return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                    }
+                    if (url.contains("googlevideo.com/videoplayback", true) && activeVideoId.isNotBlank()) {
                         val isAudio = url.contains("mime=audio", true) || url.contains("mime%3Daudio", true)
                         if (isAudio) {
                             val ua = request?.requestHeaders?.get("User-Agent") ?: settings.userAgentString
@@ -235,7 +158,7 @@ class WebYouTubeEngine(private val context: Context) {
                 <style>html,body,#player{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden;}</style>
                 </head><body>
                 <div id="player"></div>
-                <script src="[https://www.youtube.com/iframe_api](https://www.youtube.com/iframe_api)"></script>
+                <script src="https://www.youtube.com/iframe_api"></script>
                 <script>
                   var ytPlayer = null;
                   function onYouTubeIframeAPIReady() {
@@ -264,11 +187,11 @@ class WebYouTubeEngine(private val context: Context) {
                       var dur = Math.floor((ytPlayer.getDuration() || 0) * 1000);
                       SonifyBridge.onTick(pos, dur, st === 1, st === 3 || st === -1);
                     } catch(err){}
-                  }, 450);
+                  }, 400);
                 </script>
                 </body></html>
             """.trimIndent()
-            wv.loadDataWithBaseURL("[https://www.youtube-nocookie.com](https://www.youtube-nocookie.com)", html, "text/html", "UTF-8", null)
+            wv.loadDataWithBaseURL("https://www.youtube-nocookie.com", html, "text/html", "UTF-8", null)
         }
     }
 
@@ -357,6 +280,10 @@ class AudioEngine(private val context: Context) {
     @Volatile private var currentSettings: AppSettings = AppSettings()
     @Volatile private var sleepEndOfTrack: Boolean = false
     @Volatile private var isMuted: Boolean = false
+    @Volatile private var isDuckingForDj: Boolean = false
+    @Volatile private var sleepFadeMultiplier: Float = 1f
+    @Volatile private var crossfadeMultiplier: Float = 1f
+    @Volatile private var crossfadeTriggeredForMediaId: String = ""
 
     private var equalizer: Equalizer? = null
     private var loudnessEnhancer: LoudnessEnhancer? = null
@@ -367,6 +294,7 @@ class AudioEngine(private val context: Context) {
     private var wifiLock: WifiManager.WifiLock? = null
     private var sleepTimerJob: Job? = null
     private var progressJob: Job? = null
+    private var fadeInJob: Job? = null
 
     var onProgressUpdate: ((pos: Long, dur: Long, playing: Boolean, buffering: Boolean) -> Unit)? = null
     var onTrackEnded: (() -> Unit)? = null
@@ -425,8 +353,16 @@ class AudioEngine(private val context: Context) {
     }
 
     private fun buildExoPlayer(profile: AudioBufferProfile): ExoPlayer {
+        // Ultra-fast 250ms start-of-playback buffer paired with deep background stability shield
+        val minBuf = profile.minMs.coerceIn(20_000, 60_000)
+        val maxBuf = profile.maxMs.coerceIn(60_000, 180_000)
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(profile.minMs, profile.maxMs, profile.playMs, profile.rebufferMs)
+            .setBufferDurationsMs(
+                /* minBufferMs = */ minBuf,
+                /* maxBufferMs = */ maxBuf,
+                /* bufferForPlaybackMs = */ 250,
+                /* bufferForPlaybackAfterRebufferMs = */ 850
+            )
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
         val attrs = AudioAttributes.Builder()
@@ -440,6 +376,56 @@ class AudioEngine(private val context: Context) {
             .build()
     }
 
+    /**
+     * Returns true once the current song has >= 6 seconds buffered ahead so background
+     * disk pre-warming never steals bandwidth from active song startup.
+     */
+    fun isComfortablyBuffered(): Boolean {
+        if (webEngine.isActive()) return true
+        return player.isPlaying &&
+            player.playbackState == Player.STATE_READY &&
+            (player.bufferedPosition - player.currentPosition) >= 6_000L
+    }
+
+    private fun applyCompositeVolume() {
+        val target = when {
+            isMuted -> 0f
+            isDuckingForDj -> (0.24f * sleepFadeMultiplier).coerceIn(0.05f, 1f)
+            else -> (sleepFadeMultiplier * crossfadeMultiplier).coerceIn(0f, 1f)
+        }
+        player.volume = target
+        webEngine.setVolume(target)
+    }
+
+    private fun startFadeInIfNeeded(fadeMs: Long) {
+        fadeInJob?.cancel()
+        if (fadeMs <= 0L) {
+            crossfadeMultiplier = 1f
+            applyCompositeVolume()
+            return
+        }
+        fadeInJob = scope.launch {
+            val steps = 16
+            val stepDelay = (fadeMs / steps).coerceAtLeast(35L)
+            for (i in 1..steps) {
+                crossfadeMultiplier = (i.toFloat() / steps.toFloat()).coerceIn(0.08f, 1f)
+                applyCompositeVolume()
+                delay(stepDelay)
+            }
+            crossfadeMultiplier = 1f
+            applyCompositeVolume()
+        }
+    }
+
+    private fun effectiveCrossfadeSec(): Int {
+        val s = currentSettings
+        return when {
+            s.crossfadeSeconds > 0 -> s.crossfadeSeconds.coerceIn(1, 12)
+            s.automixEnabled -> 4
+            else -> 0
+        }
+    }
+
     private fun startProgressTicker() {
         progressJob?.cancel()
         progressJob = scope.launch {
@@ -449,9 +435,29 @@ class AudioEngine(private val context: Context) {
                     val dur = player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: 0L
                     val playing = player.isPlaying
                     val buffering = player.playbackState == Player.STATE_BUFFERING
+
+                    // Smooth Crossfade / Automix ramp-down near track end
+                    val cfSec = effectiveCrossfadeSec()
+                    val mediaId = player.currentMediaItem?.mediaId.orEmpty()
+                    if (playing && cfSec > 0 && dur > 30_000L && !sleepEndOfTrack) {
+                        val remainingMs = dur - pos
+                        val cfMs = cfSec * 1000L
+                        if (remainingMs in 1L..cfMs) {
+                            crossfadeMultiplier = (remainingMs.toFloat() / cfMs.toFloat()).coerceIn(0.06f, 1f)
+                            applyCompositeVolume()
+                            if (remainingMs <= 450L && mediaId.isNotBlank() && crossfadeTriggeredForMediaId != mediaId) {
+                                crossfadeTriggeredForMediaId = mediaId
+                                onTrackEnded?.invoke()
+                            }
+                        } else if (fadeInJob?.isActive != true && crossfadeMultiplier < 0.99f) {
+                            crossfadeMultiplier = 1f
+                            applyCompositeVolume()
+                        }
+                    }
+
                     onProgressUpdate?.invoke(pos, dur, playing, buffering)
                 }
-                delay(350L)
+                delay(300L)
             }
         }
     }
@@ -489,6 +495,31 @@ class AudioEngine(private val context: Context) {
         runCatching {
             tts = TextToSpeech(context.applicationContext) { status ->
                 ttsReady = (status == TextToSpeech.SUCCESS)
+                if (ttsReady) {
+                    tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String?) {
+                            mainHandler.post {
+                                isDuckingForDj = true
+                                applyCompositeVolume()
+                            }
+                        }
+
+                        override fun onDone(utteranceId: String?) {
+                            mainHandler.post {
+                                isDuckingForDj = false
+                                applyCompositeVolume()
+                            }
+                        }
+
+                        @Deprecated("Deprecated in Java")
+                        override fun onError(utteranceId: String?) {
+                            mainHandler.post {
+                                isDuckingForDj = false
+                                applyCompositeVolume()
+                            }
+                        }
+                    })
+                }
             }
         }
     }
@@ -498,13 +529,13 @@ class AudioEngine(private val context: Context) {
     fun getCapturedStreams(videoId: String): List<CapturedMediaStream> = webEngine.getCapturedStreams(videoId)
 
     /**
-     * Pre-warms the next track in the queue straight into ExoPlayer's 250MB SimpleCache on disk
-     * under `sonify_track_<id>` for instantaneous gapless playback!
+     * Pre-warms the next track directly into PlaybackDiskManager's SimpleCache
+     * under its stable `sonify_track_<id>` key for 0ms track switches.
      */
     fun prewarmNextTrackDiskCache(track: Track, resolved: ResolvedStreams) {
         if (resolved.isOffline || track.source != StreamSource.YOUTUBE) return
         scope.launch(Dispatchers.IO) {
-            AudioCacheHolder.prewarmTrackOnDisk(
+            PlaybackDiskManager.prewarmTrackHeadOnDisk(
                 context = context,
                 trackId = track.id,
                 audioUrl = resolved.audioUrl,
@@ -521,9 +552,17 @@ class AudioEngine(private val context: Context) {
         startPositionMs: Long = 0L
     ) {
         webEngine.stopAndDeactivate()
-        val cacheKey = AudioCacheHolder.cacheKeyFor(track.id)
-        val dsFactory = AudioCacheHolder.buildCacheDataSourceFactory(context, resolved.userAgent, resolved.cookie)
-        val mediaSourceFactory = DefaultMediaSourceFactory(dsFactory)
+        crossfadeTriggeredForMediaId = ""
+        val isLocalUri = resolved.audioUrl.startsWith("file:") || resolved.audioUrl.startsWith("content:")
+        val cacheKey = PlaybackDiskManager.cacheKeyFor(track.id)
+
+        // Direct local disk DataSource for offline/local/disk-cached tracks -> zero HTTP overhead
+        val mediaSourceFactory = if (isLocalUri && !videoMode) {
+            DefaultMediaSourceFactory(DefaultDataSource.Factory(context.applicationContext))
+        } else {
+            val dsFactory = PlaybackDiskManager.buildCacheDataSourceFactory(context, resolved.userAgent, resolved.cookie)
+            DefaultMediaSourceFactory(dsFactory)
+        }
 
         val meta = MediaMetadata.Builder()
             .setTitle(track.title)
@@ -531,12 +570,12 @@ class AudioEngine(private val context: Context) {
             .setAlbumTitle(track.album)
             .build()
 
-        val audioItem = MediaItem.Builder()
+        val audioItemBuilder = MediaItem.Builder()
             .setUri(resolved.audioUrl)
             .setMediaId(track.id)
-            .setCustomCacheKey(cacheKey)
             .setMediaMetadata(meta)
-            .build()
+        if (!isLocalUri) audioItemBuilder.setCustomCacheKey(cacheKey)
+        val audioItem = audioItemBuilder.build()
 
         val finalSource = if (videoMode && !resolved.videoOnlyUrl.isNullOrBlank()) {
             val videoItem = MediaItem.Builder()
@@ -560,8 +599,14 @@ class AudioEngine(private val context: Context) {
 
         player.setMediaSource(finalSource)
         player.playbackParameters = PlaybackParameters(currentSettings.playbackSpeed)
-        player.volume = if (isMuted) 0f else 1f
         if (startPositionMs > 0L) player.seekTo(startPositionMs)
+        val cfSec = effectiveCrossfadeSec()
+        if (cfSec > 0 && startPositionMs == 0L && !track.isPodcastOrAudiobook) {
+            startFadeInIfNeeded((cfSec * 450L).coerceAtMost(2500L))
+        } else {
+            crossfadeMultiplier = 1f
+            applyCompositeVolume()
+        }
         player.prepare()
         player.play()
         acquireLocksIfAllowed()
@@ -573,23 +618,23 @@ class AudioEngine(private val context: Context) {
 
     fun playViaWebEngine(videoId: String, startAtMs: Long, title: String, artist: String) {
         runCatching { player.stop(); player.clearMediaItems() }
+        crossfadeTriggeredForMediaId = ""
+        crossfadeMultiplier = 1f
         webEngine.setPlaybackRate(currentSettings.playbackSpeed)
-        webEngine.setVolume(if (isMuted) 0f else 1f)
+        applyCompositeVolume()
         webEngine.loadVideo(videoId, startAtMs, title, artist)
         acquireLocksIfAllowed()
     }
 
     fun setMuted(muted: Boolean) {
         isMuted = muted
-        val vol = if (muted) 0f else 1f
-        player.volume = vol
-        webEngine.setVolume(vol)
+        applyCompositeVolume()
     }
 
     fun togglePlayPause(onNeedRetry: () -> Unit = {}) {
         if (webEngine.isActive()) {
             if (player.isPlaying) player.pause()
-            webEngine.play()
+            if (webEngine.isPlaying()) webEngine.pause() else webEngine.play()
             return
         }
         when {
@@ -614,7 +659,7 @@ class AudioEngine(private val context: Context) {
     }
 
     fun skipByDelta(deltaMs: Long) {
-        val cur = if (webEngine.isActive()) 0L else player.currentPosition
+        val cur = if (webEngine.isActive()) webEngine.currentPositionMs() else player.currentPosition
         val dur = player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: Long.MAX_VALUE
         val target = (cur + deltaMs).coerceIn(0L, dur)
         seekTo(target)
@@ -624,6 +669,7 @@ class AudioEngine(private val context: Context) {
         currentSettings = settings
         player.playbackParameters = PlaybackParameters(settings.playbackSpeed)
         webEngine.setPlaybackRate(settings.playbackSpeed)
+        PlaybackDiskManager.setLimitMb(context, settings.playbackDiskLimitMb)
         attachAudioEffects()
     }
 
@@ -673,6 +719,8 @@ class AudioEngine(private val context: Context) {
     fun startSleepTimer(minutes: Int, onTick: (Int?) -> Unit) {
         sleepTimerJob?.cancel()
         sleepEndOfTrack = false
+        sleepFadeMultiplier = 1f
+        applyCompositeVolume()
         if (minutes <= 0) {
             onTick(null)
             return
@@ -682,20 +730,15 @@ class AudioEngine(private val context: Context) {
             while (remainingSec > 0 && isActive) {
                 onTick((remainingSec + 59) / 60)
                 if (remainingSec <= 6) {
-                    val fadeVol = (remainingSec / 6f).coerceIn(0.05f, 1f)
-                    if (!isMuted) {
-                        player.volume = fadeVol
-                        webEngine.setVolume(fadeVol)
-                    }
+                    sleepFadeMultiplier = (remainingSec / 6f).coerceIn(0.05f, 1f)
+                    applyCompositeVolume()
                 }
                 delay(1000L)
                 remainingSec--
             }
             setPlaying(false)
-            if (!isMuted) {
-                player.volume = 1f
-                webEngine.setVolume(1f)
-            }
+            sleepFadeMultiplier = 1f
+            applyCompositeVolume()
             onTick(null)
         }
     }
@@ -703,6 +746,8 @@ class AudioEngine(private val context: Context) {
     fun setSleepEndOfTrack(enabled: Boolean) {
         sleepTimerJob?.cancel()
         sleepEndOfTrack = enabled
+        sleepFadeMultiplier = 1f
+        applyCompositeVolume()
     }
 
     fun getSystemVolumeFraction(): Float {
