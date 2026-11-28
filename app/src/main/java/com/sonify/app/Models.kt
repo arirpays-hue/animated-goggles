@@ -43,14 +43,61 @@ enum class LyricsLanguage(val apiName: String, val labelHe: String, val labelEn:
 
 enum class DownloadSpeedMode(val parallelChunks: Int, val concurrentSongs: Int, val labelHe: String, val labelEn: String) {
     BALANCED(4, 1, "מאוזן (4 חיבורים)", "Balanced (4x)"),
-    TURBO(6, 2, "טורבו (6 חיבורים)", "Turbo (6x)"),
-    MAX(8, 2, "מקסימום (8 חיבורים)", "Max (8x)");
+    TURBO(8, 2, "טורבו (8 חיבורים)", "Turbo (8x)"),
+    MAX(12, 2, "מקסימום (12 חיבורים)", "Max (12x)");
     fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
 }
 
+enum class DownloadMethod(
+    val labelHe: String,
+    val labelEn: String,
+    val subHe: String,
+    val subEn: String
+) {
+    AUTO_SMART(
+        "אוטומטי חכם (הכי מהיר)",
+        "Auto Smart (Fastest)",
+        "משלב HLS Turbo + מיקרו-פיצול 256KB + גיבוי yt-dlp אוטומטי",
+        "Combines HLS Turbo + 256KB Micro-Burst + yt-dlp fallback"
+    ),
+    HLS_TURBO(
+        "HLS Turbo (מקטעי iOS ×10)",
+        "HLS Turbo (iOS 10x)",
+        "מוריד מקטעי אודיו במקביל — עוקף האטת רוחב פס של יוטיוב",
+        "Parallel iOS audio segments — bypasses YouTube bandwidth throttling"
+    ),
+    MICRO_BURST(
+        "מיקרו-פיצול (256KB ×10)",
+        "Micro-Burst (256KB x10)",
+        "מפצל את קובץ האודיו לבלוקים קטנים של 256KB להורדה תוך 1–2 שניות",
+        "Splits audio into 256KB burst chunks to beat per-connection limits"
+    ),
+    INNERTUBE_DIRECT(
+        "זרם ישיר (ANDROID_VR / TV)",
+        "Direct Stream (VR / TV)",
+        "הורדה ישירה בחיבור נקי משרת האודיו של יוטיוב",
+        "Clean direct adaptive audio download"
+    ),
+    YTDLP_ENGINE(
+        "מנוע yt-dlp (אודיו נקי)",
+        "yt-dlp Pure Audio",
+        "מנוע חיצוני חזק לשירים מוגנים (אודיו בלבד vcodec=none)",
+        "High-compatibility pure audio extractor (vcodec=none)"
+    ),
+    PROXY_FAST(
+        "שרתי מראה (Cobalt / Piped)",
+        "Fast Mirrors (Cobalt / Piped)",
+        "מוריד דרך שרתי פרוקסי חיצוניים לעקיפת חסימות ספק",
+        "Downloads through external audio mirrors"
+    );
+
+    fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
+    fun sub(isEn: Boolean) = if (isEn) subEn else subHe
+}
+
 enum class AudioBufferProfile(val minMs: Int, val maxMs: Int, val playMs: Int, val rebufferMs: Int, val labelHe: String, val labelEn: String) {
-    STANDARD(30_000, 90_000, 600, 1_800, "רגיל (30s)", "Standard (30s)"),
-    HIGH_STABILITY(60_000, 180_000, 750, 2_200, "יציב לרשת חלשה (60s)", "Weak-Network Shield (60s)");
+    STANDARD(30_000, 90_000, 500, 1_500, "רגיל (30s)", "Standard (30s)"),
+    HIGH_STABILITY(60_000, 180_000, 650, 2_000, "יציב לרשת חלשה (60s)", "Weak-Network Shield (60s)");
     fun label(isEn: Boolean) = if (isEn) labelEn else labelHe
 }
 
@@ -173,7 +220,13 @@ data class Track(
     val isExplicit: Boolean = false,
     val isSmartInjected: Boolean = false,
     val addedAt: Long = System.currentTimeMillis()
-)
+) {
+    val isPodcastOrAudiobook: Boolean
+        get() = isPodcast || isAudiobook || durationMs >= 15L * 60_000L ||
+            title.contains("פודקאסט") || title.contains("פרק ") ||
+            title.contains("podcast", true) || title.contains("episode", true) ||
+            title.contains("interview", true) || title.contains("ראיון")
+}
 
 data class RemotePlaylist(
     val id: String,
@@ -195,16 +248,37 @@ data class TrackCreditEntry(
     val isMainArtist: Boolean = false
 )
 
+data class PodcastComment(
+    val id: String = UUID.randomUUID().toString(),
+    val author: String,
+    val text: String,
+    val timeAgo: String,
+    val likes: Int = 0,
+    val timestampSec: Int? = null
+)
+
 data class NowPlayingExtras(
     val trackId: String,
     val artistPhotoUrl: String = "",
     val artistBio: String = "",
     val artistSubscribers: String = "",
+    val episodeDescription: String = "",
+    val episodePublishDate: String = "",
     val credits: List<TrackCreditEntry> = emptyList(),
     val artistEpisodes: List<Track> = emptyList(),
     val artistTopTrack: Track? = null,
     val similarArtistTrack: Track? = null,
     val similarSongTrack: Track? = null
+)
+
+data class SamplesFeedState(
+    val title: String,
+    val subtitle: String = "",
+    val sourceArtist: String = "",
+    val tracks: List<Track> = emptyList(),
+    val tags: List<String> = emptyList(),
+    val isLoading: Boolean = false,
+    val isMuted: Boolean = false
 )
 
 data class WidgetQuickTile(
@@ -230,7 +304,7 @@ data class ResolvedStreams(
     val audioUrl: String,
     val videoUrl: String? = null,
     val videoOnlyUrl: String? = null,
-    val userAgent: String = "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+    val userAgent: String = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
     val cookie: String? = null,
     val isLossless: Boolean = false,
     val isOffline: Boolean = false,
@@ -318,7 +392,7 @@ data class FriendProfile(
     val name: String,
     val currentActivity: String = "",
     val isOnline: Boolean = true,
-    val roomCode: String = "" // Optional live cloudless chat room code (via ntfy.sh)
+    val roomCode: String = ""
 )
 
 data class ChatMessage(
@@ -434,9 +508,6 @@ object BlendTasteCodec {
     }
 }
 
-/**
- * Real clickable HTTPS + custom-scheme deep links that launch Sonify directly on the linked item!
- */
 object SonifyShareLinks {
     fun trackUrl(track: Track, posMs: Long = 0L): String {
         val sec = (posMs / 1000L).toInt().coerceAtLeast(0)
@@ -487,6 +558,7 @@ data class AppSettings(
     val wifiQuality: AudioQuality = AudioQuality.VERY_HIGH,
     val cellularQuality: AudioQuality = AudioQuality.HIGH,
     val downloadQuality: AudioQuality = AudioQuality.HIGH,
+    val downloadMethod: DownloadMethod = DownloadMethod.AUTO_SMART,
     val autoAdjustQuality: Boolean = true,
     val subsonicUrl: String = "",
     val subsonicUser: String = "",
