@@ -5,7 +5,6 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.provider.MediaStore
-import android.text.Html
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -60,6 +59,7 @@ class StreamRepository(private val context: Context) {
 
     val downloadEngine: OfflineDownloadEngine = OfflineDownloadCoordinator.getEngine(context)
     val aiClient = AiApiClient()
+    val lyricsEngine = LyricsEngine(context)
 
     private val artistPhotoCache = ConcurrentHashMap<String, String>()
     private val artistInfoCache = ConcurrentHashMap<String, SimilarArtist>()
@@ -103,9 +103,6 @@ class StreamRepository(private val context: Context) {
         "https://api.cobalt.tools",
         "https://cobalt-api.kwiatekmiki.com"
     )
-
-    private val lyricsCacheDir: File
-        get() = File(context.filesDir, "lyrics_cache").apply { if (!exists()) mkdirs() }
 
     // ---------- Delegated Offline & Network Utilities ----------
     suspend fun prewarmYtDlp() = downloadEngine.prewarmYtDlp()
@@ -178,6 +175,8 @@ class StreamRepository(private val context: Context) {
         }
     }
 
+    fun clearLyricsCache() = lyricsEngine.clearCache()
+
     suspend fun testAiConnection(settings: AppSettings): Pair<Boolean, String> = aiClient.testConnection(settings)
 
     // ---------- 1. Search Songs, Artists, Podcasts & Audiobooks ----------
@@ -240,9 +239,57 @@ class StreamRepository(private val context: Context) {
         (s1 + s2).distinctBy { it.id }.take(35)
     }
 
-    // ---------- 1B. Real Artist Photo + Full Now Playing Extras (Spotify-Grade) ----------
+    // ---------- 1A. Vertical Song Samples Feed ("דומה ל..." / "שירים של...") ----------
+    suspend fun fetchSamplesForCard(
+        mode: String, // "ARTIST_SONGS", "SIMILAR_ARTIST", "SIMILAR_SONG"
+        track: Track,
+        settings: AppSettings
+    ): List<Track> = withContext(Dispatchers.IO) {
+        if (settings.offlineMode) return@withContext emptyList()
+        val mainArtist = lyricsEngine.cleanArtist(track.artist).ifBlank { track.artist.trim() }
+        val cleanTitle = lyricsEngine.cleanTitle(track.title).ifBlank { track.title.trim() }
+
+        val queries = when (mode) {
+            "ARTIST_SONGS" -> listOf("$mainArtist best songs", "$mainArtist popular hits")
+            "SIMILAR_ARTIST" -> listOf("$mainArtist similar artists hits", "artists like $mainArtist songs")
+            else -> listOf("$cleanTitle $mainArtist similar songs", "$cleanTitle vibe songs")
+        }
+
+        val results = coroutineScope {
+            queries.map { q ->
+                async { runCatching { searchTracks(q, settings, maxResults = 16) }.getOrDefault(emptyList()) }
+            }.awaitAll().flatten()
+        }
+
+        val filtered = results
+            .filter { it.id != track.id && !it.isPodcastOrAudiobook }
+            .distinctBy { it.id }
+            .let { list ->
+                if (mode == "SIMILAR_ARTIST") {
+                    val nonSelf = list.filterNot { it.artist.contains(mainArtist, true) }
+                    if (nonSelf.size >= 5) nonSelf else list
+                } else list
+            }
+            .take(18)
+
+        filtered
+    }
+
+    suspend fun fetchRelatedPodcastEpisodes(track: Track, settings: AppSettings): List<Track> = withContext(Dispatchers.IO) {
+        if (settings.offlineMode) return@withContext emptyList()
+        val showName = lyricsEngine.cleanArtist(track.artist).ifBlank { track.artist.trim() }
+        val topicHint = lyricsEngine.cleanTitle(track.title).take(32)
+        val (sameShow, relatedTopic) = coroutineScope {
+            val j1 = async { runCatching { searchYouTubeWeb("$showName פרק podcast", isPodcast = true, isAudiobook = false, maxLimit = 8) }.getOrDefault(emptyList()) }
+            val j2 = async { runCatching { searchYouTubeWeb("$topicHint podcast", isPodcast = true, isAudiobook = false, maxLimit = 6) }.getOrDefault(emptyList()) }
+            j1.await() to j2.await()
+        }
+        (sameShow + relatedTopic).filter { it.id != track.id }.distinctBy { it.id }.take(10)
+    }
+
+    // ---------- 1B. Real Artist Photo + Full Now Playing / Podcast Extras ----------
     suspend fun fetchArtistPhotoUrl(artistName: String): String = withContext(Dispatchers.IO) {
-        val clean = cleanArtistName(artistName).ifBlank { artistName.trim() }
+        val clean = lyricsEngine.cleanArtist(artistName).ifBlank { artistName.trim() }
         if (clean.isBlank() || clean.equals("YouTube", true) || clean.equals("אמן", true)) return@withContext ""
         val key = clean.lowercase()
         artistPhotoCache[key]?.takeIf { it.isNotBlank() }?.let { return@withContext it }
@@ -272,16 +319,16 @@ class StreamRepository(private val context: Context) {
     }
 
     suspend fun fetchNowPlayingExtras(track: Track, settings: AppSettings): NowPlayingExtras = withContext(Dispatchers.IO) {
-        val mainArtist = cleanArtistName(track.artist).ifBlank { track.artist.trim() }
+        val mainArtist = lyricsEngine.cleanArtist(track.artist).ifBlank { track.artist.trim() }
+        val isEn = settings.language == AppLanguage.ENGLISH
         if (settings.offlineMode || track.source == StreamSource.LOCAL) {
             return@withContext NowPlayingExtras(
                 trackId = track.id,
                 artistPhotoUrl = artistPhotoCache[mainArtist.lowercase()].orEmpty(),
-                credits = buildFallbackCredits(track, settings.language == AppLanguage.ENGLISH)
+                credits = buildFallbackCredits(track, isEn)
             )
         }
 
-        val isEn = settings.language == AppLanguage.ENGLISH
         coroutineScope {
             val artistJob = async {
                 runCatching {
@@ -320,31 +367,36 @@ class StreamRepository(private val context: Context) {
                 }.getOrDefault(Quad("", "", "", null))
             }
 
-            val creditsJob = async {
-                runCatching { fetchTrackCreditsFromYouTube(track, isEn) }
-                    .getOrDefault(buildFallbackCredits(track, isEn))
+            val videoMetaJob = async {
+                runCatching { fetchYouTubeVideoMetaAndCredits(track, isEn) }
+                    .getOrDefault(Triple(buildFallbackCredits(track, isEn), "", ""))
             }
 
             val episodesJob = async {
                 runCatching {
-                    searchYouTubeWeb("$mainArtist interview podcast", isPodcast = true, isAudiobook = false, maxLimit = 5)
-                        .filter { it.id != track.id }
-                        .take(3)
+                    if (track.isPodcastOrAudiobook) {
+                        fetchRelatedPodcastEpisodes(track, settings).take(6)
+                    } else {
+                        searchYouTubeWeb("$mainArtist interview podcast", isPodcast = true, isAudiobook = false, maxLimit = 5)
+                            .filter { it.id != track.id }
+                            .take(3)
+                    }
                 }.getOrDefault(emptyList())
             }
 
             val similarJob = async {
-                runCatching {
+                if (track.isPodcastOrAudiobook) null to null
+                else runCatching {
                     val simA = searchTracks("$mainArtist similar artists", settings, maxResults = 6)
                         .firstOrNull { it.id != track.id && !it.artist.contains(mainArtist, true) }
-                    val simS = searchTracks("${cleanSongTitle(track.title)} $mainArtist similar songs", settings, maxResults = 6)
+                    val simS = searchTracks("${lyricsEngine.cleanTitle(track.title)} $mainArtist similar songs", settings, maxResults = 6)
                         .firstOrNull { it.id != track.id && it.id != simA?.id }
                     simA to simS
                 }.getOrDefault(null to null)
             }
 
             val (photo, bio, subs, topTrack) = artistJob.await()
-            val credits = creditsJob.await()
+            val (credits, epDesc, epDate) = videoMetaJob.await()
             val episodes = episodesJob.await()
             val (simArtistTrack, simSongTrack) = similarJob.await()
 
@@ -353,6 +405,8 @@ class StreamRepository(private val context: Context) {
                 artistPhotoUrl = photo,
                 artistBio = bio,
                 artistSubscribers = subs,
+                episodeDescription = epDesc,
+                episodePublishDate = epDate,
                 credits = credits,
                 artistEpisodes = episodes,
                 artistTopTrack = topTrack,
@@ -364,7 +418,7 @@ class StreamRepository(private val context: Context) {
 
     private fun buildFallbackCredits(track: Track, isEn: Boolean): List<TrackCreditEntry> {
         val rawArtists = track.artist.split(",", "&", "feat.", "ft.", " x ", " X ")
-            .map { cleanArtistName(it) }
+            .map { lyricsEngine.cleanArtist(it) }
             .filter { it.length >= 2 }
             .distinct()
         if (rawArtists.isEmpty()) {
@@ -376,16 +430,19 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    private fun fetchTrackCreditsFromYouTube(track: Track, isEn: Boolean): List<TrackCreditEntry> {
+    private fun fetchYouTubeVideoMetaAndCredits(track: Track, isEn: Boolean): Triple<List<TrackCreditEntry>, String, String> {
         val base = buildFallbackCredits(track, isEn).toMutableList()
-        if (track.source != StreamSource.YOUTUBE || track.id.length != 11) return base
+        if (track.source != StreamSource.YOUTUBE || track.id.length != 11) return Triple(base, "", "")
 
-        val desc = runCatching {
+        var desc = ""
+        var publishDate = ""
+
+        runCatching {
             val bodyJson = JSONObject().apply {
                 put("videoId", track.id)
                 put("context", JSONObject().apply {
                     put("client", JSONObject().apply {
-                        put("clientName", "WEB"); put("clientVersion", "2.20250219.01.00"); put("hl", "en"); put("gl", "US")
+                        put("clientName", "WEB"); put("clientVersion", "2.20260401.01.00"); put("hl", "he"); put("gl", "IL")
                     })
                 })
             }
@@ -395,15 +452,18 @@ class StreamRepository(private val context: Context) {
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
                 .build()
             fastProxyClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use ""
-                JSONObject(resp.body?.string() ?: return@use "")
-                    .optJSONObject("videoDetails")
-                    ?.optString("shortDescription")
+                if (!resp.isSuccessful) return@use
+                val root = JSONObject(resp.body?.string() ?: return@use)
+                desc = root.optJSONObject("videoDetails")?.optString("shortDescription").orEmpty()
+                publishDate = root.optJSONObject("microformat")
+                    ?.optJSONObject("playerMicroformatRenderer")
+                    ?.optString("publishDate")
                     .orEmpty()
+                    .take(10)
             }
-        }.getOrDefault("")
+        }
 
-        if (desc.isBlank()) return base
+        if (desc.isBlank()) return Triple(base, "", publishDate)
 
         val roleMap = LinkedHashMap<String, MutableSet<String>>()
         val roleRegex = Regex("^(Composer|Lyricist|Writer|Producer|Associated Performer|Vocals|Mixer|Mastering Engineer|Engineer|Arranger|Music Publisher|Composer, Lyricist|Written by|Produced by)\\s*:\\s*(.+)$", RegexOption.IGNORE_CASE)
@@ -413,9 +473,7 @@ class StreamRepository(private val context: Context) {
             val rawRole = m.groupValues[1].trim()
             val names = m.groupValues[2].split(",", "&", ";").map { it.trim() }.filter { it.length in 2..42 && !it.startsWith("http") }
             val label = translateCreditRole(rawRole, isEn)
-            names.forEach { person ->
-                roleMap.getOrPut(person) { LinkedHashSet() }.add(label)
-            }
+            names.forEach { person -> roleMap.getOrPut(person) { LinkedHashSet() }.add(label) }
         }
 
         roleMap.entries.take(8).forEach { (person, roles) ->
@@ -428,7 +486,7 @@ class StreamRepository(private val context: Context) {
                 base.add(TrackCreditEntry(person, roles.joinToString(" • "), false))
             }
         }
-        return base.take(10)
+        return Triple(base.take(10), desc.trim().take(600), publishDate)
     }
 
     private fun translateCreditRole(role: String, isEn: Boolean): String {
@@ -453,7 +511,7 @@ class StreamRepository(private val context: Context) {
         settings: AppSettings,
         knownBrowseId: String = ""
     ): ArtistProfileDetails = withContext(Dispatchers.IO) {
-        val cleanName = cleanArtistName(artistName).ifBlank { artistName.trim() }
+        val cleanName = lyricsEngine.cleanArtist(artistName).ifBlank { artistName.trim() }
         if (settings.offlineMode || settings.streamSource != StreamSource.YOUTUBE) {
             val tracks = searchArtistTracks(cleanName, settings)
             return@withContext ArtistProfileDetails(
@@ -775,7 +833,7 @@ class StreamRepository(private val context: Context) {
                 put("videoId", cleanId)
                 put("context", JSONObject().apply {
                     put("client", JSONObject().apply {
-                        put("clientName", "WEB"); put("clientVersion", "2.20250219.01.00"); put("hl", "he"); put("gl", "IL")
+                        put("clientName", "WEB"); put("clientVersion", "2.20260401.01.00"); put("hl", "he"); put("gl", "IL")
                     })
                 })
             }
@@ -788,7 +846,7 @@ class StreamRepository(private val context: Context) {
                 if (!resp.isSuccessful) return@use null
                 val vd = JSONObject(resp.body?.string() ?: return@use null).optJSONObject("videoDetails") ?: return@use null
                 val rawTitle = vd.optString("title").trim()
-                val rawAuthor = cleanArtistName(vd.optString("author").trim())
+                val rawAuthor = lyricsEngine.cleanArtist(vd.optString("author").trim())
                 val durMs = vd.optString("lengthSeconds").toLongOrNull()?.times(1000L) ?: 0L
                 val thumbs = vd.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
                 val art = if (thumbs != null && thumbs.length() > 0) {
@@ -808,7 +866,7 @@ class StreamRepository(private val context: Context) {
                 if (!resp.isSuccessful) return@use null
                 val o = JSONObject(resp.body?.string() ?: return@use null)
                 val rawTitle = o.optString("title").trim()
-                val rawAuthor = cleanArtistName(o.optString("author_name").trim())
+                val rawAuthor = lyricsEngine.cleanArtist(o.optString("author_name").trim())
                 val art = upgradeArtworkUrlGlobal(o.optString("thumbnail_url")).ifBlank { defaultArt }
                 if (rawTitle.isBlank()) return@use null
                 val (parsedArtist, parsedTitle) = splitArtistAndTitle(rawTitle, rawAuthor)
@@ -821,7 +879,7 @@ class StreamRepository(private val context: Context) {
     }
 
     private fun splitArtistAndTitle(rawTitle: String, rawAuthor: String): Pair<String, String> {
-        val cleanedTitle = cleanSongTitle(rawTitle).ifBlank { rawTitle.trim() }
+        val cleanedTitle = lyricsEngine.cleanTitle(rawTitle).ifBlank { rawTitle.trim() }
         val sep = listOf(" - ", " – ", " — ").firstOrNull { cleanedTitle.contains(it) }
         if (sep != null) {
             val left = cleanedTitle.substringBefore(sep).trim()
@@ -835,8 +893,8 @@ class StreamRepository(private val context: Context) {
 
     // ---------- Official Music Video Finder ----------
     suspend fun findOfficialMusicVideoId(track: Track): String? = withContext(Dispatchers.IO) {
-        val cleanTitle = cleanSongTitle(track.title)
-        val cleanArtist = cleanArtistName(track.artist)
+        val cleanTitle = lyricsEngine.cleanTitle(track.title)
+        val cleanArtist = lyricsEngine.cleanArtist(track.artist)
         val hasHebrew = cleanTitle.any { it in '\u0590'..'\u05FF' } || cleanArtist.any { it in '\u0590'..'\u05FF' }
 
         val queries = buildList {
@@ -928,7 +986,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 2. Playlists Search, Browse & Complete Multi-Source Import (YouTube + Spotify + Text) ----------
+    // ---------- 2. Playlists Search, Browse & Complete Multi-Source Import ----------
     suspend fun searchPlaylists(query: String): List<RemotePlaylist> = withContext(Dispatchers.IO) {
         val combined = mutableListOf<RemotePlaylist>()
 
@@ -996,7 +1054,7 @@ class StreamRepository(private val context: Context) {
             put("params", "EgIQAw==")
             put("context", JSONObject().apply {
                 put("client", JSONObject().apply {
-                    put("clientName", "WEB"); put("clientVersion", "2.20250219.01.00"); put("hl", "he"); put("gl", "IL")
+                    put("clientName", "WEB"); put("clientVersion", "2.20260401.01.00"); put("hl", "he"); put("gl", "IL")
                 })
             })
         }
@@ -1103,7 +1161,6 @@ class StreamRepository(private val context: Context) {
     suspend fun importPlaylistFromTextOrUrl(rawInput: String, settings: AppSettings): Pair<String?, List<Track>> = withContext(Dispatchers.IO) {
         val trimmed = rawInput.trim()
 
-        // 1. YouTube Playlist URL
         if (trimmed.contains("list=", ignoreCase = true)) {
             val listId = trimmed.substringAfter("list=").substringBefore("&").substringBefore("\n").substringBefore(" ").trim()
             if (listId.isNotBlank()) {
@@ -1112,7 +1169,6 @@ class StreamRepository(private val context: Context) {
             }
         }
 
-        // 2. Spotify Playlist / Album / Track Link
         val spotifyMatch = Regex("open\\.spotify\\.com/(playlist|album|track)/([a-zA-Z0-9]+)", RegexOption.IGNORE_CASE).find(trimmed)
         if (spotifyMatch != null) {
             val spType = spotifyMatch.groupValues[1].lowercase()
@@ -1124,7 +1180,6 @@ class StreamRepository(private val context: Context) {
             }
         }
 
-        // 3. Single YouTube Video URL(s)
         val ytVidMatches = Regex("(?:youtu\\.be/|watch\\?v=)([a-zA-Z0-9_-]{11})").findAll(trimmed).map { it.groupValues[1] }.distinct().toList()
         if (ytVidMatches.isNotEmpty() && trimmed.lines().all { it.contains("http", true) || it.isBlank() }) {
             val tracks = coroutineScope {
@@ -1133,7 +1188,6 @@ class StreamRepository(private val context: Context) {
             if (tracks.isNotEmpty()) return@withContext null to tracks
         }
 
-        // 4. Plain-Text Song List (parallel batches of 4)
         val lines = trimmed.lines()
             .map { it.replace(Regex("^\\d+[.)\\s-]+"), "").trim() }
             .filter { it.length >= 2 && !it.startsWith("http", true) }
@@ -1289,7 +1343,7 @@ class StreamRepository(private val context: Context) {
             put("query", query)
             put("context", JSONObject().apply {
                 put("client", JSONObject().apply {
-                    put("clientName", "WEB"); put("clientVersion", "2.20250201.00.00"); put("hl", "he"); put("gl", "IL")
+                    put("clientName", "WEB"); put("clientVersion", "2.20260401.01.00"); put("hl", "he"); put("gl", "IL")
                 })
             })
         }
@@ -1665,7 +1719,7 @@ class StreamRepository(private val context: Context) {
         }
     }
 
-    // ---------- 4. Upgraded Multi-Provider AI Engine (Deep Taste Profile + YouTube Mixes + Auto Count) ----------
+    // ---------- 4. Upgraded Multi-Provider AI Engine ----------
     private fun computeWeightedTasteArtists(
         likedTracks: List<Track>,
         recentTracks: List<Track>,
@@ -1675,7 +1729,7 @@ class StreamRepository(private val context: Context) {
     ): List<String> {
         val scores = LinkedHashMap<String, Int>()
         fun addScore(rawArtist: String, pts: Int) {
-            val clean = cleanArtistName(rawArtist)
+            val clean = lyricsEngine.cleanArtist(rawArtist)
             if (clean.length < 2 || clean.equals("YouTube", true) || clean.equals("אמן", true)) return
             if (excludedArtists.any { ex -> clean.contains(ex, true) }) return
             scores[clean] = (scores[clean] ?: 0) + pts
@@ -2000,7 +2054,7 @@ class StreamRepository(private val context: Context) {
                 queries += listOf("$prompt$eraSuffix$energySuffix", "$prompt best songs", "$prompt top hits", "$prompt similar artists", "$prompt essentials")
             }
         }
-        likedContext.map { cleanArtistName(it.artist) }.distinct().take(2).forEach { fav ->
+        likedContext.map { lyricsEngine.cleanArtist(it.artist) }.distinct().take(2).forEach { fav ->
             queries.add("$fav$energySuffix")
         }
         return "AI • ${prompt.take(26)}" to queries.distinct()
@@ -2031,7 +2085,7 @@ class StreamRepository(private val context: Context) {
         }.getOrNull()
     }
 
-    // ---------- 5. Bulletproof Multi-Provider AI Lyrics Translation ----------
+    // ---------- 5. Multi-Provider AI Lyrics Translation ----------
     suspend fun translateLyrics(
         lines: List<LyricLine>,
         targetLanguage: LyricsLanguage,
@@ -2097,390 +2151,17 @@ class StreamRepository(private val context: Context) {
         else result.toList() to null
     }
 
-    // ---------- 6. 7-Source Parallel Synced Lyrics Engine + Offline Lyrics Cache ----------
-    private fun JSONObject.safeStr(key: String): String {
-        if (isNull(key)) return ""
-        val v = optString(key, "").trim()
-        return if (v.equals("null", true)) "" else v
-    }
-
-    private fun lyricsCacheFile(trackId: String): File {
-        val safe = trackId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-        return File(lyricsCacheDir, "$safe.json")
-    }
-
-    fun clearLyricsCache() {
-        runCatching { lyricsCacheDir.listFiles()?.forEach { it.delete() } }
-    }
-
-    fun getCachedLyrics(trackId: String): List<LyricLine> {
-        val f = lyricsCacheFile(trackId)
-        if (!f.exists()) return emptyList()
-        return runCatching {
-            val arr = JSONArray(f.readText())
-            List(arr.length()) { i ->
-                val o = arr.optJSONObject(i)
-                LyricLine(o.optLong("t", 0L), o.safeStr("x"))
-            }.filter { it.text.isNotBlank() }
-        }.getOrDefault(emptyList())
-    }
-
-    private fun saveLyricsToCache(trackId: String, lines: List<LyricLine>) {
-        if (lines.isEmpty()) return
-        runCatching {
-            val arr = JSONArray()
-            lines.forEach { l -> arr.put(JSONObject().apply { put("t", l.timeMs); put("x", l.text) }) }
-            lyricsCacheFile(trackId).writeText(arr.toString())
-        }
-    }
-
-    private fun cleanSongTitle(title: String): String {
-        return title
-            .replace(Regex("\\([^)]*(official|video|audio|lyric|prod|remaster|feat|ft\\.|קליפ|מילים|רשמי|from the series)[^)]*\\)", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\[[^]]*]"), "")
-            .replace(Regex("\\s*-\\s*(official|audio|video|קליפ).*", RegexOption.IGNORE_CASE), "")
-            .replace("Official Music Video", "", true)
-            .replace("Official Video", "", true)
-            .replace("Official Audio", "", true)
-            .replace("קליפ רשמי", "")
-            .replace("|", " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-    }
-
-    private fun cleanArtistName(artist: String): String {
-        return artist
-            .replace("- Topic", "", true)
-            .replace("VEVO", "", true)
-            .replace("Official", "", true)
-            .replace(Regex("\\s*(?:feat\\.|ft\\.).*", RegexOption.IGNORE_CASE), "")
-            .substringBefore(",")
-            .substringBefore("&")
-            .trim()
-    }
-
+    // ---------- 6. Delegated 8-Source Lyrics & Podcast Transcript Engine ----------
     suspend fun fetchSyncedLyrics(
         track: Track,
         manualOverrideQuery: String? = null,
         offlineOnly: Boolean = false
-    ): List<LyricLine> = withContext(Dispatchers.IO) {
-        if (manualOverrideQuery.isNullOrBlank()) {
-            val cached = getCachedLyrics(track.id)
-            if (cached.isNotEmpty()) return@withContext cached
-        }
-        if (offlineOnly) return@withContext emptyList()
+    ): List<LyricLine> = lyricsEngine.fetchSongLyrics(track, manualOverrideQuery, offlineOnly)
 
-        val cleanTitle = if (!manualOverrideQuery.isNullOrBlank()) manualOverrideQuery.trim() else cleanSongTitle(track.title)
-        val titleNoParens = cleanTitle.replace(Regex("\\([^)]*\\)"), "").replace(Regex("\\s+"), " ").trim()
-        val cleanArtist = if (!manualOverrideQuery.isNullOrBlank()) "" else cleanArtistName(track.artist)
-        val encArtist = URLEncoder.encode(cleanArtist, "UTF-8")
-        val encTitle = URLEncoder.encode(cleanTitle, "UTF-8")
-        val encTitleNoP = URLEncoder.encode(titleNoParens, "UTF-8")
-        val lrcUa = "Sonify v11.1.0 ([https://sonify.link](https://sonify.link))"
-
-        val searchQueries = listOfNotNull(
-            "$cleanArtist $cleanTitle".trim().takeIf { it.isNotBlank() },
-            "$cleanArtist $titleNoParens".trim().takeIf { it.isNotBlank() },
-            titleNoParens.takeIf { it.length >= 2 && cleanArtist.isNotBlank() },
-            cleanTitle.takeIf { it.length >= 2 && cleanArtist.isNotBlank() }
-        ).distinct()
-
-        // Wave 1: Race the 3 strongest synced-lyrics sources in parallel
-        val (simpRes, lrcExactRes, lrcSearchRes) = coroutineScope {
-            val simpJob = async {
-                if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
-                    runCatching { fetchSimpMusicLyrics(track.id) }.getOrDefault(emptyList())
-                } else emptyList()
-            }
-            val exactJob = async {
-                if (cleanArtist.isBlank()) emptyList()
-                else {
-                    var best: List<LyricLine> = emptyList()
-                    for (tEnc in listOf(encTitle, encTitleNoP).distinct()) {
-                        val found = runCatching {
-                            val url = "[https://lrclib.net/api/get?artist_name=$encArtist&track_name=$tEnc](https://lrclib.net/api/get?artist_name=$encArtist&track_name=$tEnc)"
-                            client.newCall(Request.Builder().url(url).header("User-Agent", lrcUa).build()).execute().use { resp ->
-                                if (!resp.isSuccessful) return@use emptyList()
-                                parseLyricsJson(JSONObject(resp.body?.string() ?: return@use emptyList()))
-                            }
-                        }.getOrDefault(emptyList())
-                        if (found.isNotEmpty()) { best = found; break }
-                    }
-                    best
-                }
-            }
-            val searchJob = async {
-                var best: List<LyricLine> = emptyList()
-                for (sq in searchQueries.take(3)) {
-                    val found = runCatching {
-                        val encQ = URLEncoder.encode(sq, "UTF-8")
-                        client.newCall(Request.Builder().url("[https://lrclib.net/api/search?q=$encQ](https://lrclib.net/api/search?q=$encQ)").header("User-Agent", lrcUa).build()).execute().use { resp ->
-                            if (!resp.isSuccessful) return@use emptyList()
-                            val arr = JSONArray(resp.body?.string() ?: return@use emptyList())
-                            for (i in 0 until arr.length().coerceAtMost(8)) {
-                                val obj = arr.optJSONObject(i) ?: continue
-                                if (obj.safeStr("syncedLyrics").isNotBlank()) {
-                                    val parsed = parseLyricsJson(obj)
-                                    if (parsed.isNotEmpty()) return@use parsed
-                                }
-                            }
-                            for (i in 0 until arr.length().coerceAtMost(8)) {
-                                val parsed = parseLyricsJson(arr.optJSONObject(i) ?: continue)
-                                if (parsed.isNotEmpty()) return@use parsed
-                            }
-                            emptyList()
-                        }
-                    }.getOrDefault(emptyList())
-                    if (found.isNotEmpty()) { best = found; break }
-                }
-                best
-            }
-            Triple(simpJob.await(), exactJob.await(), searchJob.await())
-        }
-
-        val fastWinner = listOf(lrcExactRes, simpRes, lrcSearchRes).firstOrNull { it.isNotEmpty() }
-        if (fastWinner != null) {
-            saveLyricsToCache(track.id, fastWinner)
-            return@withContext fastWinner
-        }
-
-        // Wave 2: YouTube Music Native Lyrics + NetEase + YouTube Captions in parallel
-        val (ytmRes, netEaseRes, ytCapRes) = coroutineScope {
-            val ytmJob = async {
-                if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
-                    runCatching { fetchYouTubeMusicNativeLyrics(track.id) }.getOrDefault(emptyList())
-                } else emptyList()
-            }
-            val neJob = async {
-                val q = searchQueries.firstOrNull().orEmpty()
-                if (q.isNotBlank()) runCatching { fetchNetEaseSyncedLyrics(q) }.getOrDefault(emptyList()) else emptyList()
-            }
-            val capJob = async {
-                if (track.source == StreamSource.YOUTUBE && manualOverrideQuery.isNullOrBlank()) {
-                    runCatching { fetchYouTubeCaptions(track.id) }.getOrDefault(emptyList())
-                } else emptyList()
-            }
-            Triple(ytmJob.await(), neJob.await(), capJob.await())
-        }
-
-        val secondWinner = listOf(netEaseRes, ytmRes, ytCapRes).firstOrNull { it.isNotEmpty() }
-        if (secondWinner != null) {
-            saveLyricsToCache(track.id, secondWinner)
-            return@withContext secondWinner
-        }
-
-        // Wave 3: Lyrics.ovh Fallback
-        if (cleanArtist.isNotBlank() && titleNoParens.isNotBlank()) {
-            val ovh = runCatching {
-                val url = "[https://api.lyrics.ovh/v1/$encArtist/$encTitleNoP](https://api.lyrics.ovh/v1/$encArtist/$encTitleNoP)"
-                probeClient.newCall(Request.Builder().url(url).header("User-Agent", lrcUa).build()).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use emptyList()
-                    val plain = JSONObject(resp.body?.string() ?: return@use emptyList()).safeStr("lyrics")
-                    plain.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("Paroles de", true) }
-                        .mapIndexed { idx, line -> LyricLine(idx * 3200L, line) }
-                }
-            }.getOrDefault(emptyList())
-            if (ovh.isNotEmpty()) {
-                saveLyricsToCache(track.id, ovh)
-                return@withContext ovh
-            }
-        }
-
-        emptyList()
-    }
-
-    private fun fetchSimpMusicLyrics(videoId: String): List<LyricLine> {
-        val req = Request.Builder()
-            .url("[https://api-lyrics.simpmusic.org/v1/$videoId](https://api-lyrics.simpmusic.org/v1/$videoId)")
-            .header("User-Agent", "Sonify/11.1")
-            .header("Accept", "application/json")
-            .build()
-        return fastProxyClient.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyList()
-            val body = resp.body?.string() ?: return emptyList()
-            val root = JSONObject(body)
-            val dataArr = root.optJSONArray("data")
-            if (dataArr != null && dataArr.length() > 0) {
-                for (i in 0 until dataArr.length()) {
-                    val item = dataArr.optJSONObject(i) ?: continue
-                    val synced = item.safeStr("syncedLyrics")
-                    if (synced.isNotBlank()) {
-                        val parsed = parseLrc(synced)
-                        if (parsed.isNotEmpty()) return parsed
-                    }
-                    val plain = item.safeStr("plainLyrics")
-                    if (plain.isNotBlank()) {
-                        return plain.lines().map { it.trim() }.filter { it.isNotBlank() }
-                            .mapIndexed { idx, l -> LyricLine(idx * 3400L, l) }
-                    }
-                }
-            }
-            emptyList()
-        }
-    }
-
-    private fun fetchNetEaseSyncedLyrics(query: String): List<LyricLine> {
-        val encQ = URLEncoder.encode(query, "UTF-8")
-        val searchUrl = "[https://music.163.com/api/search/get/web?s=$encQ&type=1&limit=4](https://music.163.com/api/search/get/web?s=$encQ&type=1&limit=4)"
-        val sReq = Request.Builder()
-            .url(searchUrl)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            .header("Referer", "[https://music.163.com/](https://music.163.com/)")
-            .build()
-        val songId = fastProxyClient.newCall(sReq).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyList()
-            JSONObject(resp.body?.string() ?: return emptyList())
-                .optJSONObject("result")
-                ?.optJSONArray("songs")
-                ?.optJSONObject(0)
-                ?.optLong("id", 0L) ?: 0L
-        }
-        if (songId <= 0L) return emptyList()
-
-        val lyrReq = Request.Builder()
-            .url("[https://music.163.com/api/song/lyric?id=$songId&lv=1&kv=1&tv=-1](https://music.163.com/api/song/lyric?id=$songId&lv=1&kv=1&tv=-1)")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            .header("Referer", "[https://music.163.com/](https://music.163.com/)")
-            .build()
-        return fastProxyClient.newCall(lyrReq).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyList()
-            val lrc = JSONObject(resp.body?.string() ?: return emptyList())
-                .optJSONObject("lrc")
-                ?.safeStr("lyric")
-                .orEmpty()
-            if (lrc.isBlank()) return emptyList()
-            val parsed = parseLrc(lrc)
-            if (parsed.size >= 4) parsed else emptyList()
-        }
-    }
-
-    private fun fetchYouTubeMusicNativeLyrics(videoId: String): List<LyricLine> {
-        val nextBody = JSONObject().apply {
-            put("videoId", videoId)
-            put("context", ytMusicContext())
-        }
-        val nextReq = Request.Builder()
-            .url("[https://music.youtube.com/youtubei/v1/next?prettyPrint=false](https://music.youtube.com/youtubei/v1/next?prettyPrint=false)")
-            .post(nextBody.toString().toRequestBody("application/json".toMediaType()))
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            .header("Origin", "[https://music.youtube.com](https://music.youtube.com)")
-            .header("Referer", "[https://music.youtube.com/](https://music.youtube.com/)")
-            .build()
-
-        val lyricsBrowseId = client.newCall(nextReq).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyList()
-            val text = resp.body?.string().orEmpty()
-            Regex("\"(MPLYt[^\"]+)\"").find(text)?.groupValues?.get(1)
-        } ?: return emptyList()
-
-        val browseRoot = fetchYtMusicBrowseJson(lyricsBrowseId) ?: return emptyList()
-        val rawLyricsText = findFirstMusicDescriptionText(browseRoot)
-        if (rawLyricsText.isBlank()) return emptyList()
-        val lines = rawLyricsText.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("Source:", true) }
-        if (lines.size < 3) return emptyList()
-        return lines.mapIndexed { idx, line -> LyricLine(idx * 3200L, line) }
-    }
-
-    private fun findFirstMusicDescriptionText(node: Any?): String {
-        if (node == null) return ""
-        when (node) {
-            is JSONObject -> {
-                node.optJSONObject("musicDescriptionShelfRenderer")?.let { shelf ->
-                    val txt = extractRunsText(shelf.optJSONObject("description"))
-                    if (txt.length > 30) return txt
-                }
-                val keys = node.keys()
-                while (keys.hasNext()) {
-                    val found = findFirstMusicDescriptionText(node.opt(keys.next()))
-                    if (found.isNotBlank()) return found
-                }
-            }
-            is JSONArray -> {
-                for (i in 0 until node.length()) {
-                    val found = findFirstMusicDescriptionText(node.opt(i))
-                    if (found.isNotBlank()) return found
-                }
-            }
-        }
-        return ""
-    }
-
-    private fun fetchYouTubeCaptions(videoId: String): List<LyricLine> {
-        val body = JSONObject().apply {
-            put("videoId", videoId)
-            put("context", JSONObject().apply {
-                put("client", JSONObject().apply {
-                    put("clientName", "ANDROID_VR"); put("clientVersion", "1.65.10")
-                    put("androidSdkVersion", 32); put("hl", "he"); put("gl", "IL")
-                })
-            })
-        }
-        val req = Request.Builder()
-            .url("[https://www.youtube.com/youtubei/v1/player?prettyPrint=false](https://www.youtube.com/youtubei/v1/player?prettyPrint=false)")
-            .post(body.toString().toRequestBody("application/json".toMediaType()))
-            .header("User-Agent", "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L) gzip")
-            .build()
-
-        val captionUrl = client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyList()
-            val root = JSONObject(resp.body?.string() ?: return emptyList())
-            val tracks = root.optJSONObject("captions")
-                ?.optJSONObject("playerCaptionsTracklistRenderer")
-                ?.optJSONArray("captionTracks") ?: return emptyList()
-            var bestUrl: String? = null
-            for (i in 0 until tracks.length()) {
-                val ct = tracks.optJSONObject(i) ?: continue
-                val base = ct.safeStr("baseUrl")
-                val lang = ct.safeStr("languageCode")
-                val kind = ct.safeStr("kind")
-                if (base.startsWith("http")) {
-                    if (kind.isBlank() && (lang.startsWith("he") || lang.startsWith("iw") || lang.startsWith("en"))) {
-                        bestUrl = base; break
-                    }
-                    if (bestUrl == null) bestUrl = base
-                }
-            }
-            bestUrl
-        } ?: return emptyList()
-
-        val finalCapUrl = if (captionUrl.contains("fmt=")) captionUrl else "$captionUrl&fmt=srv1"
-        val xml = client.newCall(Request.Builder().url(finalCapUrl).header("User-Agent", "Mozilla/5.0").build()).execute().use { r ->
-            if (!r.isSuccessful) return emptyList()
-            r.body?.string().orEmpty()
-        }
-        val regex = Regex("<text[^>]*start=\"([0-9.]+)\"[^>]*>(.*?)</text>", RegexOption.DOT_MATCHES_ALL)
-        return regex.findAll(xml).mapNotNull { m ->
-            val startSec = m.groupValues[1].toDoubleOrNull() ?: return@mapNotNull null
-            val rawText = Html.fromHtml(m.groupValues[2], Html.FROM_HTML_MODE_LEGACY).toString().replace("\n", " ").trim()
-            if (rawText.isBlank() || rawText == "[Music]" || rawText == "[מוזיקה]") null
-            else LyricLine((startSec * 1000).toLong(), rawText)
-        }.toList().sortedBy { it.timeMs }
-    }
-
-    private fun parseLyricsJson(json: JSONObject): List<LyricLine> {
-        val synced = json.safeStr("syncedLyrics")
-        if (synced.isNotBlank()) {
-            val parsed = parseLrc(synced)
-            if (parsed.isNotEmpty()) return parsed
-        }
-        val plain = json.safeStr("plainLyrics")
-        if (plain.isNotBlank()) {
-            return plain.lines().filter { it.isNotBlank() }.mapIndexed { idx, line -> LyricLine(idx * 3500L, line.trim()) }
-        }
-        return emptyList()
-    }
-
-    private fun parseLrc(lrc: String): List<LyricLine> {
-        val regex = Regex("\\[(\\d{1,2}):(\\d{2})(?:\\.(\\d{1,3}))?](.*)")
-        return lrc.lines().mapNotNull { line ->
-            val m = regex.find(line.trim()) ?: return@mapNotNull null
-            val min = m.groupValues[1].toLongOrNull() ?: 0L
-            val sec = m.groupValues[2].toLongOrNull() ?: 0L
-            val ms = m.groupValues[3].padEnd(3, '0').take(3).toLongOrNull() ?: 0L
-            val text = m.groupValues[4].trim()
-            if (text.isBlank()) null else LyricLine(min * 60_000L + sec * 1000L + ms, text)
-        }.sortedBy { it.timeMs }
-    }
+    suspend fun fetchPodcastTranscript(
+        track: Track,
+        offlineOnly: Boolean = false
+    ): List<LyricLine> = lyricsEngine.fetchPodcastTranscript(track, offlineOnly)
 
     // ---------- 7. OpenSubsonic & Local Audio ----------
     suspend fun testSubsonicConnection(settings: AppSettings): Pair<Boolean, String> = withContext(Dispatchers.IO) {
