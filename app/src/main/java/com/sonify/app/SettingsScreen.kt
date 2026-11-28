@@ -47,7 +47,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
         listOf(
             SettingsSearchEntry("ספק AI, מפתח API ומודלים", "AI Provider, API Key & Models", "api gemini openai groq claude deepseek openrouter מודל מפתח בינה מלאכותית תרגום מילים dj", SettingsSection.AI_NOTIFICATIONS, Icons.Rounded.AutoAwesome),
             SettingsSearchEntry("מקור שמע (YouTube / שרת / קבצים)", "Stream Source (YouTube / Server / Local)", "youtube subsonic navidrome lossless flac local מקור שרת איכות wifi סלולר", SettingsSection.STREAM_QUALITY, Icons.Rounded.HighQuality),
-            SettingsSearchEntry("אחסון, אופליין, שיטות הורדה ומטמון", "Storage, Offline, Download Methods & Cache", "אופליין הורדה שיטת הורדה hls turbo micro burst ytdlp proxy אחסון מטמון cache מילים סריקת קבצים ייבוא שחזור offline download method", SettingsSection.STORAGE_OFFLINE, Icons.Rounded.Storage),
+            SettingsSearchEntry("אחסון, אופליין, דיסק השמעה ושיטות הורדה", "Storage, Offline, Playback Disk & Downloads", "אופליין הורדה שיטת הורדה דיסק השמעה hls turbo micro burst ytdlp proxy אחסון מטמון cache מילים סריקת קבצים ייבוא שחזור offline download disk", SettingsSection.STORAGE_OFFLINE, Icons.Rounded.Storage),
             SettingsSearchEntry("מהירות ניגון, Crossfade והגנת רשת", "Playback Speed, Crossfade & Buffer", "מהירות speed crossfade gapless automix autoplay mono איזון canvas קליפ וידאו wakelock buffer", SettingsSection.PLAYBACK_AUDIO, Icons.Rounded.PlayCircleOutline),
             SettingsSearchEntry("אקולייזר 10 ערוצים (EQ)", "10-Band Equalizer (EQ)", "אקולייזר באס bass vocal pop rock eq flat צליל", SettingsSection.EQUALIZER, Icons.Rounded.Equalizer),
             SettingsSearchEntry("Jam חי, שם תצוגה וצ'אט ללא ענן", "Live Jam, Display Name & Chat", "jam צ'אט חברים ntfy סנכרון שם תצוגה relay", SettingsSection.JAM_SOCIAL, Icons.Rounded.Groups),
@@ -79,7 +79,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                     SettingsSection.PLAYBACK_AUDIO -> str.t("ניגון, מהירות והגנת רשת", "Playback, Speed & Buffer")
                     SettingsSection.EQUALIZER -> str.t("אקולייזר 10 ערוצים", "10-Band Equalizer")
                     SettingsSection.PRIVACY_TASTE -> str.t("פרטיות ופרופיל טעם", "Privacy & Taste Profile")
-                    SettingsSection.STORAGE_OFFLINE -> str.t("אחסון, אופליין ושיטות הורדה", "Storage, Offline & Download Methods")
+                    SettingsSection.STORAGE_OFFLINE -> str.t("אחסון, דיסק השמעה והורדות", "Storage, Playback Disk & Downloads")
                     SettingsSection.AI_NOTIFICATIONS -> str.t("בינה מלאכותית, API והתראות", "AI API, Models & Notifications")
                     SettingsSection.JAM_SOCIAL -> str.t("Jam חי וצ'אט חברים", "Live Jam & Cloudless Chat")
                 },
@@ -96,7 +96,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                     OutlinedTextField(
                         value = settingsSearch,
                         onValueChange = { settingsSearch = it },
-                        placeholder = { Text(str.t("חפש בהגדרות (API, שיטת הורדה, אקולייזר, אופליין...)", "Search settings (API, download method, EQ, offline...)"), fontSize = 13.sp) },
+                        placeholder = { Text(str.t("חפש בהגדרות (דיסק, API, שיטת הורדה, אקולייזר...)", "Search settings (disk, API, download method, EQ...)"), fontSize = 13.sp) },
                         leadingIcon = { Icon(Icons.Rounded.Search, null, tint = SpotifySubtle) },
                         trailingIcon = {
                             if (settingsSearch.isNotBlank()) {
@@ -132,9 +132,11 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                             QuickSettingsChip(Icons.Rounded.History, str.t("היסטוריה", "History"), Modifier.weight(1f)) { vm.setShowHistorySheet(true) }
                         }
 
+                        val diskLabel = if (s.playbackDiskLimitMb >= 1024) "${String.format("%.1f", s.playbackDiskLimitMb / 1024f)}GB" else "${s.playbackDiskLimitMb}MB"
+
                         SettingsNavTile(Icons.Rounded.AutoAwesome, str.t("בינה מלאכותית, API ומודלים", "AI API, Multi-Provider & Models"), "${s.aiProvider.label(isEn)} • ${vm.repo.aiClient.activeModelFor(s)}", isEn) { vm.setSettingsSection(SettingsSection.AI_NOTIFICATIONS) }
                         SettingsNavTile(Icons.Rounded.HighQuality, str.t("מקור שמע ואיכות הזרמה", "Stream Source & Audio Quality"), "${s.streamSource.label(isEn).substringBefore(" (")} • ${s.wifiQuality.shortLabel(isEn, s.streamSource)}", isEn) { vm.setSettingsSection(SettingsSection.STREAM_QUALITY) }
-                        SettingsNavTile(Icons.Rounded.Storage, str.t("אחסון, אופליין ושיטות הורדה", "Storage, Offline & Download Engine"), "${s.downloadMethod.label(isEn)} • ${state.offlineTrackIds.size} ${str.songs}", isEn) { vm.setSettingsSection(SettingsSection.STORAGE_OFFLINE) }
+                        SettingsNavTile(Icons.Rounded.Storage, str.t("אחסון, דיסק השמעה והורדות", "Storage, Playback Disk & Downloads"), "${str.t("דיסק", "Disk")}: $diskLabel • ${s.downloadMethod.label(isEn)}", isEn) { vm.setSettingsSection(SettingsSection.STORAGE_OFFLINE) }
                         SettingsNavTile(Icons.Rounded.PlayCircleOutline, str.t("ניגון, מהירות, Crossfade ורשת חלשה", "Playback, Speed, Crossfade & Buffer"), "${s.playbackSpeed}x • ${s.audioBufferProfile.label(isEn)}", isEn) { vm.setSettingsSection(SettingsSection.PLAYBACK_AUDIO) }
                         SettingsNavTile(Icons.Rounded.Equalizer, str.t("אקולייזר 10 ערוצים", "10-Band Equalizer"), if (s.eqEnabled) str.t("פעיל", "ON") else str.t("כבוי", "OFF"), isEn) { vm.setSettingsSection(SettingsSection.EQUALIZER) }
                         SettingsNavTile(Icons.Rounded.Groups, str.t("Jam חי וצ'אט ללא ענן", "Live Jam & Cloudless Chat"), s.jamUserDisplayName.ifBlank { str.t("הגדר שם תצוגה ושרת סנכרון", "Set display name & relay") }, isEn) { vm.setSettingsSection(SettingsSection.JAM_SOCIAL) }
@@ -152,7 +154,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                             Spacer(Modifier.width(6.dp))
                             Text(str.t("אפס הגדרות לברירת מחדל", "Reset Settings to Defaults"), color = SpotifySubtle, fontSize = 13.sp)
                         }
-                        Text("Sonify v11.2.0 • 6-Method Turbo Downloads, 8-Source Lyrics & Podcast Player", color = SpotifyMuted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+                        Text("Sonify v11.2.0 • Fast Playback Disk, 6-Method Downloads & 8-Source Lyrics", color = SpotifyMuted, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
                     }
                 }
 
@@ -341,7 +343,7 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                 }
 
                 SettingsSection.STORAGE_OFFLINE -> {
-                    // 6 Selectable Download Methods (HLS Turbo, Micro-Burst 256KB, Direct, yt-dlp, Proxy Mirrors!)
+                    // 6 Selectable Download Methods (HLS Turbo, Micro-Burst 256KB, Direct, yt-dlp, Proxy Mirrors)
                     SettingsSectionCard(str.t("שיטת הורדת אודיו (בחר את המהירה ביותר ברשת שלך)", "Audio Download Method (Pick Fastest for Your Network)")) {
                         DownloadMethod.entries.forEach { method ->
                             val selected = s.downloadMethod == method
@@ -380,11 +382,72 @@ fun SettingsScreen(state: UiState, vm: AppViewModel) {
                         SettingsSwitchRow(str.t("הורדה דרך רשת סלולרית", "Download over Cellular"), str.t("מאפשר הורדות גם ללא Wi-Fi", "Allows downloads without Wi-Fi"), s.downloadUsingCellular) { vm.updateSettings(s.copy(downloadUsingCellular = it)) }
                     }
 
-                    SettingsSectionCard(str.t("ניהול אחסון ומטמונים (דיסק השמעה 250MB)", "Storage & 250MB Playback Disk Cache")) {
+                    // Dedicated Playback Disk Storage Quota Card (100MB - 4GB)
+                    SettingsSectionCard(str.t("דיסק השמעה (מעבר מיידי בין שירים)", "Playback Disk Cache (Instant Track Switching)")) {
+                        val diskStats = remember(state.storageRefreshKey, s.playbackDiskLimitMb) { vm.getPlaybackDiskStats() }
+                        val limitLabel = if (s.playbackDiskLimitMb >= 1024) {
+                            "${String.format("%.1f", s.playbackDiskLimitMb / 1024f)} GB"
+                        } else {
+                            "${s.playbackDiskLimitMb} MB"
+                        }
+                        val fillFrac = (diskStats.usedMb / s.playbackDiskLimitMb.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text(str.t("בשימוש כרגע:", "Currently used:"), color = SpotifySubtle, fontSize = 13.sp)
+                            Text(
+                                "${String.format("%.1f", diskStats.usedMb)} MB / $limitLabel (${diskStats.cachedItemsCount} ${str.songs})",
+                                color = SpotifyGreen,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        LinearProgressIndicator(
+                            progress = { fillFrac },
+                            modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(50)),
+                            color = SpotifyGreen,
+                            trackColor = SpotifyCard
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Text(str.t("נפח מוקצה לדיסק ההשמעה: $limitLabel", "Allocated Playback Disk: $limitLabel"), color = SpotifyWhite, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Slider(
+                            value = s.playbackDiskLimitMb.toFloat(),
+                            onValueChange = { nv ->
+                                val stepped = ((nv / 50f).toInt() * 50).coerceIn(PlaybackDiskManager.MIN_LIMIT_MB, PlaybackDiskManager.MAX_LIMIT_MB)
+                                vm.updateSettings(s.copy(playbackDiskLimitMb = stepped))
+                            },
+                            valueRange = PlaybackDiskManager.MIN_LIMIT_MB.toFloat()..PlaybackDiskManager.MAX_LIMIT_MB.toFloat(),
+                            colors = SliderDefaults.colors(thumbColor = SpotifyGreen, activeTrackColor = SpotifyGreen)
+                        )
+
+                        val presetsMb = listOf(150 to "150MB", 300 to "300MB", 500 to "500MB", 1024 to "1GB", 2048 to "2GB", 4096 to "4GB")
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            items(presetsMb) { (mb, lbl) ->
+                                FilterChip(
+                                    selected = s.playbackDiskLimitMb == mb,
+                                    onClick = { vm.updateSettings(s.copy(playbackDiskLimitMb = mb)) },
+                                    label = { Text(lbl, fontSize = 11.5.sp) }
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedButton(
+                            onClick = { vm.clearPlaybackDiskOnly() },
+                            shape = RoundedCornerShape(50),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Rounded.CleaningServices, null, tint = SpotifyGreen, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(str.t("נקה דיסק השמעה (שומר הורדות אופליין)", "Clear Playback Disk (Keeps Offline)"), color = SpotifyWhite, fontSize = 12.sp)
+                        }
+                    }
+
+                    SettingsSectionCard(str.t("ניהול אחסון ומטמונים", "Storage & Cache Management")) {
                         val cacheMb = remember(state.storageRefreshKey) { vm.repo.getCacheSizeMb() }
                         val offlineMb = remember(state.storageRefreshKey, state.offlineTrackIds.size) { vm.repo.getOfflineSizeMb() }
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(str.t("מטמון דיסק השמעה (Cache):", "Playback Disk Cache:"), color = SpotifySubtle, fontSize = 14.sp)
+                            Text(str.t("מטמון כללי (Cache):", "Total App Cache:"), color = SpotifySubtle, fontSize = 14.sp)
                             Text("${String.format("%.1f", cacheMb)} MB", color = SpotifyWhite, fontWeight = FontWeight.Bold)
                         }
                         Spacer(Modifier.height(6.dp))
