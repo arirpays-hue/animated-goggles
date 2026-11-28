@@ -213,6 +213,7 @@ data class UiState(
     val openedPlaylist: Playlist? = null,
     val openedArtist: ArtistPageState? = null,
     val openedArtistProfile: ArtistProfileDetails? = null,
+    val samplesFeed: SamplesFeedState? = null,
     val isLoadingPlaylist: Boolean = false,
     val isExpandingPlaylist: Boolean = false,
     val trackForOptions: Track? = null,
@@ -253,7 +254,7 @@ data class UiState(
     val hasSearched: Boolean = false,
     val isSearching: Boolean = false,
 
-    // Library, Playlist Smart Shuffle, Background Downloads & Live Cloudless Chat
+    // Library, Playlist Smart Shuffle, Background Downloads, Podcast Comments & Live Cloudless Chat
     val likedTracks: List<Track> = emptyList(),
     val hiddenTrackIds: Set<String> = emptySet(),
     val followedArtists: Set<String> = emptySet(),
@@ -267,6 +268,7 @@ data class UiState(
     val activeChatFriend: String = "כללי",
     val activeChatLiveConnected: Boolean = false,
     val messages: List<ChatMessage> = emptyList(),
+    val podcastComments: Map<String, List<PodcastComment>> = emptyMap(),
     val stats: ListeningStats = ListeningStats(),
     val offlineTrackIds: Set<String> = emptySet(),
     val downloadingIds: Set<String> = emptySet(),
@@ -334,6 +336,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var prefetchJob: Job? = null
     private var lyricsJob: Job? = null
     private var extrasJob: Job? = null
+    private var samplesJob: Job? = null
     private var homeInfinitePage = 0
     @Volatile private var isApplyingRemoteJam = false
 
@@ -503,6 +506,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val wifiQ = source.clampQuality(runCatching { AudioQuality.valueOf(prefs.getString("wifi_q", AudioQuality.VERY_HIGH.name)!!) }.getOrDefault(AudioQuality.VERY_HIGH))
         val cellQ = source.clampQuality(runCatching { AudioQuality.valueOf(prefs.getString("cell_q", AudioQuality.HIGH.name)!!) }.getOrDefault(AudioQuality.HIGH))
         val dlQ = source.clampQuality(runCatching { AudioQuality.valueOf(prefs.getString("dl_q", AudioQuality.HIGH.name)!!) }.getOrDefault(AudioQuality.HIGH))
+        val dlMethod = runCatching { DownloadMethod.valueOf(prefs.getString("dl_method", DownloadMethod.AUTO_SMART.name)!!) }.getOrDefault(DownloadMethod.AUTO_SMART)
         val normLvl = runCatching { NormalizationLevel.valueOf(prefs.getString("norm_lvl", NormalizationLevel.NORMAL.name)!!) }.getOrDefault(NormalizationLevel.NORMAL)
         val dlSpeed = runCatching { DownloadSpeedMode.valueOf(prefs.getString("dl_speed", DownloadSpeedMode.TURBO.name)!!) }.getOrDefault(DownloadSpeedMode.TURBO)
         val bufProf = runCatching { AudioBufferProfile.valueOf(prefs.getString("buffer_profile", AudioBufferProfile.HIGH_STABILITY.name)!!) }.getOrDefault(AudioBufferProfile.HIGH_STABILITY)
@@ -521,6 +525,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             wifiQuality = wifiQ,
             cellularQuality = cellQ,
             downloadQuality = dlQ,
+            downloadMethod = dlMethod,
             autoAdjustQuality = prefs.getBoolean("auto_adj_q", true),
             subsonicUrl = prefs.getString("subsonic_url", "") ?: "",
             subsonicUser = prefs.getString("subsonic_user", "") ?: "",
@@ -586,6 +591,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val searchHist = decodeStringList(prefs.getString("search_history", "[]") ?: "[]")
         val friends = decodeFriends(prefs.getString("friends_v11", prefs.getString("friends_v7", "") ?: "") ?: "")
         val msgs = decodeMessages(prefs.getString("messages", "[]") ?: "[]")
+        val podComments = decodePodcastComments(prefs.getString("podcast_comments", "{}") ?: "{}")
         val stats = decodeStats(prefs.getString("stats", "{}") ?: "{}")
 
         if (schemaVer < 7) {
@@ -599,7 +605,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 settings = settings, likedTracks = liked, recentTracks = recent, playlists = playlists,
                 deletedPlaylists = deleted, folders = folders, hiddenTrackIds = hidden,
                 followedArtists = followedArtists, excludedArtistsFromTaste = excluded,
-                searchHistory = searchHist, friends = friends, messages = msgs, stats = stats,
+                searchHistory = searchHist, friends = friends, messages = msgs,
+                podcastComments = podComments, stats = stats,
                 offlineTrackIds = repo.getOfflineTrackIds()
             )
         }
@@ -815,6 +822,115 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 trendingSongs = playableOffline.take(20)
             )
         }
+    }
+
+    // ---------- Vertical Song Samples Feed ("דומה ל..." / "שירים של...") ----------
+    fun openSamplesFeed(mode: String, seedTrack: Track) {
+        val st = _uiState.value
+        val s = st.strings
+        if (st.settings.offlineMode) {
+            _uiState.update { it.copy(statusMessage = s.t("דגימות שירים דורשות חיבור לאינטרנט", "Song samples require internet")) }
+            return
+        }
+        val title = when (mode) {
+            "ARTIST_SONGS" -> seedTrack.artist
+            "SIMILAR_ARTIST" -> s.t("דומה ל-${seedTrack.artist}", "Similar to ${seedTrack.artist}")
+            else -> s.t("דומה ל-${seedTrack.title}", "Similar to ${seedTrack.title}")
+        }
+        val subtitle = when (mode) {
+            "ARTIST_SONGS" -> s.t("שירים של ${seedTrack.artist}", "Songs by ${seedTrack.artist}")
+            "SIMILAR_ARTIST" -> s.t("אמנים דומים", "Similar artists")
+            else -> s.t("שירים דומים", "Similar songs")
+        }
+
+        _uiState.update {
+            it.copy(
+                samplesFeed = SamplesFeedState(
+                    title = title,
+                    subtitle = subtitle,
+                    sourceArtist = seedTrack.artist,
+                    tracks = emptyList(),
+                    isLoading = true,
+                    isMuted = false
+                )
+            )
+        }
+
+        samplesJob?.cancel()
+        samplesJob = viewModelScope.launch {
+            val found = repo.fetchSamplesForCard(mode, seedTrack, _uiState.value.settings)
+            _uiState.update { cur ->
+                val active = cur.samplesFeed ?: return@update cur
+                cur.copy(samplesFeed = active.copy(tracks = found, isLoading = false))
+            }
+        }
+    }
+
+    fun playSampleTrack(track: Track) {
+        val muted = _uiState.value.samplesFeed?.isMuted == true
+        audioEngine.setMuted(muted)
+        // Jump straight to the hook/chorus (~30% of track or 35 seconds) just like Spotify Samples!
+        val hookStartMs = when {
+            track.durationMs > 90_000L -> (track.durationMs * 0.28f).toLong().coerceIn(22_000L, 55_000L)
+            track.durationMs > 45_000L -> 15_000L
+            else -> 0L
+        }
+        playTrack(track, listOf(track), startAtMs = hookStartMs)
+    }
+
+    fun playFullTrackFromSample(track: Track, list: List<Track>) {
+        audioEngine.setMuted(false)
+        _uiState.update { it.copy(samplesFeed = null) }
+        playTrack(track, list, startAtMs = 0L)
+        setShowNowPlaying(true)
+    }
+
+    fun toggleSamplesMute() {
+        val cur = _uiState.value.samplesFeed ?: return
+        val newMuted = !cur.isMuted
+        audioEngine.setMuted(newMuted)
+        _uiState.update { it.copy(samplesFeed = cur.copy(isMuted = newMuted)) }
+    }
+
+    fun closeSamplesFeed() {
+        samplesJob?.cancel()
+        audioEngine.setMuted(false)
+        _uiState.update { it.copy(samplesFeed = null) }
+    }
+
+    // ---------- Podcast Specific Controls & Comments ----------
+    fun skipByDelta(deltaMs: Long) {
+        val st = _uiState.value
+        val maxDur = st.durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE
+        val target = (st.positionMs + deltaMs).coerceIn(0L, maxDur)
+        seekTo(target)
+    }
+
+    fun addPodcastComment(trackId: String, text: String, includeTimestamp: Boolean) {
+        val clean = text.trim()
+        if (clean.isBlank()) return
+        val s = _uiState.value.strings
+        val tsSec = if (includeTimestamp) (_uiState.value.positionMs / 1000L).toInt() else null
+        val comment = PodcastComment(
+            author = effectiveJamName(),
+            text = clean,
+            timeAgo = s.t("עכשיו", "Just now"),
+            likes = 1,
+            timestampSec = tsSec
+        )
+        val curMap = _uiState.value.podcastComments.toMutableMap()
+        val updatedList = (listOf(comment) + curMap[trackId].orEmpty()).take(40)
+        curMap[trackId] = updatedList
+        prefs.edit().putString("podcast_comments", encodePodcastComments(curMap)).apply()
+        _uiState.update { it.copy(podcastComments = curMap, statusMessage = s.t("התגובה פורסמה!", "Comment posted!")) }
+    }
+
+    fun likePodcastComment(trackId: String, commentId: String) {
+        val curMap = _uiState.value.podcastComments.toMutableMap()
+        val list = curMap[trackId] ?: return
+        curMap[trackId] = list.map { if (it.id == commentId) it.copy(likes = it.likes + 1) else it }
+        prefs.edit().putString("podcast_comments", encodePodcastComments(curMap)).apply()
+        _uiState.update { it.copy(podcastComments = curMap) }
     }
 
     // ---------- Navigation & UI State ----------
@@ -1125,6 +1241,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             .putString("wifi_q", newSettings.wifiQuality.name)
             .putString("cell_q", newSettings.cellularQuality.name)
             .putString("dl_q", newSettings.downloadQuality.name)
+            .putString("dl_method", newSettings.downloadMethod.name)
             .putBoolean("auto_adj_q", newSettings.autoAdjustQuality)
             .putString("subsonic_url", newSettings.subsonicUrl)
             .putString("subsonic_user", newSettings.subsonicUser)
@@ -1441,7 +1558,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- Playback, Instant Pre-Cache, Reliable Lyrics & Real Artist Extras ----------
+    // ---------- Playback, Instant 250MB Disk Pre-Warm, Reliable 8-Source Lyrics & Extras ----------
     private suspend fun resolveFastWithCache(track: Track, settings: AppSettings, attempt: Int = 0): ResolvedStreams? {
         if (attempt == 0) {
             val offlineFile = repo.getOfflineFile(track.id)
@@ -1451,7 +1568,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val precacheFile = repo.getPrecachedAudioFile(track.id)
             if (precacheFile.exists() && precacheFile.length() > 48_000) {
                 precacheFile.setLastModified(System.currentTimeMillis())
-                return ResolvedStreams(precacheFile.toURI().toString(), isOffline = true, codecLabel = "INSTANT CACHE")
+                return ResolvedStreams(precacheFile.toURI().toString(), isOffline = true, codecLabel = "DISK CACHE")
             }
         }
         if (attempt == 0 && track.source == StreamSource.YOUTUBE && !settings.offlineMode) {
@@ -1467,6 +1584,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return fresh
     }
 
+    /**
+     * Proactively warms the upcoming track(s) directly into ExoPlayer's 250MB SimpleCache AND disk precache
+     * under stable `sonify_track_<id>` keys so skipping to the next song starts immediately with zero buffering!
+     */
     private fun prefetchNextTracksInQueue(queue: List<Track>, currentIndex: Int) {
         prefetchJob?.cancel()
         val settings = _uiState.value.settings
@@ -1477,19 +1598,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (next1 == null && next2 == null) return
 
         prefetchJob = viewModelScope.launch(Dispatchers.IO) {
-            delay(1400)
+            delay(850)
             if (next1 != null && next1.source == StreamSource.YOUTUBE) {
-                val precached = runCatching { repo.precacheTrackAudio(next1, settings) }.getOrDefault(false)
-                if (!precached) {
-                    val res = runCatching { repo.resolveStreams(next1, settings, attemptIndex = 0) }.getOrNull()
-                    if (res != null && !res.isOffline) resolvedStreamCache[next1.id] = res to System.currentTimeMillis()
+                val res1 = resolveFastWithCache(next1, settings, attempt = 0)
+                if (res1 != null && !res1.isOffline) {
+                    // Warm directly into ExoPlayer's SimpleCache (first 3.5MB) under stable Track ID key!
+                    audioEngine.prewarmNextTrackDiskCache(next1, res1)
+                }
+                if (!settings.dataSaver) {
+                    runCatching { repo.precacheTrackAudio(next1, settings) }
                 }
             }
             if (next2 != null && next2.source == StreamSource.YOUTUBE) {
-                val existing = resolvedStreamCache[next2.id]
-                if (existing == null || (System.currentTimeMillis() - existing.second) >= 30L * 60_000L) {
-                    val res2 = runCatching { repo.resolveStreams(next2, settings, attemptIndex = 0) }.getOrNull()
-                    if (res2 != null && !res2.isOffline) resolvedStreamCache[next2.id] = res2 to System.currentTimeMillis()
+                val res2 = resolveFastWithCache(next2, settings, attempt = 0)
+                if (res2 != null && !res2.isOffline && repo.isOnWifi()) {
+                    audioEngine.prewarmNextTrackDiskCache(next2, res2)
                 }
             }
         }
@@ -1522,6 +1645,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         val state = _uiState.value
         val s = state.strings
+        val isDiskWarmed = AudioCacheHolder.isTrackWarmed(getApplication(), track.id)
         val isOfflineReady = track.id in state.offlineTrackIds ||
             track.source == StreamSource.LOCAL ||
             repo.getPrecachedAudioFile(track.id).let { it.exists() && it.length() > 48_000 }
@@ -1554,13 +1678,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val useWebDirect = track.source == StreamSource.YOUTUBE &&
             settings.ytEngineMode == YouTubeEngineMode.WEB_DIRECT &&
             !isOfflineReady &&
+            !isDiskWarmed &&
             !settings.offlineMode
 
         val updatedJam = if (state.jamState.active) {
             state.jamState.copy(joinUrl = SonifyShareLinks.jamUrl(state.jamState.code, track, startAtMs))
         } else state.jamState
 
-        val weakNet = !isOfflineReady && !settings.offlineMode && repo.isWeakNetwork()
+        val weakNet = !isOfflineReady && !isDiskWarmed && !settings.offlineMode && repo.isWeakNetwork()
         val cachedExtras = nowPlayingExtrasCache[track.id]
 
         _uiState.update {
@@ -1571,7 +1696,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 isAiDjActive = if (keepDjActive) it.isAiDjActive else false,
                 activeDjStyleLabel = if (keepDjActive) it.activeDjStyleLabel else "",
                 isUsingWebEngine = useWebDirect, isWeakNetworkActive = weakNet,
-                isResolvingStream = !useWebDirect && !isOfflineReady,
+                isResolvingStream = !useWebDirect && !isOfflineReady && !isDiskWarmed,
                 isPlayerBuffering = useWebDirect,
                 isVideoMode = false, positionMs = startAtMs, durationMs = track.durationMs,
                 lyrics = emptyList(), isLoadingLyrics = true, showTranslatedLyrics = false,
@@ -1597,18 +1722,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         prefetchNextTracksInQueue(finalQueue, idx)
 
-        if (!settings.offlineMode && (openVideoImmediately || (!settings.dataSaver && !(track.isPodcast && settings.audioOnlyPodcasts) && settings.autoVideoOnWifi && track.source == StreamSource.YOUTUBE))) {
+        if (!settings.offlineMode && (openVideoImmediately || (!settings.dataSaver && !(track.isPodcastOrAudiobook && settings.audioOnlyPodcasts) && settings.autoVideoOnWifi && track.source == StreamSource.YOUTUBE))) {
             viewModelScope.launch { toggleVideoClipMode() }
         }
 
+        // Load 8-source synced lyrics (or podcast transcript automatically!)
         lyricsJob?.cancel()
         lyricsJob = viewModelScope.launch {
             val lyrics = runCatching {
-                repo.fetchSyncedLyrics(track, offlineOnly = settings.offlineMode)
+                if (track.isPodcastOrAudiobook) repo.fetchPodcastTranscript(track, offlineOnly = settings.offlineMode)
+                else repo.fetchSyncedLyrics(track, offlineOnly = settings.offlineMode)
             }.getOrDefault(emptyList())
             if (_uiState.value.currentTrack?.id == track.id) {
                 _uiState.update { it.copy(lyrics = lyrics, isLoadingLyrics = false) }
-                if (lyrics.isNotEmpty() && !settings.offlineMode && settings.autoTranslateLyrics && repo.aiClient.hasValidConfig(settings)) {
+                if (lyrics.isNotEmpty() && !track.isPodcastOrAudiobook && !settings.offlineMode && settings.autoTranslateLyrics && repo.aiClient.hasValidConfig(settings)) {
                     toggleTranslateLyrics()
                 }
             }
@@ -1707,7 +1834,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // Strict Offline Guard: Video Clip CANNOT be opened in Offline Mode
     fun toggleVideoClipMode() {
         val state = _uiState.value
         val track = state.currentTrack ?: return
@@ -1733,8 +1859,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             _uiState.update { it.copy(isFindingVideoClip = true) }
-            val cached = officialVideoCache[track.id]
-            val officialId = cached ?: repo.findOfficialMusicVideoId(track)?.also { officialVideoCache[track.id] = it } ?: track.id
+            val officialId = if (track.isPodcastOrAudiobook) {
+                track.id
+            } else {
+                officialVideoCache[track.id] ?: repo.findOfficialMusicVideoId(track)?.also { officialVideoCache[track.id] = it } ?: track.id
+            }
             val latest = _uiState.value
             if (latest.currentTrack?.id != track.id || latest.settings.offlineMode) {
                 _uiState.update { it.copy(isFindingVideoClip = false) }
@@ -1776,17 +1905,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val state = _uiState.value
         val current = state.currentTrack
         val willPlay = !state.isPlaying
-        audioEngine.togglePlayPause(onNeedRetry = {
-            if (current != null) {
-                if (current.source == StreamSource.YOUTUBE && !state.settings.offlineMode && state.settings.ytEngineMode != YouTubeEngineMode.EXOPLAYER_ONLY) {
-                    activateWebFallback(current)
-                } else {
-                    retryAttemptForCurrent = 0
-                    _uiState.update { it.copy(isResolvingStream = true) }
-                    resolveAndStartTrack(current, 0)
+        if (state.isUsingWebEngine) {
+            audioEngine.setPlaying(willPlay)
+        } else {
+            audioEngine.togglePlayPause(onNeedRetry = {
+                if (current != null) {
+                    if (current.source == StreamSource.YOUTUBE && !state.settings.offlineMode && state.settings.ytEngineMode != YouTubeEngineMode.EXOPLAYER_ONLY) {
+                        activateWebFallback(current)
+                    } else {
+                        retryAttemptForCurrent = 0
+                        _uiState.update { it.copy(isResolvingStream = true) }
+                        resolveAndStartTrack(current, 0)
+                    }
                 }
-            }
-        })
+            })
+        }
         if (!isApplyingRemoteJam && state.jamState.active && (state.jamState.isHost || state.jamState.guestsCanControlQueue)) {
             publishJamState(if (willPlay) "PLAY" else "PAUSE", playingOverride = willPlay)
         }
@@ -2941,7 +3074,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(isLoadingLyrics = true, showTranslatedLyrics = false, lyricsTranslateError = null) }
         lyricsJob?.cancel()
         lyricsJob = viewModelScope.launch {
-            val lyrics = repo.fetchSyncedLyrics(track, customQuery, offlineOnly = _uiState.value.settings.offlineMode)
+            val lyrics = if (track.isPodcastOrAudiobook && customQuery.isNullOrBlank()) {
+                repo.fetchPodcastTranscript(track, offlineOnly = _uiState.value.settings.offlineMode)
+            } else {
+                repo.fetchSyncedLyrics(track, customQuery, offlineOnly = _uiState.value.settings.offlineMode)
+            }
             if (_uiState.value.currentTrack?.id == track.id) {
                 _uiState.update { it.copy(lyrics = lyrics, isLoadingLyrics = false) }
             }
@@ -2949,6 +3086,43 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ---------- JSON Serialization ----------
+    private fun encodePodcastComments(map: Map<String, List<PodcastComment>>): String {
+        val root = JSONObject()
+        map.forEach { (trackId, list) ->
+            val arr = JSONArray()
+            list.forEach { c ->
+                arr.put(JSONObject().apply {
+                    put("id", c.id); put("au", c.author); put("tx", c.text)
+                    put("tm", c.timeAgo); put("lk", c.likes); put("ts", c.timestampSec ?: -1)
+                })
+            }
+            root.put(trackId, arr)
+        }
+        return root.toString()
+    }
+
+    private fun decodePodcastComments(raw: String): Map<String, List<PodcastComment>> = runCatching {
+        val root = JSONObject(raw)
+        val out = LinkedHashMap<String, List<PodcastComment>>()
+        root.keys().forEach { trackId ->
+            val arr = root.optJSONArray(trackId) ?: return@forEach
+            out[trackId] = List(arr.length()) { i -> arr.optJSONObject(i) }.mapNotNull { o ->
+                o?.let {
+                    val ts = it.optInt("ts", -1)
+                    PodcastComment(
+                        id = it.optString("id", UUID.randomUUID().toString()),
+                        author = it.optString("au", "מאזין"),
+                        text = it.optString("tx", ""),
+                        timeAgo = it.optString("tm", ""),
+                        likes = it.optInt("lk", 0),
+                        timestampSec = if (ts >= 0) ts else null
+                    )
+                }
+            }.filter { it.text.isNotBlank() }
+        }
+        out
+    }.getOrDefault(emptyMap())
+
     private fun saveStats(st: ListeningStats) {
         val obj = JSONObject().apply { put("totalMs", st.totalListeningMs); put("tracks", JSONObject(st.trackPlayCounts)); put("artists", JSONObject(st.artistPlayCounts)) }
         prefs.edit().putString("stats", obj.toString()).apply()
