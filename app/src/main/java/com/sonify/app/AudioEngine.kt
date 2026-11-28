@@ -3,19 +3,13 @@
 package com.sonify.app
 
 import android.annotation.SuppressLint
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
-import android.media.audiofx.DynamicsProcessing
 import android.media.audiofx.Equalizer
 import android.media.audiofx.LoudnessEnhancer
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
@@ -23,9 +17,6 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
-import android.util.Base64
-import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -36,8 +27,6 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
-import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -45,27 +34,19 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
-import androidx.media3.common.audio.AudioProcessor
-import androidx.media3.common.audio.BaseAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
-import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.audio.AudioSink
-import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.exoplayer.hls.HlsMediaSource
-import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MergingMediaSource
-import androidx.media3.exoplayer.source.ProgressiveMediaSource
-import androidx.media3.session.MediaSession
-import androidx.media3.session.MediaSessionService
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -73,898 +54,293 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.ConnectionPool
-import okhttp3.OkHttpClient
-import java.io.ByteArrayInputStream
 import java.io.File
-import java.io.FileOutputStream
-import java.net.URLDecoder
-import java.nio.ByteBuffer
 import java.util.Locale
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.TimeUnit
-import kotlin.math.abs
 
-// Persistent 180MB ExoPlayer Disk Cache for zero-stutter playback in weak-signal zones!
+/**
+ * 250MB Persistent ExoPlayer Disk Cache with stable per-track cache keys (`sonify_track_<id>`).
+ * Because YouTube signed URLs change on every request, keying by Track ID ensures instant 0ms hits
+ * when skipping to pre-warmed tracks or replaying songs!
+ */
 object AudioCacheHolder {
-    @Volatile private var simpleCache: SimpleCache? = null
+    private const val MAX_CACHE_BYTES = 250L * 1024L * 1024L
 
-    fun getOrCreate(context: Context): SimpleCache? {
-        return simpleCache ?: synchronized(this) {
-            simpleCache ?: runCatching {
-                val cacheDir = File(context.applicationContext.cacheDir, "exo_stream_cache")
-                if (!cacheDir.exists()) cacheDir.mkdirs()
-                val evictor = LeastRecentlyUsedCacheEvictor(180L * 1024L * 1024L)
-                val dbProvider = StandaloneDatabaseProvider(context.applicationContext)
-                SimpleCache(cacheDir, evictor, dbProvider)
-            }.getOrNull()?.also { simpleCache = it }
+    @Volatile private var cacheInstance: SimpleCache? = null
+    private val lock = Any()
+
+    fun cacheKeyFor(trackId: String): String = "sonify_track_${trackId.replace(Regex("[^a-zA-Z0-9_-]"), "_")}"
+
+    fun get(context: Context): SimpleCache {
+        return cacheInstance ?: synchronized(lock) {
+            cacheInstance ?: run {
+                val dir = File(context.applicationContext.cacheDir, "exo_stream_cache").apply { if (!exists()) mkdirs() }
+                val db = StandaloneDatabaseProvider(context.applicationContext)
+                SimpleCache(dir, LeastRecentlyUsedCacheEvictor(MAX_CACHE_BYTES), db).also { cacheInstance = it }
+            }
         }
+    }
+
+    fun isTrackWarmed(context: Context, trackId: String): Boolean = runCatching {
+        val cache = get(context)
+        val key = cacheKeyFor(trackId)
+        cache.getCachedBytes(key, 0L, 1_024L * 1024L) >= 196_608L
+    }.getOrDefault(false)
+
+    fun buildCacheDataSourceFactory(context: Context, userAgent: String, cookie: String? = null): CacheDataSource.Factory {
+        val headers = mutableMapOf<String, String>()
+        if (!cookie.isNullOrBlank()) headers["Cookie"] = cookie
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(userAgent)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(10_000)
+            .setReadTimeoutMs(15_000)
+            .setDefaultRequestProperties(headers)
+        val upstream = DefaultDataSource.Factory(context.applicationContext, httpFactory)
+        return CacheDataSource.Factory()
+            .setCache(get(context))
+            .setUpstreamDataSourceFactory(upstream)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+    }
+
+    /**
+     * Streams the first ~3.5MB of the upcoming track directly into ExoPlayer's SimpleCache
+     * under its stable `sonify_track_<id>` key so switching tracks is instantaneous with zero spinner!
+     */
+    fun prewarmTrackOnDisk(
+        context: Context,
+        trackId: String,
+        audioUrl: String,
+        userAgent: String,
+        cookie: String? = null,
+        maxBytes: Long = 3_500_000L
+    ): Boolean {
+        if (audioUrl.startsWith("file:") || audioUrl.startsWith("content:") || audioUrl.contains(".m3u8", true)) return false
+        if (isTrackWarmed(context, trackId)) return true
+        return runCatching {
+            val cache = get(context)
+            val key = cacheKeyFor(trackId)
+            val dataSource = buildCacheDataSourceFactory(context, userAgent, cookie).createDataSource()
+            val dataSpec = DataSpec.Builder()
+                .setUri(Uri.parse(audioUrl))
+                .setKey(key)
+                .setPosition(0L)
+                .setLength(maxBytes)
+                .build()
+            val writer = CacheWriter(dataSource, dataSpec, ByteArray(32 * 1024)) { _, _, _ -> }
+            writer.cache()
+            cache.getCachedBytes(key, 0L, maxBytes) > 128_000L
+        }.getOrDefault(false)
     }
 
     fun clearAllEntries() {
+        val c = cacheInstance ?: return
         runCatching {
-            val cache = simpleCache ?: return
-            cache.keys.toList().forEach { key ->
-                runCatching { cache.removeResource(key) }
+            c.keys.toList().forEach { key ->
+                runCatching { c.removeResource(key) }
             }
         }
     }
 }
 
-class ChannelBalanceMonoProcessor : BaseAudioProcessor() {
-    @Volatile var monoEnabled: Boolean = false
-    @Volatile var balance: Float = 0f
-
-    override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT || inputAudioFormat.channelCount != 2) {
-            return AudioProcessor.AudioFormat.NOT_SET
-        }
-        return inputAudioFormat
-    }
-
-    override fun queueInput(inputBuffer: ByteBuffer) {
-        val pos = inputBuffer.position()
-        val limit = inputBuffer.limit()
-        val size = limit - pos
-        if (size <= 0) return
-
-        val out = replaceOutputBuffer(size)
-        val mono = monoEnabled
-        val bal = balance.coerceIn(-1f, 1f)
-        val leftGain = if (bal > 0f) 1f - bal else 1f
-        val rightGain = if (bal < 0f) 1f + bal else 1f
-
-        if (!mono && bal == 0f) {
-            out.put(inputBuffer)
-        } else {
-            var i = pos
-            while (i + 3 < limit) {
-                val l = inputBuffer.getShort(i).toInt()
-                val r = inputBuffer.getShort(i + 2).toInt()
-                val baseL = if (mono) (l + r) / 2 else l
-                val baseR = if (mono) (l + r) / 2 else r
-                out.putShort((baseL * leftGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort())
-                out.putShort((baseR * rightGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort())
-                i += 4
-            }
-            inputBuffer.position(limit)
-        }
-        out.flip()
-    }
-}
-
-object PlayerHolder {
-    @Volatile private var player: ExoPlayer? = null
-    val balanceMonoProcessor = ChannelBalanceMonoProcessor()
-
-    fun getOrCreate(context: Context): ExoPlayer {
-        return player ?: synchronized(this) {
-            player ?: run {
-                val prefs = context.applicationContext.getSharedPreferences("sonify_prefs", Context.MODE_PRIVATE)
-                val profile = runCatching {
-                    AudioBufferProfile.valueOf(prefs.getString("buffer_profile", AudioBufferProfile.HIGH_STABILITY.name)!!)
-                }.getOrDefault(AudioBufferProfile.HIGH_STABILITY)
-
-                val renderersFactory = object : DefaultRenderersFactory(context.applicationContext) {
-                    override fun buildAudioSink(ctx: Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): AudioSink {
-                        return DefaultAudioSink.Builder(ctx)
-                            .setAudioProcessors(arrayOf(balanceMonoProcessor))
-                            .build()
-                    }
-                }
-
-                // Weak-network shield: 60s-180s deep buffer + 20s back buffer + fast 650ms start!
-                val loadControl = DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(profile.minMs, profile.maxMs, profile.playMs.coerceAtMost(750), profile.rebufferMs)
-                    .setBackBuffer(20_000, true)
-                    .setPrioritizeTimeOverSizeThresholds(true)
-                    .build()
-
-                ExoPlayer.Builder(context.applicationContext, renderersFactory)
-                    .setLoadControl(loadControl)
-                    .setWakeMode(C.WAKE_MODE_NETWORK)
-                    .setAudioAttributes(
-                        AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(),
-                        true
-                    )
-                    .setHandleAudioBecomingNoisy(true)
-                    .build()
-                    .also { player = it }
-            }
-        }
-    }
-}
-
-class PlaybackService : MediaSessionService() {
-    companion object {
-        private const val CHANNEL_ID = "sonify_bg_playback"
-        private const val WEB_NOTIF_ID = 1042
-        const val ACTION_WEB_START = "com.sonify.app.ACTION_WEB_BG_START"
-        const val ACTION_WEB_STOP = "com.sonify.app.ACTION_WEB_BG_STOP"
-        const val EXTRA_TITLE = "extra_title"
-        const val EXTRA_ARTIST = "extra_artist"
-
-        @Volatile private var webForegroundActive = false
-
-        fun setWebBackgroundPlayback(context: Context, active: Boolean, title: String = "Sonify", artist: String = "") {
-            runCatching {
-                val intent = Intent(context.applicationContext, PlaybackService::class.java).apply {
-                    action = if (active) ACTION_WEB_START else ACTION_WEB_STOP
-                    putExtra(EXTRA_TITLE, title)
-                    putExtra(EXTRA_ARTIST, artist)
-                }
-                if (active && !webForegroundActive) {
-                    ContextCompat.startForegroundService(context.applicationContext, intent)
-                } else if (active || webForegroundActive) {
-                    context.applicationContext.startService(intent)
-                }
-            }
-        }
-    }
-
-    private var mediaSession: MediaSession? = null
-
-    override fun onCreate() {
-        super.onCreate()
-        createBgChannel()
-        mediaSession = MediaSession.Builder(this, PlayerHolder.getOrCreate(this)).build()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_WEB_START -> {
-                val title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { "Sonify" }
-                val artist = intent.getStringExtra(EXTRA_ARTIST).orEmpty()
-                val notif = buildWebNotification(title, artist)
-                runCatching {
-                    if (webForegroundActive) {
-                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-                        nm?.notify(WEB_NOTIF_ID, notif)
-                    } else {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            startForeground(WEB_NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-                        } else {
-                            startForeground(WEB_NOTIF_ID, notif)
-                        }
-                        webForegroundActive = true
-                    }
-                }
-            }
-            ACTION_WEB_STOP -> {
-                webForegroundActive = false
-                runCatching {
-                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-                    nm?.cancel(WEB_NOTIF_ID)
-                    if (!PlayerHolder.getOrCreate(this).isPlaying) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                            stopForeground(STOP_FOREGROUND_REMOVE)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            stopForeground(true)
-                        }
-                    }
-                }
-            }
-        }
-        super.onStartCommand(intent, flags, startId)
-        return START_STICKY
-    }
-
-    private fun createBgChannel() {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-            val ch = NotificationChannel(CHANNEL_ID, "Sonify Playback", NotificationManager.IMPORTANCE_LOW).apply {
-                setShowBadge(false)
-                setSound(null, null)
-            }
-            nm.createNotificationChannel(ch)
-        }
-    }
-
-    private fun buildWebNotification(title: String, artist: String): Notification {
-        val openIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val openPi = PendingIntent.getActivity(this, 0, openIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val prevPi = PendingIntent.getBroadcast(this, 1, Intent(this, SonifyWidget::class.java).setAction(SonifyWidget.ACTION_PREV), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val playPi = PendingIntent.getBroadcast(this, 2, Intent(this, SonifyWidget::class.java).setAction(SonifyWidget.ACTION_PLAY_PAUSE), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val nextPi = PendingIntent.getBroadcast(this, 3, Intent(this, SonifyWidget::class.java).setAction(SonifyWidget.ACTION_NEXT), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(title)
-            .setContentText(artist.ifBlank { "Sonify Background Audio" })
-            .setContentIntent(openPi)
-            .setOngoing(true)
-            .setSilent(true)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .addAction(android.R.drawable.ic_media_previous, "Prev", prevPi)
-            .addAction(android.R.drawable.ic_media_pause, "Play/Pause", playPi)
-            .addAction(android.R.drawable.ic_media_next, "Next", nextPi)
-            .build()
-    }
-
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
-    override fun onDestroy() {
-        webForegroundActive = false
-        mediaSession?.release()
-        mediaSession = null
-        super.onDestroy()
-    }
-}
-
-private class BackgroundWebView(context: Context) : WebView(context) {
-    override fun onWindowVisibilityChanged(visibility: Int) {
-        super.onWindowVisibilityChanged(View.VISIBLE)
-    }
-}
-
-private data class ActiveWebDownload(
-    val tmpFile: File,
-    val targetFile: File,
-    val outStream: FileOutputStream,
-    val onProgress: (Int) -> Unit,
-    val deferred: CompletableDeferred<Boolean>
-)
-
-class WebPlaybackEngine(private val context: Context) {
-
+class WebYouTubeEngine(private val context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var webView: WebView? = null
-    private var isMobileWatchFallback = false
-    private var currentVideoId: String = ""
-    private var pendingVideoId: String? = null
-    private var pendingStartSec: Double = 0.0
-    private var hasStartedPlayingCurrent = false
-    private var watchdogRunnable: Runnable? = null
-    private var currentSpeed: Float = 1.0f
+    private val capturedMap = ConcurrentHashMap<String, MutableList<CapturedMediaStream>>()
 
-    val capturedStreamsMap = ConcurrentHashMap<String, CopyOnWriteArrayList<CapturedMediaStream>>()
-    private val activeDownloads = ConcurrentHashMap<String, ActiveWebDownload>()
-    private val mobileUa = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+    @Volatile private var webView: WebView? = null
+    @Volatile private var activeVideoId: String = ""
+    @Volatile private var currentPosMs: Long = 0L
+    @Volatile private var currentDurMs: Long = 0L
+    @Volatile private var isPlayingNow: Boolean = false
+    @Volatile private var isBufferingNow: Boolean = false
+    @Volatile private var currentRate: Float = 1.0f
+    @Volatile private var currentVolume: Float = 1.0f
+    @Volatile private var activeMode: Boolean = false
 
-    @Volatile var isActive: Boolean = false
-        private set
-    @Volatile var isPlaying: Boolean = false
-        private set
-
-    var onProgress: ((Long, Long, Boolean, Boolean) -> Unit)? = null
+    var onStateChanged: ((posMs: Long, durMs: Long, playing: Boolean, buffering: Boolean) -> Unit)? = null
     var onEnded: (() -> Unit)? = null
 
-    private val adBlockedHostFragments = listOf(
-        "doubleclick.net",
-        "googlesyndication.com",
-        "googleadservices.com",
-        "adservice.google",
-        "imasdk.googleapis.com",
-        "2mdn.net",
-        "moatads.com"
-    )
+    fun isActive(): Boolean = activeMode
 
-    private val adBlockedUrlFragments = listOf(
-        "/pagead/",
-        "/api/stats/ads",
-        "/ptracking",
-        "/get_midroll_info",
-        "/youtubei/v1/ad_break",
-        "adformat=",
-        "adunit=",
-        "oad=",
-        "ctier=L",
-        "googleads."
-    )
-
-    private fun isAdRequest(url: String, host: String): Boolean {
-        val h = host.lowercase()
-        val u = url.lowercase()
-        if (adBlockedHostFragments.any { h.contains(it) }) return true
-        if (adBlockedUrlFragments.any { u.contains(it) }) return true
-        if (h.contains("googlevideo.com") && (u.contains("&oad=") || u.contains("?oad=") || u.contains("adformat="))) return true
-        return false
-    }
-
-    private fun emptyAdResponse(): WebResourceResponse =
-        WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
-
-    private val visibilitySpoofJs = """
-        (function() {
-          try {
-            Object.defineProperty(document, 'hidden', { get: function() { return false; }, configurable: true });
-            Object.defineProperty(document, 'webkitHidden', { get: function() { return false; }, configurable: true });
-            Object.defineProperty(document, 'visibilityState', { get: function() { return 'visible'; }, configurable: true });
-            var block = function(e) { e.stopImmediatePropagation(); };
-            document.addEventListener('visibilitychange', block, true);
-            document.addEventListener('webkitvisibilitychange', block, true);
-            window.addEventListener('pagehide', block, true);
-            window.addEventListener('blur', block, true);
-          } catch(e) {}
-        })();
-    """.trimIndent()
-
-    private fun recordCapturedUrl(videoId: String, rawUrl: String, isAudio: Boolean, headers: Map<String, String> = emptyMap()) {
-        if (videoId.isBlank() || !rawUrl.startsWith("http")) return
-        if (rawUrl.contains("sabr=1", true) || rawUrl.contains("oad=", true)) return
-        val list = capturedStreamsMap.getOrPut(videoId) { CopyOnWriteArrayList() }
-        val key = rawUrl.substringBefore("&range=").substringBefore("&rn=")
-        if (list.any { it.url.substringBefore("&range=").substringBefore("&rn=") == key }) return
-        val cookie = runCatching { CookieManager.getInstance().getCookie(rawUrl) }.getOrNull()
-        list.add(0, CapturedMediaStream(videoId, rawUrl, mobileUa, cookie, headers, isAudioOnly = isAudio))
-        while (list.size > 5) list.removeAt(list.lastIndex)
-    }
-
-    fun getCapturedStreams(videoId: String): List<CapturedMediaStream> = capturedStreamsMap[videoId]?.toList() ?: emptyList()
+    fun getCapturedStreams(videoId: String): List<CapturedMediaStream> =
+        capturedMap[videoId]?.toList().orEmpty()
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun getOrCreateWebView(): WebView {
+    private fun ensureWebView(): WebView {
         webView?.let { return it }
-        return BackgroundWebView(context.applicationContext).apply {
+        val wv = WebView(context.applicationContext).apply {
             setBackgroundColor(android.graphics.Color.BLACK)
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                runCatching { setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false) }
+            settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                mediaPlaybackRequiresUserGesture = false
+                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                cacheMode = WebSettings.LOAD_DEFAULT
+                userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
             }
-            isVerticalScrollBarEnabled = false
-            isHorizontalScrollBarEnabled = false
-            val cm = CookieManager.getInstance()
-            cm.setAcceptCookie(true)
-            cm.setAcceptThirdPartyCookies(this, true)
-
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.databaseEnabled = true
-            settings.mediaPlaybackRequiresUserGesture = false
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            settings.cacheMode = WebSettings.LOAD_DEFAULT
-            settings.userAgentString = mobileUa
-
+            addJavascriptInterface(JsBridge(), "SonifyBridge")
             webChromeClient = WebChromeClient()
             webViewClient = object : WebViewClient() {
-                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                    val host = request?.url?.host.orEmpty()
-                    return !(host.contains("youtube.com") || host.contains("youtu.be") || host.contains("google.com"))
-                }
-
                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                     val url = request?.url?.toString().orEmpty()
-                    val host = request?.url?.host.orEmpty()
-                    if (isAdRequest(url, host)) return emptyAdResponse()
-                    val vid = currentVideoId
-                    if (vid.isNotBlank() && url.contains("googlevideo.com/videoplayback") && !url.contains("sabr=1", true)) {
-                        val decoded = runCatching { URLDecoder.decode(url, "UTF-8") }.getOrDefault(url)
-                        val isAudio = decoded.contains("mime=audio", true) ||
-                            decoded.contains("itag=140") || decoded.contains("itag=251") ||
-                            decoded.contains("itag=250") || decoded.contains("itag=249")
-                        val isMuxed = decoded.contains("itag=18") || decoded.contains("itag=22")
-                        if ((isAudio || isMuxed) && (decoded.contains("clen=") || decoded.contains("itag="))) {
-                            recordCapturedUrl(vid, url, isAudio, request?.requestHeaders ?: emptyMap())
+                    if (url.contains("[googlevideo.com/videoplayback](https://googlevideo.com/videoplayback)", true) && activeVideoId.isNotBlank()) {
+                        val isAudio = url.contains("mime=audio", true) || url.contains("mime%3Daudio", true)
+                        if (isAudio) {
+                            val ua = request?.requestHeaders?.get("User-Agent") ?: settings.userAgentString
+                            val cookie = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
+                            val list = capturedMap.getOrPut(activeVideoId) { mutableListOf() }
+                            synchronized(list) {
+                                if (list.none { it.url == url }) {
+                                    list.add(0, CapturedMediaStream(activeVideoId, url, ua, cookie, request?.requestHeaders.orEmpty(), true))
+                                    if (list.size > 4) list.removeAt(list.lastIndex)
+                                }
+                            }
                         }
                     }
                     return super.shouldInterceptRequest(view, request)
                 }
 
-                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                    if (isActive && isMobileWatchFallback) {
-                        view?.evaluateJavascript(visibilitySpoofJs, null)
-                        injectCleanVideoCssOnly()
-                    }
-                }
-
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    if (isActive && isMobileWatchFallback) {
-                        view?.evaluateJavascript(visibilitySpoofJs, null)
-                        injectCleanVideoCssOnly()
-                        injectMobileWatchHook(pendingStartSec)
-                    }
+                    super.onPageFinished(view, url)
+                    injectPlayerControllerJs()
                 }
             }
-            addJavascriptInterface(JsBridge(), "SonifyBridge")
-            webView = this
         }
+        webView = wv
+        return wv
     }
 
     fun attachTo(container: FrameLayout) {
-        val existing = webView
-        if (existing != null && existing.parent === container && pendingVideoId == null) return
-
         mainHandler.post {
-            val wv = getOrCreateWebView()
-            if (wv.parent !== container) {
-                (wv.parent as? ViewGroup)?.removeView(wv)
-                container.removeAllViews()
-                container.addView(wv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-                wv.onResume()
-                wv.resumeTimers()
-                if (isActive && isMobileWatchFallback) injectCleanVideoCssOnly()
-            }
-            val pending = pendingVideoId
-            if (isActive && !pending.isNullOrBlank()) {
-                val startS = pendingStartSec
-                pendingVideoId = null
-                loadIframePlayer(wv, pending, startS)
-            }
+            val wv = ensureWebView()
+            if (wv.parent === container) return@post
+            (wv.parent as? ViewGroup)?.removeView(wv)
+            container.removeAllViews()
+            container.addView(wv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
     }
 
-    fun playVideo(videoId: String, startPositionMs: Long = 0L) {
-        val safeId = videoId.replace(Regex("[^a-zA-Z0-9_-]"), "")
-        currentVideoId = safeId
-        pendingStartSec = (startPositionMs / 1000.0).coerceAtLeast(0.0)
-        isActive = true
-        isPlaying = false
-        isMobileWatchFallback = false
-        hasStartedPlayingCurrent = false
-        cancelWatchdog()
-
+    fun loadVideo(videoId: String, startAtMs: Long, @Suppress("UNUSED_PARAMETER") title: String, @Suppress("UNUSED_PARAMETER") artist: String) {
+        activeMode = true
+        activeVideoId = videoId
+        currentPosMs = startAtMs
+        isBufferingNow = true
+        val startSec = (startAtMs / 1000L).coerceAtLeast(0L)
         mainHandler.post {
-            val wv = getOrCreateWebView()
-            if (wv.parent == null) pendingVideoId = safeId
-            else { pendingVideoId = null; loadIframePlayer(wv, safeId, pendingStartSec) }
-        }
-    }
-
-    private fun loadIframePlayer(wv: WebView, safeId: String, startSec: Double) {
-        wv.onResume()
-        wv.resumeTimers()
-        scheduleWatchdog(safeId)
-        val startInt = startSec.toInt().coerceAtLeast(0)
-
-        val html = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-            <style>
-              html, body { margin:0; padding:0; width:100vw; height:100vh; background:#000; overflow:hidden; }
-              #player { position:fixed; left:0; width:100vw; height:150vh; top:-25vh; border:0; background:#000; pointer-events:none; }
-            </style>
-            <script>$visibilitySpoofJs</script>
-            </head>
-            <body>
-            <div id="player"></div>
-            <script src="https://www.youtube.com/iframe_api"></script>
-            <script>
-              var player = null;
-              var userPaused = false;
-              var lastKick = 0;
-              var lastSentKey = '';
-              function onYouTubeIframeAPIReady() {
-                player = new YT.Player('player', {
-                  width: '100%', height: '100%', videoId: '$safeId',
-                  host: 'https://www.youtube-nocookie.com',
-                  playerVars: { 'autoplay': 1, 'start': $startInt, 'playsinline': 1, 'controls': 0, 'rel': 0, 'fs': 0, 'iv_load_policy': 3, 'modestbranding': 1, 'disablekb': 1, 'enablejsapi': 1, 'origin': 'https://www.youtube-nocookie.com' },
-                  events: {
-                    'onReady': function(e) {
-                      try {
-                        e.target.unMute(); e.target.setVolume(100); e.target.setPlaybackRate($currentSpeed);
-                        if ($startInt > 0) e.target.seekTo($startInt, true);
-                        e.target.playVideo();
-                      } catch(err) {}
-                    },
-                    'onStateChange': function(e) {
-                      if (e.data === 0) SonifyBridge.onEnded();
-                      if (e.data === 2 && !userPaused) {
-                        setTimeout(function() { if (!userPaused && player && player.playVideo) try { player.playVideo(); } catch(err){} }, 300);
-                      }
-                    },
-                    'onError': function(e) { SonifyBridge.onEmbedError(e.data); }
-                  }
-                });
-              }
-              setInterval(function() {
-                if (player && typeof player.getCurrentTime === 'function') {
-                  var pos = Math.floor((player.getCurrentTime() || 0) * 1000);
-                  var dur = Math.floor((player.getDuration() || 0) * 1000);
-                  var st = player.getPlayerState ? player.getPlayerState() : -1;
-                  var now = Date.now();
-                  if ((st === -1 || st === 2 || st === 5) && !userPaused && now - lastKick > 2000) {
-                    lastKick = now;
-                    try { player.playVideo(); } catch(err) {}
-                  }
-                  var playing = (st === 1);
-                  var buffering = (st === 3) || (!userPaused && st === -1);
-                  var key = Math.floor(pos / 400) + '_' + st + '_' + userPaused;
-                  if (key !== lastSentKey) {
-                    lastSentKey = key;
-                    SonifyBridge.onProgress(pos, dur, playing, buffering);
-                  }
-                }
-              }, 450);
-              window.sonifyPlay = function() { userPaused = false; if (player && player.playVideo) player.playVideo(); };
-              window.sonifyPause = function() { userPaused = true; if (player && player.pauseVideo) player.pauseVideo(); };
-              window.sonifyToggle = function() { if (!player) return; if (player.getPlayerState && player.getPlayerState() === 1) window.sonifyPause(); else window.sonifyPlay(); };
-              window.sonifySeek = function(sec) { if (player && player.seekTo) player.seekTo(sec, true); };
-              window.sonifyVolume = function(pct) { if (player && player.setVolume) player.setVolume(pct); };
-              window.sonifySpeed = function(spd) { if (player && player.setPlaybackRate) player.setPlaybackRate(spd); };
-            </script>
-            </body>
-            </html>
-        """.trimIndent()
-        wv.loadDataWithBaseURL("https://www.youtube-nocookie.com", html, "text/html", "UTF-8", null)
-    }
-
-    private fun scheduleWatchdog(expectedVideoId: String) {
-        cancelWatchdog()
-        val r = Runnable {
-            if (isActive && currentVideoId == expectedVideoId && !hasStartedPlayingCurrent && !isMobileWatchFallback) {
-                switchToMobileWatchFallback()
-            }
-        }
-        watchdogRunnable = r
-        mainHandler.postDelayed(r, 2600L)
-    }
-
-    private fun cancelWatchdog() {
-        watchdogRunnable?.let { mainHandler.removeCallbacks(it) }
-        watchdogRunnable = null
-    }
-
-    private fun switchToMobileWatchFallback() {
-        if (currentVideoId.isBlank() || isMobileWatchFallback) return
-        isMobileWatchFallback = true
-        cancelWatchdog()
-        val tParam = if (pendingStartSec >= 1.0) "&t=${pendingStartSec.toInt()}s" else ""
-        mainHandler.post {
-            val wv = getOrCreateWebView()
-            wv.onResume()
-            wv.resumeTimers()
-            wv.loadUrl("https://m.youtube.com/watch?v=$currentVideoId$tParam")
-        }
-    }
-
-    private fun sanitizeSignedUrl(url: String): String {
-        val sparamsRaw = Regex("[?&]sparams=([^&]+)").find(url)?.groupValues?.get(1).orEmpty()
-        val signedParams = runCatching { URLDecoder.decode(sparamsRaw, "UTF-8") }
-            .getOrDefault(sparamsRaw)
-            .split(",")
-            .map { it.trim().lowercase() }
-            .filter { it.isNotEmpty() }
-            .toSet()
-
-        val removable = listOf("range", "rn", "rbuf", "alr", "ump", "srfvp", "sabr")
-            .filterNot { it in signedParams }
-        if (removable.isEmpty()) return url
-
-        val pattern = Regex("([?&])(${removable.joinToString("|")})=[^&]*", RegexOption.IGNORE_CASE)
-        return url
-            .replace(pattern, "$1")
-            .replace("?&", "?")
-            .replace(Regex("&{2,}"), "&")
-            .trimEnd('&', '?')
-    }
-
-    suspend fun downloadViaWebViewFetch(
-        videoId: String,
-        targetFile: File,
-        onProgress: (Int) -> Unit
-    ): Boolean {
-        val wv = webView ?: return false
-        val candidates = getCapturedStreams(videoId)
-            .sortedByDescending { it.isAudioOnly }
-            .filter { !it.url.contains(".m3u8", true) && !it.url.contains("sabr=1", true) }
-            .take(3)
-        if (candidates.isEmpty()) return false
-
-        for (cap in candidates) {
-            val cleanUrl = sanitizeSignedUrl(cap.url)
-            val dlId = UUID.randomUUID().toString().take(8)
-            val tmpFile = File(targetFile.parentFile, "${targetFile.name}.wvtmp")
-            val deferred = CompletableDeferred<Boolean>()
-            val fos = runCatching { FileOutputStream(tmpFile) }.getOrNull() ?: continue
-            activeDownloads[dlId] = ActiveWebDownload(tmpFile, targetFile, fos, onProgress, deferred)
-
-            val escapedUrl = cleanUrl.replace("\\", "\\\\").replace("'", "\\'")
-            val js = """
-                (async function() {
-                  const dlId = '$dlId';
-                  let baseUrl = '$escapedUrl';
-                  function abToB64(u8) {
-                    let s = '';
-                    const step = 0x8000;
-                    for (let i = 0; i < u8.length; i += step) {
-                      s += String.fromCharCode.apply(null, u8.subarray(i, i + step));
-                    }
-                    return btoa(s);
-                  }
-                  async function fetchChunk(url) {
-                    const resp = await fetch(url, { mode: 'cors', credentials: 'omit' });
-                    if (!resp.ok) return null;
-                    const ct = (resp.headers.get('content-type') || '').toLowerCase();
-                    if (ct.includes('text/html') || ct.includes('yt-ump')) return null;
-                    const buf = new Uint8Array(await resp.arrayBuffer());
-                    if (ct.includes('text/plain') && buf.length < 2048) {
-                      const txt = new TextDecoder().decode(buf).trim();
-                      if (txt.startsWith('https://')) return { redirect: txt };
-                      return null;
-                    }
-                    return { data: buf };
-                  }
-                  try {
-                    const clenMatch = baseUrl.match(/[?&]clen=(\d+)/);
-                    const clen = clenMatch ? parseInt(clenMatch[1], 10) : 0;
-                    if (clen > 0 && clen < 75000000) {
-                      let offset = 0;
-                      const chunk = 1024 * 1024;
-                      while (offset < clen) {
-                        const end = Math.min(offset + chunk - 1, clen - 1);
-                        let res = null;
-                        for (let r = 0; r < 2; r++) {
-                          const sep = baseUrl.includes('?') ? '&' : '?';
-                          const attempt = await fetchChunk(baseUrl + sep + 'range=' + offset + '-' + end);
-                          if (attempt && attempt.redirect) { baseUrl = attempt.redirect; continue; }
-                          if (attempt && attempt.data && attempt.data.length > 0) { res = attempt.data; break; }
+            val wv = ensureWebView()
+            val html = """
+                <!DOCTYPE html>
+                <html><head>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                <style>html,body,#player{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden;}</style>
+                </head><body>
+                <div id="player"></div>
+                <script src="[https://www.youtube.com/iframe_api](https://www.youtube.com/iframe_api)"></script>
+                <script>
+                  var ytPlayer = null;
+                  function onYouTubeIframeAPIReady() {
+                    ytPlayer = new YT.Player('player', {
+                      videoId: '$videoId',
+                      playerVars: { autoplay: 1, controls: 0, rel: 0, modestbranding: 1, playsinline: 1, start: $startSec },
+                      events: {
+                        'onReady': function(e) {
+                          try {
+                            e.target.setPlaybackRate($currentRate);
+                            e.target.setVolume(${(currentVolume * 100).toInt().coerceIn(0, 100)});
+                            e.target.playVideo();
+                          } catch(err){}
+                        },
+                        'onStateChange': function(e) {
+                          if (e.data === 0) { try { SonifyBridge.onTrackEnded(); } catch(err){} }
                         }
-                        if (!res) { SonifyBridge.onDownloadDone(dlId, false); return; }
-                        offset += res.length;
-                        const pct = Math.min(98, Math.max(5, Math.floor((offset * 98) / clen)));
-                        SonifyBridge.onDownloadChunk(dlId, abToB64(res), pct);
                       }
-                      SonifyBridge.onDownloadDone(dlId, true);
-                    } else {
-                      const resp = await fetch(baseUrl, { mode: 'cors', credentials: 'omit' });
-                      if (!resp.ok || !resp.body) { SonifyBridge.onDownloadDone(dlId, false); return; }
-                      const total = parseInt(resp.headers.get('content-length') || '0', 10);
-                      const reader = resp.body.getReader();
-                      let loaded = 0;
-                      while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        loaded += value.length;
-                        const pct = total > 0 ? Math.min(98, Math.max(5, Math.floor((loaded * 98) / total))) : 50;
-                        SonifyBridge.onDownloadChunk(dlId, abToB64(value), pct);
-                      }
-                      SonifyBridge.onDownloadDone(dlId, loaded > 16384);
-                    }
-                  } catch (e) {
-                    SonifyBridge.onDownloadDone(dlId, false);
+                    });
                   }
-                })();
+                  setInterval(function() {
+                    if (!ytPlayer || !ytPlayer.getCurrentTime) return;
+                    try {
+                      var st = ytPlayer.getPlayerState();
+                      var pos = Math.floor((ytPlayer.getCurrentTime() || 0) * 1000);
+                      var dur = Math.floor((ytPlayer.getDuration() || 0) * 1000);
+                      SonifyBridge.onTick(pos, dur, st === 1, st === 3 || st === -1);
+                    } catch(err){}
+                  }, 450);
+                </script>
+                </body></html>
             """.trimIndent()
-
-            mainHandler.post { wv.evaluateJavascript(js, null) }
-
-            val ok = withTimeoutOrNull(25_000L) { deferred.await() } ?: false
-            if (ok) return true
-            activeDownloads.remove(dlId)?.let { dl ->
-                runCatching { dl.outStream.close() }
-                dl.tmpFile.delete()
-            }
+            wv.loadDataWithBaseURL("[https://www.youtube-nocookie.com](https://www.youtube-nocookie.com)", html, "text/html", "UTF-8", null)
         }
-        return false
     }
 
-    private fun cleanMobileCssString(): String = """
-        html, body { background:#000 !important; margin:0 !important; padding:0 !important; width:100vw !important; height:100vh !important; overflow:hidden !important; }
-        ytm-mobile-topbar-renderer, .mobile-topbar-header, #header-bar, header,
-        .watch-below-the-player, ytm-watch-metadata, ytm-slim-video-metadata-section-renderer,
-        ytm-item-section-renderer, ytm-engagement-panel-section-list-renderer,
-        ytm-single-column-watch-next-results-renderer, .ytm-autonav-bar, ytm-app-header,
-        #player-control-overlay, .player-controls-content, .player-controls-background,
-        .player-controls-background-container, .player-controls-top, .player-controls-middle,
-        .player-controls-bottom, .ytp-chrome-top, .ytp-chrome-bottom, .ytp-gradient-top,
-        .ytp-gradient-bottom, .ytp-pause-overlay, .ytp-watermark, .ytp-bezel-text-wrapper,
-        .ytp-doubletap-ui-legacy, .ytm-custom-control-host, .ytp-spinner, .ytp-mweb-player-chrome,
-        .ytp-cued-thumbnail-overlay, .ytp-large-play-button, ytm-promoted-sparkles-web-renderer,
-        .ytp-endscreen-content, .ytp-ce-element, .ytp-suggested-action, .ytp-cards-teaser,
-        .ytp-ad-module, .ytp-ad-overlay-container, .ytp-ad-player-overlay, .video-ads {
-          display:none !important; opacity:0 !important; visibility:hidden !important; pointer-events:none !important;
-        }
-        #player-container-id, .player-container, #player, #movie_player, .html5-video-player, .html5-video-container {
-          position:fixed !important; top:0 !important; left:0 !important; right:0 !important; bottom:0 !important;
-          width:100vw !important; height:100vh !important; max-width:100vw !important; max-height:100vh !important;
-          margin:0 !important; padding:0 !important; background:#000 !important; z-index:99999 !important;
-        }
-        video, video.html5-main-video {
-          position:fixed !important; top:0 !important; left:0 !important; width:100vw !important; height:100vh !important;
-          object-fit:contain !important; background:#000 !important; transform:none !important; z-index:2147483647 !important;
-        }
-    """.trimIndent().replace("\n", " ")
-
-    private fun injectCleanVideoCssOnly() {
-        val css = cleanMobileCssString()
-        val js = "(function(){var s=document.getElementById('sonify-clean-css');if(!s){s=document.createElement('style');s.id='sonify-clean-css';(document.head||document.documentElement).appendChild(s);}s.textContent=\"$css\";})();"
-        mainHandler.post { webView?.evaluateJavascript(js, null) }
+    private fun injectPlayerControllerJs() {
+        evalJs("if(ytPlayer){try{ytPlayer.setPlaybackRate($currentRate);ytPlayer.setVolume(${(currentVolume * 100).toInt()});}catch(e){}}")
     }
 
-    private fun injectMobileWatchHook(startSec: Double) {
-        val css = cleanMobileCssString()
-        val js = """
-            (function() {
-              $visibilitySpoofJs
-              window.__sonifyUserPaused = false;
-              window.__sonifyEndedFired = false;
-              window.__sonifySeekedOnce = false;
-              window.__sonifyLastPlayTry = 0;
-              window.__sonifyLastKey = '';
-              if (window.__sonifyTimer) clearInterval(window.__sonifyTimer);
-
-              function enforceCleanCss() {
-                var s = document.getElementById('sonify-clean-css');
-                if (!s) {
-                  s = document.createElement('style');
-                  s.id = 'sonify-clean-css';
-                  (document.head || document.documentElement).appendChild(s);
-                  s.textContent = "$css";
-                }
-              }
-              enforceCleanCss();
-
-              if (!window.__sonifyObserver && document.documentElement) {
-                window.__sonifyObserver = new MutationObserver(function() {
-                  if (!document.getElementById('sonify-clean-css')) enforceCleanCss();
-                });
-                window.__sonifyObserver.observe(document.documentElement, { childList: true, subtree: false });
-              }
-
-              try {
-                var sd = window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.streamingData;
-                if (sd) {
-                  if (sd.hlsManifestUrl) SonifyBridge.onCapturedUrl(sd.hlsManifestUrl, true);
-                  if (sd.adaptiveFormats) {
-                    for (var i = 0; i < sd.adaptiveFormats.length; i++) {
-                      var af = sd.adaptiveFormats[i];
-                      if (af.url && af.mimeType && af.mimeType.indexOf('audio/') === 0) { SonifyBridge.onCapturedUrl(af.url, true); break; }
-                    }
-                  }
-                  if (sd.formats) {
-                    for (var j = 0; j < sd.formats.length; j++) {
-                      if (sd.formats[j].url) { SonifyBridge.onCapturedUrl(sd.formats[j].url, false); break; }
-                    }
-                  }
-                }
-              } catch(e) {}
-
-              window.__sonifyTimer = setInterval(function() {
-                var v = document.querySelector('video');
-                var playerEl = document.querySelector('#movie_player, .html5-video-player');
-                var isAd = (playerEl && (playerEl.classList.contains('ad-showing') || playerEl.classList.contains('ad-interrupting')))
-                           || !!document.querySelector('.ytp-ad-player-overlay, .ytp-ad-text, .ytp-ad-preview-container');
-
-                var skip = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button-slot button');
-                if (skip) { try { skip.click(); } catch(e){} }
-
-                if (isAd && v) {
-                  try {
-                    v.muted = true;
-                    v.playbackRate = 16.0;
-                    if (isFinite(v.duration) && v.duration > 0.2 && v.currentTime < v.duration - 0.2) {
-                      v.currentTime = v.duration - 0.1;
-                    }
-                  } catch(e) {}
-                  SonifyBridge.onProgress(0, 0, false, true);
-                  return;
-                }
-
-                if (!v) return;
-                if (!window.__sonifySeekedOnce && $startSec >= 1 && v.readyState >= 1) {
-                  window.__sonifySeekedOnce = true;
-                  try { v.currentTime = $startSec; } catch(e){}
-                }
-                if (Math.abs(v.playbackRate - $currentSpeed) > 0.05) { try { v.playbackRate = $currentSpeed; } catch(e){} }
-                var now = Date.now();
-                if (!window.__sonifyUserPaused) {
-                  if (v.muted) v.muted = false;
-                  if (v.volume === 0) v.volume = 1.0;
-                  if (v.paused && !v.ended && v.readyState >= 2 && (now - window.__sonifyLastPlayTry > 2000)) {
-                    window.__sonifyLastPlayTry = now;
-                    v.play().catch(function(){});
-                  }
-                }
-                var pos = Math.floor((v.currentTime || 0) * 1000);
-                var dur = Math.floor((isFinite(v.duration) && v.duration > 0 ? v.duration : 0) * 1000);
-                var playing = !v.paused && !v.ended && v.readyState >= 2;
-                var buffering = !window.__sonifyUserPaused && !playing && v.readyState < 3;
-                var key = Math.floor(pos / 400) + '_' + playing + '_' + buffering;
-                if (key !== window.__sonifyLastKey) {
-                  window.__sonifyLastKey = key;
-                  SonifyBridge.onProgress(pos, dur, playing, buffering);
-                }
-                if (v.ended && !window.__sonifyEndedFired) { window.__sonifyEndedFired = true; SonifyBridge.onEnded(); }
-              }, 350);
-
-              window.sonifyPlay = function() { window.__sonifyUserPaused = false; var v = document.querySelector('video'); if (v) { v.muted = false; v.play().catch(function(){}); } };
-              window.sonifyPause = function() { window.__sonifyUserPaused = true; var v = document.querySelector('video'); if (v) v.pause(); };
-              window.sonifyToggle = function() { var v = document.querySelector('video'); if (!v) return; if (v.paused) window.sonifyPlay(); else window.sonifyPause(); };
-              window.sonifySeek = function(sec) { var v = document.querySelector('video'); if (v) v.currentTime = sec; };
-              window.sonifyVolume = function(pct) { var v = document.querySelector('video'); if (v) v.volume = Math.max(0, Math.min(1, pct / 100)); };
-              window.sonifySpeed = function(spd) { var v = document.querySelector('video'); if (v) v.playbackRate = spd; };
-            })();
-        """.trimIndent()
-        mainHandler.post { webView?.evaluateJavascript(js, null) }
+    fun play() {
+        if (!activeMode) return
+        evalJs("if(ytPlayer&&ytPlayer.playVideo)ytPlayer.playVideo();")
     }
 
-    fun play() = mainHandler.post { webView?.onResume(); webView?.resumeTimers(); webView?.evaluateJavascript("if(window.sonifyPlay) window.sonifyPlay();", null) }
-    fun pause() = mainHandler.post { webView?.evaluateJavascript("if(window.sonifyPause) window.sonifyPause();", null) }
-    fun seekTo(ms: Long) = mainHandler.post { webView?.evaluateJavascript("if(window.sonifySeek) window.sonifySeek(${(ms / 1000.0).coerceAtLeast(0.0)});", null) }
-    fun setVolume(fraction: Float) = mainHandler.post { webView?.evaluateJavascript("if(window.sonifyVolume) window.sonifyVolume(${(fraction * 100).toInt().coerceIn(0, 100)});", null) }
-    fun setSpeed(speed: Float) {
-        currentSpeed = speed.coerceIn(0.5f, 3.5f)
-        mainHandler.post { webView?.evaluateJavascript("if(window.sonifySpeed) window.sonifySpeed($currentSpeed);", null) }
+    fun pause() {
+        evalJs("if(ytPlayer&&ytPlayer.pauseVideo)ytPlayer.pauseVideo();")
     }
 
-    fun togglePlayPause() {
+    fun stopAndDeactivate() {
+        activeMode = false
+        isPlayingNow = false
+        isBufferingNow = false
         mainHandler.post {
-            webView?.onResume()
-            webView?.resumeTimers()
-            if (!hasStartedPlayingCurrent && !isMobileWatchFallback && currentVideoId.isNotBlank()) {
-                switchToMobileWatchFallback()
-            } else if (isPlaying) {
-                webView?.evaluateJavascript("if(window.sonifyPause) window.sonifyPause();", null)
-            } else {
-                webView?.evaluateJavascript("if(window.sonifyPlay) window.sonifyPlay();", null)
-            }
-        }
-    }
-
-    fun stop() {
-        isActive = false; isPlaying = false; pendingVideoId = null; hasStartedPlayingCurrent = false; cancelWatchdog()
-        mainHandler.post {
-            webView?.evaluateJavascript("if(window.sonifyPause) window.sonifyPause();", null)
+            evalJs("if(ytPlayer&&ytPlayer.stopVideo)ytPlayer.stopVideo();")
             webView?.loadUrl("about:blank")
         }
     }
 
+    fun seekTo(ms: Long) {
+        currentPosMs = ms
+        val sec = (ms / 1000.0)
+        evalJs("if(ytPlayer&&ytPlayer.seekTo)ytPlayer.seekTo($sec,true);")
+    }
+
+    fun setPlaybackRate(rate: Float) {
+        currentRate = rate
+        evalJs("if(ytPlayer&&ytPlayer.setPlaybackRate)ytPlayer.setPlaybackRate($rate);")
+    }
+
+    fun setVolume(vol: Float) {
+        currentVolume = vol.coerceIn(0f, 1f)
+        val pct = (currentVolume * 100).toInt()
+        evalJs("if(ytPlayer&&ytPlayer.setVolume)ytPlayer.setVolume($pct);")
+    }
+
+    private fun evalJs(script: String) {
+        mainHandler.post { runCatching { webView?.evaluateJavascript(script, null) } }
+    }
+
     private inner class JsBridge {
         @JavascriptInterface
-        fun onProgress(posMs: Long, durMs: Long, playing: Boolean, buffering: Boolean) {
-            if (!isActive) return
-            if (playing && posMs > 200L) { hasStartedPlayingCurrent = true; cancelWatchdog() }
-            isPlaying = playing
-            mainHandler.post { onProgress?.invoke(posMs, durMs, playing, buffering) }
-        }
-
-        @JavascriptInterface fun onEnded() { if (isActive) mainHandler.post { onEnded?.invoke() } }
-        @JavascriptInterface fun onEmbedError(code: Int) { if (isActive) switchToMobileWatchFallback() }
-        @JavascriptInterface fun onCapturedUrl(url: String, isAudio: Boolean) {
-            if (currentVideoId.isNotBlank()) recordCapturedUrl(currentVideoId, url, isAudio)
+        fun onTick(pos: Long, dur: Long, playing: Boolean, buffering: Boolean) {
+            if (!activeMode) return
+            currentPosMs = pos
+            currentDurMs = dur
+            isPlayingNow = playing
+            isBufferingNow = buffering
+            mainHandler.post { onStateChanged?.invoke(pos, dur, playing, buffering) }
         }
 
         @JavascriptInterface
-        fun onDownloadChunk(dlId: String, b64: String, pct: Int) {
-            val dl = activeDownloads[dlId] ?: return
+        fun onTrackEnded() {
+            if (!activeMode) return
+            mainHandler.post { onEnded?.invoke() }
+        }
+    }
+
+    fun release() {
+        stopAndDeactivate()
+        mainHandler.post {
             runCatching {
-                val bytes = Base64.decode(b64, Base64.DEFAULT)
-                dl.outStream.write(bytes)
-                dl.onProgress(pct)
-            }.onFailure {
-                onDownloadDone(dlId, false)
-            }
-        }
-
-        @JavascriptInterface
-        fun onDownloadDone(dlId: String, success: Boolean) {
-            val dl = activeDownloads.remove(dlId) ?: return
-            runCatching { dl.outStream.flush(); dl.outStream.close() }
-            if (success && dl.tmpFile.exists() && dl.tmpFile.length() > 16_384) {
-                if (dl.targetFile.exists()) dl.targetFile.delete()
-                dl.tmpFile.renameTo(dl.targetFile)
-                dl.onProgress(100)
-                dl.deferred.complete(true)
-            } else {
-                dl.tmpFile.delete()
-                dl.deferred.complete(false)
+                (webView?.parent as? ViewGroup)?.removeView(webView)
+                webView?.destroy()
+                webView = null
             }
         }
     }
@@ -972,428 +348,410 @@ class WebPlaybackEngine(private val context: Context) {
 
 class AudioEngine(private val context: Context) {
 
-    val player: ExoPlayer = PlayerHolder.getOrCreate(context)
-    val webEngine = WebPlaybackEngine(context)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .connectionPool(ConnectionPool(10, 5, TimeUnit.MINUTES))
-        .retryOnConnectionFailure(true)
-        .followRedirects(true)
-        .build()
+    val webEngine = WebYouTubeEngine(context)
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    @Volatile private var currentSettings: AppSettings = AppSettings()
+    @Volatile private var sleepEndOfTrack: Boolean = false
+    @Volatile private var isMuted: Boolean = false
+
     private var equalizer: Equalizer? = null
-    private var dynamicsProcessing: DynamicsProcessing? = null
     private var loudnessEnhancer: LoudnessEnhancer? = null
-    private var lastSettings: AppSettings = AppSettings()
-    private var currentWebTitle: String = "Sonify"
-    private var currentWebArtist: String = ""
-
-    private val wakeLock: PowerManager.WakeLock? = runCatching {
-        (context.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager)
-            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Sonify::AudioPlaybackLock")
-            ?.apply { setReferenceCounted(false) }
-    }.getOrNull()
-
-    private val wifiLock: WifiManager.WifiLock? = runCatching {
-        val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        } else {
-            @Suppress("DEPRECATION")
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        }
-        wm?.createWifiLock(mode, "Sonify::AudioWifiLock")?.apply { setReferenceCounted(false) }
-    }.getOrNull()
-
     private var tts: TextToSpeech? = null
     private var ttsReady = false
 
-    private var sleepJob: Job? = null
-    var sleepEndOfTrack: Boolean = false
-        private set
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var sleepTimerJob: Job? = null
+    private var progressJob: Job? = null
 
+    var onProgressUpdate: ((pos: Long, dur: Long, playing: Boolean, buffering: Boolean) -> Unit)? = null
     var onTrackEnded: (() -> Unit)? = null
-    var onPlaybackError: ((String) -> Unit)? = null
-    var onProgressUpdate: ((Long, Long, Boolean, Boolean) -> Unit)? = null
+    var onPlaybackError: ((code: String) -> Unit)? = null
 
-    private val eqCenterFreqs = floatArrayOf(31f, 62f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f)
+    val player: ExoPlayer = buildExoPlayer(AudioBufferProfile.HIGH_STABILITY)
 
     init {
-        AudioCacheHolder.getOrCreate(context)
-        tts = TextToSpeech(context.applicationContext) { status ->
-            ttsReady = (status == TextToSpeech.SUCCESS)
-            if (ttsReady) {
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) { duckVolume(true) }
-                    override fun onDone(utteranceId: String?) { duckVolume(false) }
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(utteranceId: String?) { duckVolume(false) }
-                })
-            }
-        }
+        initLocks()
+        initTts()
 
-        webEngine.onProgress = { pos, dur, playing, buffering ->
-            if (webEngine.isActive) {
-                updatePlaybackLocks(playing || buffering)
+        webEngine.onStateChanged = { pos, dur, playing, buffering ->
+            if (webEngine.isActive()) {
                 onProgressUpdate?.invoke(pos, dur, playing, buffering)
             }
         }
         webEngine.onEnded = {
-            if (sleepEndOfTrack) {
-                sleepEndOfTrack = false
-                webEngine.pause()
-                updatePlaybackLocks(false)
-                PlaybackService.setWebBackgroundPlayback(context, false)
-            } else onTrackEnded?.invoke()
+            if (webEngine.isActive()) {
+                if (sleepEndOfTrack) {
+                    sleepEndOfTrack = false
+                    webEngine.pause()
+                } else {
+                    onTrackEnded?.invoke()
+                }
+            }
         }
 
         player.addListener(object : Player.Listener {
-            override fun onAudioSessionIdChanged(audioSessionId: Int) = attachAudioEffects(audioSessionId)
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (!webEngine.isActive) updatePlaybackLocks(isPlaying)
-            }
             override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_ENDED && !webEngine.isActive) {
-                    updatePlaybackLocks(false)
-                    if (sleepEndOfTrack) { sleepEndOfTrack = false; player.pause() } else onTrackEnded?.invoke()
+                if (webEngine.isActive()) return
+                when (playbackState) {
+                    Player.STATE_ENDED -> {
+                        if (sleepEndOfTrack) {
+                            sleepEndOfTrack = false
+                            player.pause()
+                        } else {
+                            onTrackEnded?.invoke()
+                        }
+                    }
+                    Player.STATE_READY -> attachAudioEffects()
+                    else -> {}
                 }
             }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (isPlaying) acquireLocksIfAllowed() else releaseLocks()
+            }
+
             override fun onPlayerError(error: PlaybackException) {
-                if (!webEngine.isActive) onPlaybackError?.invoke(error.errorCodeName)
+                if (webEngine.isActive()) return
+                onPlaybackError?.invoke(error.errorCodeName)
             }
         })
 
-        runCatching { context.startService(Intent(context, PlaybackService::class.java)) }
+        startProgressTicker()
+    }
 
-        scope.launch {
+    private fun buildExoPlayer(profile: AudioBufferProfile): ExoPlayer {
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(profile.minMs, profile.maxMs, profile.playMs, profile.rebufferMs)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+        val attrs = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .build()
+        return ExoPlayer.Builder(context.applicationContext)
+            .setLoadControl(loadControl)
+            .setAudioAttributes(attrs, true)
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+    }
+
+    private fun startProgressTicker() {
+        progressJob?.cancel()
+        progressJob = scope.launch {
             while (isActive) {
-                if (!webEngine.isActive) {
+                if (!webEngine.isActive()) {
                     val pos = player.currentPosition.coerceAtLeast(0L)
-                    val dur = player.duration.coerceAtLeast(0L)
-                    val buffering = player.playbackState == Player.STATE_BUFFERING
+                    val dur = player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: 0L
                     val playing = player.isPlaying
-                    updatePlaybackLocks(playing || buffering)
+                    val buffering = player.playbackState == Player.STATE_BUFFERING
                     onProgressUpdate?.invoke(pos, dur, playing, buffering)
-
-                    val effectiveFadeSec = if (lastSettings.automixEnabled && lastSettings.crossfadeSeconds == 0) 4 else lastSettings.crossfadeSeconds
-                    val cfMs = effectiveFadeSec * 1000L
-                    val targetVol = if (cfMs > 0 && dur > cfMs && playing) {
-                        val remaining = dur - pos
-                        when {
-                            remaining in 1..cfMs -> (remaining.toFloat() / cfMs.toFloat()).coerceIn(0.05f, 1f)
-                            pos < cfMs / 2 -> (pos.toFloat() / (cfMs / 2f)).coerceIn(0.15f, 1f)
-                            else -> 1f
-                        }
-                    } else if (sleepJob == null || !sleepJob!!.isActive) {
-                        1f
-                    } else null
-
-                    if (targetVol != null && abs(player.volume - targetVol) > 0.01f) {
-                        player.volume = targetVol
-                    }
                 }
-                delay(400)
+                delay(350L)
             }
         }
     }
 
-    private fun updatePlaybackLocks(shouldHold: Boolean) {
-        val allowed = shouldHold && lastSettings.keepWakeLockAudio
+    private fun initLocks() {
+        wakeLock = runCatching {
+            (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+                ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Sonify::AudioWakeLock")
+                ?.apply { setReferenceCounted(false) }
+        }.getOrNull()
+        wifiLock = runCatching {
+            val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            else @Suppress("DEPRECATION") WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            wm?.createWifiLock(mode, "Sonify::AudioWifiLock")?.apply { setReferenceCounted(false) }
+        }.getOrNull()
+    }
+
+    private fun acquireLocksIfAllowed() {
+        if (!currentSettings.keepWakeLockAudio) return
         runCatching {
-            if (allowed) {
-                if (wakeLock?.isHeld == false) wakeLock.acquire(4L * 60L * 60L * 1000L)
-                if (wifiLock?.isHeld == false) wifiLock.acquire()
-            } else {
-                if (wakeLock?.isHeld == true) wakeLock.release()
-                if (wifiLock?.isHeld == true) wifiLock.release()
-            }
+            if (wakeLock?.isHeld == false) wakeLock?.acquire(180L * 60L * 1000L)
+            if (wifiLock?.isHeld == false) wifiLock?.acquire()
         }
     }
 
     fun releaseLocks() {
-        updatePlaybackLocks(false)
-        PlaybackService.setWebBackgroundPlayback(context, false)
-    }
-
-    private fun duckVolume(duck: Boolean) {
-        scope.launch {
-            val v = if (duck) 0.22f else 1.0f
-            player.volume = v
-            if (webEngine.isActive) webEngine.setVolume(v)
+        runCatching {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            if (wifiLock?.isHeld == true) wifiLock?.release()
         }
     }
 
-    fun speakDjAnnouncement(text: String, isEn: Boolean, forceAllow: Boolean = false) {
-        if ((!lastSettings.djVoiceEnabled && !forceAllow) || !ttsReady) return
+    private fun initTts() {
         runCatching {
-            val loc = if (isEn) Locale.US else Locale("he", "IL")
-            tts?.language = loc
-            tts?.setSpeechRate(1.05f)
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "dj_${System.currentTimeMillis()}")
+            tts = TextToSpeech(context.applicationContext) { status ->
+                ttsReady = (status == TextToSpeech.SUCCESS)
+            }
         }
     }
 
     fun attachWebView(container: FrameLayout) = webEngine.attachTo(container)
+
     fun getCapturedStreams(videoId: String): List<CapturedMediaStream> = webEngine.getCapturedStreams(videoId)
 
-    private fun attachAudioEffects(sessionId: Int) {
-        if (sessionId == C.AUDIO_SESSION_ID_UNSET || sessionId <= 0) return
-        runCatching { loudnessEnhancer?.release(); loudnessEnhancer = LoudnessEnhancer(sessionId) }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            runCatching {
-                dynamicsProcessing?.release()
-                val cfg = DynamicsProcessing.Config.Builder(
-                    DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION, 2, true, 10, false, 0, false, 0, true
-                ).build()
-                dynamicsProcessing = DynamicsProcessing(0, sessionId, cfg)
-            }
-        } else {
-            runCatching { equalizer?.release(); equalizer = Equalizer(0, sessionId) }
-        }
-        applySettings(lastSettings)
-    }
-
-    fun applySettings(settings: AppSettings) {
-        lastSettings = settings
-        if (!settings.keepWakeLockAudio) updatePlaybackLocks(false)
-        PlayerHolder.balanceMonoProcessor.monoEnabled = settings.monoAudio
-        PlayerHolder.balanceMonoProcessor.balance = settings.audioBalance
-        player.playbackParameters = PlaybackParameters(settings.playbackSpeed.coerceIn(0.5f, 3.5f))
-        webEngine.setSpeed(settings.playbackSpeed)
-
-        runCatching {
-            loudnessEnhancer?.apply {
-                enabled = settings.normalizeVolume
-                setTargetGain(if (settings.normalizeVolume) settings.normalizationLevel.gainMb else 0)
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            runCatching {
-                dynamicsProcessing?.let { dp ->
-                    dp.enabled = settings.eqEnabled
-                    val eq = DynamicsProcessing.Eq(true, settings.eqEnabled, 10)
-                    for (i in 0 until 10) {
-                        eq.getBand(i).apply {
-                            isEnabled = settings.eqEnabled
-                            cutoffFrequency = eqCenterFreqs[i]
-                            gain = settings.eqBands.getOrElse(i) { 0 }.toFloat().coerceIn(-12f, 12f)
-                        }
-                    }
-                    dp.setPreEqAllChannelsTo(eq)
-                    dp.setLimiterAllChannelsTo(DynamicsProcessing.Limiter(true, true, 0, 2f, 60f, 4f, -1.5f, 0f))
-                }
-            }
-        } else {
-            runCatching {
-                equalizer?.let { eq ->
-                    eq.enabled = settings.eqEnabled
-                    val bands = eq.numberOfBands.toInt()
-                    val minLvl = eq.bandLevelRange[0].toInt()
-                    val maxLvl = eq.bandLevelRange[1].toInt()
-                    for (i in 0 until bands) {
-                        val mapped = settings.eqBands.getOrElse((i * 2).coerceAtMost(9)) { 0 }
-                        eq.setBandLevel(i.toShort(), ((mapped / 12f) * (maxLvl - minLvl) / 2f).toInt().coerceIn(minLvl, maxLvl).toShort())
-                    }
-                }
-            }
+    /**
+     * Pre-warms the next track in the queue straight into ExoPlayer's 250MB SimpleCache on disk
+     * under `sonify_track_<id>` for instantaneous gapless playback!
+     */
+    fun prewarmNextTrackDiskCache(track: Track, resolved: ResolvedStreams) {
+        if (resolved.isOffline || track.source != StreamSource.YOUTUBE) return
+        scope.launch(Dispatchers.IO) {
+            AudioCacheHolder.prewarmTrackOnDisk(
+                context = context,
+                trackId = track.id,
+                audioUrl = resolved.audioUrl,
+                userAgent = resolved.userAgent,
+                cookie = resolved.cookie
+            )
         }
     }
 
-    // Uses 180MB SimpleCache for remote HTTP/HTTPS streams (smooth playback even when signal drops!)
-    private fun buildSingleSource(
-        url: String,
-        metadata: MediaMetadata,
-        userAgent: String,
-        cookie: String? = null,
-        cacheKey: String? = null
-    ): MediaSource {
-        val isLocalUri = url.startsWith("file:", true) || url.startsWith("content:", true)
-        val okHttpFactory = OkHttpDataSource.Factory(okHttpClient).setUserAgent(userAgent)
-        if (!cookie.isNullOrBlank()) okHttpFactory.setDefaultRequestProperties(mapOf("Cookie" to cookie))
-        val upstreamFactory = DefaultDataSource.Factory(context, okHttpFactory)
+    fun playResolved(
+        resolved: ResolvedStreams,
+        track: Track,
+        videoMode: Boolean = false,
+        startPositionMs: Long = 0L
+    ) {
+        webEngine.stopAndDeactivate()
+        val cacheKey = AudioCacheHolder.cacheKeyFor(track.id)
+        val dsFactory = AudioCacheHolder.buildCacheDataSourceFactory(context, resolved.userAgent, resolved.cookie)
+        val mediaSourceFactory = DefaultMediaSourceFactory(dsFactory)
 
-        val isHls = url.contains(".m3u8", true) || url.contains("manifest/hls", true)
-        val cache = if (!isLocalUri && !isHls) AudioCacheHolder.getOrCreate(context) else null
+        val meta = MediaMetadata.Builder()
+            .setTitle(track.title)
+            .setArtist(track.artist)
+            .setAlbumTitle(track.album)
+            .build()
 
-        val dataSourceFactory = if (cache != null) {
-            CacheDataSource.Factory()
-                .setCache(cache)
-                .setUpstreamDataSourceFactory(upstreamFactory)
-                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        val audioItem = MediaItem.Builder()
+            .setUri(resolved.audioUrl)
+            .setMediaId(track.id)
+            .setCustomCacheKey(cacheKey)
+            .setMediaMetadata(meta)
+            .build()
+
+        val finalSource = if (videoMode && !resolved.videoOnlyUrl.isNullOrBlank()) {
+            val videoItem = MediaItem.Builder()
+                .setUri(resolved.videoOnlyUrl)
+                .setCustomCacheKey("${cacheKey}_vid")
+                .build()
+            MergingMediaSource(
+                mediaSourceFactory.createMediaSource(videoItem),
+                mediaSourceFactory.createMediaSource(audioItem)
+            )
+        } else if (videoMode && !resolved.videoUrl.isNullOrBlank()) {
+            val muxedItem = MediaItem.Builder()
+                .setUri(resolved.videoUrl)
+                .setMediaId(track.id)
+                .setMediaMetadata(meta)
+                .build()
+            mediaSourceFactory.createMediaSource(muxedItem)
         } else {
-            upstreamFactory
+            mediaSourceFactory.createMediaSource(audioItem)
         }
 
-        val itemBuilder = MediaItem.Builder().setUri(url).setMediaMetadata(metadata)
-        if (!cacheKey.isNullOrBlank() && cache != null) {
-            itemBuilder.setCustomCacheKey(cacheKey)
-        }
-        val item = itemBuilder.build()
-
-        return if (isHls) {
-            HlsMediaSource.Factory(dataSourceFactory).createMediaSource(item)
-        } else {
-            ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(item)
-        }
-    }
-
-    fun playResolved(resolved: ResolvedStreams, track: Track, videoMode: Boolean, startPositionMs: Long = 0L, playImmediately: Boolean = true) {
-        webEngine.stop()
-        PlaybackService.setWebBackgroundPlayback(context, false)
-        runCatching { context.startService(Intent(context, PlaybackService::class.java)) }
-
-        val metadata = MediaMetadata.Builder().setTitle(track.title).setArtist(track.artist).setAlbumTitle(track.album).build()
-        val audioCacheKey = if (!videoMode && !resolved.isOffline) "sonify_a_${track.id}" else null
-        val source: MediaSource = if (videoMode) {
-            when {
-                !resolved.videoUrl.isNullOrBlank() -> buildSingleSource(resolved.videoUrl, metadata, resolved.userAgent, resolved.cookie)
-                !resolved.videoOnlyUrl.isNullOrBlank() -> MergingMediaSource(
-                    buildSingleSource(resolved.videoOnlyUrl, metadata, resolved.userAgent, resolved.cookie),
-                    buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent, resolved.cookie, audioCacheKey)
-                )
-                else -> buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent, resolved.cookie, audioCacheKey)
-            }
-        } else buildSingleSource(resolved.audioUrl, metadata, resolved.userAgent, resolved.cookie, audioCacheKey)
-
-        player.setMediaSource(source, startPositionMs)
+        player.setMediaSource(finalSource)
+        player.playbackParameters = PlaybackParameters(currentSettings.playbackSpeed)
+        player.volume = if (isMuted) 0f else 1f
+        if (startPositionMs > 0L) player.seekTo(startPositionMs)
         player.prepare()
-        player.playWhenReady = playImmediately
-        updatePlaybackLocks(playImmediately)
-        if (player.audioSessionId > 0 && dynamicsProcessing == null && equalizer == null) attachAudioEffects(player.audioSessionId)
+        player.play()
+        acquireLocksIfAllowed()
     }
 
-    fun playViaWebEngine(videoId: String, startPositionMs: Long = 0L, title: String = "Sonify", artist: String = "") {
-        currentWebTitle = title
-        currentWebArtist = artist
-        player.stop()
-        player.clearMediaItems()
-        updatePlaybackLocks(true)
-        PlaybackService.setWebBackgroundPlayback(context, true, title, artist)
-        webEngine.playVideo(videoId, startPositionMs)
+    fun seamlessSwitchVideoMode(resolved: ResolvedStreams, track: Track, toVideo: Boolean, startPositionMs: Long) {
+        playResolved(resolved, track, videoMode = toVideo, startPositionMs = startPositionMs)
     }
 
-    fun seamlessSwitchVideoMode(resolved: ResolvedStreams, track: Track, toVideo: Boolean, startPositionMs: Long = player.currentPosition.coerceAtLeast(0L)) {
-        val playing = player.isPlaying || player.playWhenReady || webEngine.isPlaying
-        playResolved(resolved, track, videoMode = toVideo, startPositionMs = startPositionMs, playImmediately = playing)
+    fun playViaWebEngine(videoId: String, startAtMs: Long, title: String, artist: String) {
+        runCatching { player.stop(); player.clearMediaItems() }
+        webEngine.setPlaybackRate(currentSettings.playbackSpeed)
+        webEngine.setVolume(if (isMuted) 0f else 1f)
+        webEngine.loadVideo(videoId, startAtMs, title, artist)
+        acquireLocksIfAllowed()
     }
 
-    fun togglePlayPause(onNeedRetry: () -> Unit) {
-        if (webEngine.isActive) {
-            if (!webEngine.isPlaying) {
-                PlaybackService.setWebBackgroundPlayback(context, true, currentWebTitle, currentWebArtist)
-            }
-            webEngine.togglePlayPause()
+    fun setMuted(muted: Boolean) {
+        isMuted = muted
+        val vol = if (muted) 0f else 1f
+        player.volume = vol
+        webEngine.setVolume(vol)
+    }
+
+    fun togglePlayPause(onNeedRetry: () -> Unit = {}) {
+        if (webEngine.isActive()) {
+            if (player.isPlaying) player.pause()
+            webEngine.play()
             return
         }
         when {
-            player.playbackState == Player.STATE_IDLE -> onNeedRetry()
-            player.playbackState == Player.STATE_ENDED -> { player.seekTo(0L); player.play() }
             player.isPlaying -> player.pause()
+            player.playbackState == Player.STATE_IDLE || player.mediaItemCount == 0 -> onNeedRetry()
+            player.playbackState == Player.STATE_ENDED -> { player.seekTo(0L); player.play() }
             else -> player.play()
         }
     }
 
-    fun setPlaying(play: Boolean) {
-        if (webEngine.isActive) {
-            if (play) {
-                PlaybackService.setWebBackgroundPlayback(context, true, currentWebTitle, currentWebArtist)
-                webEngine.play()
-            } else {
-                webEngine.pause()
-            }
+    fun setPlaying(playing: Boolean) {
+        if (webEngine.isActive()) {
+            if (playing) webEngine.play() else webEngine.pause()
         } else {
-            if (play) player.play() else player.pause()
+            if (playing) player.play() else player.pause()
         }
     }
 
-    fun seekTo(positionMs: Long) {
-        if (webEngine.isActive) webEngine.seekTo(positionMs) else player.seekTo(positionMs.coerceAtLeast(0L))
+    fun seekTo(ms: Long) {
+        val clamped = ms.coerceAtLeast(0L)
+        if (webEngine.isActive()) webEngine.seekTo(clamped) else player.seekTo(clamped)
     }
 
-    fun startSleepTimer(minutes: Int, onRemainingChange: (Int?) -> Unit) {
-        sleepJob?.cancel(); sleepJob = null; sleepEndOfTrack = false
-        player.volume = 1f; webEngine.setVolume(1f)
-        if (minutes <= 0) { onRemainingChange(null); return }
-        sleepJob = scope.launch {
+    fun skipByDelta(deltaMs: Long) {
+        val cur = if (webEngine.isActive()) 0L else player.currentPosition
+        val dur = player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: Long.MAX_VALUE
+        val target = (cur + deltaMs).coerceIn(0L, dur)
+        seekTo(target)
+    }
+
+    fun applySettings(settings: AppSettings) {
+        currentSettings = settings
+        player.playbackParameters = PlaybackParameters(settings.playbackSpeed)
+        webEngine.setPlaybackRate(settings.playbackSpeed)
+        attachAudioEffects()
+    }
+
+    private fun attachAudioEffects() {
+        val sessionId = player.audioSessionId
+        if (sessionId == C.AUDIO_SESSION_ID_UNSET || sessionId <= 0) return
+
+        runCatching {
+            if (loudnessEnhancer == null) loudnessEnhancer = LoudnessEnhancer(sessionId)
+            loudnessEnhancer?.apply {
+                enabled = currentSettings.normalizeVolume
+                setTargetGain(if (currentSettings.normalizeVolume) currentSettings.normalizationLevel.gainMb else 0)
+            }
+        }
+
+        runCatching {
+            if (equalizer == null) equalizer = Equalizer(0, sessionId)
+            equalizer?.apply {
+                enabled = currentSettings.eqEnabled
+                if (currentSettings.eqEnabled) {
+                    val bands = numberOfBands.toInt()
+                    val minLvl = bandLevelRange[0].toInt()
+                    val maxLvl = bandLevelRange[1].toInt()
+                    val userBands = currentSettings.eqBands
+                    for (b in 0 until bands) {
+                        val mappedIdx = ((b * userBands.size) / bands.coerceAtLeast(1)).coerceIn(0, userBands.lastIndex)
+                        val db = userBands.getOrElse(mappedIdx) { 0 }
+                        val targetMb = (db * 100).coerceIn(minLvl, maxLvl).toShort()
+                        setBandLevel(b.toShort(), targetMb)
+                    }
+                }
+            }
+        }
+    }
+
+    fun speakDjAnnouncement(text: String, isEn: Boolean, forceAllow: Boolean = false) {
+        if (!forceAllow && !currentSettings.djVoiceEnabled) return
+        if (!ttsReady || text.isBlank()) return
+        mainHandler.post {
+            runCatching {
+                tts?.language = if (isEn) Locale.US else Locale("he", "IL")
+                tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "sonify_dj_${System.currentTimeMillis()}")
+            }
+        }
+    }
+
+    fun startSleepTimer(minutes: Int, onTick: (Int?) -> Unit) {
+        sleepTimerJob?.cancel()
+        sleepEndOfTrack = false
+        if (minutes <= 0) {
+            onTick(null)
+            return
+        }
+        sleepTimerJob = scope.launch {
             var remainingSec = minutes * 60
             while (remainingSec > 0 && isActive) {
-                onRemainingChange((remainingSec + 59) / 60)
-                if (remainingSec <= 5) {
-                    val v = (remainingSec / 5f).coerceIn(0.05f, 1f)
-                    player.volume = v
-                    if (webEngine.isActive) webEngine.setVolume(v)
+                onTick((remainingSec + 59) / 60)
+                if (remainingSec <= 6) {
+                    val fadeVol = (remainingSec / 6f).coerceIn(0.05f, 1f)
+                    if (!isMuted) {
+                        player.volume = fadeVol
+                        webEngine.setVolume(fadeVol)
+                    }
                 }
-                delay(1000)
+                delay(1000L)
                 remainingSec--
             }
-            if (webEngine.isActive) webEngine.pause() else player.pause()
-            releaseLocks()
-            player.volume = 1f; webEngine.setVolume(1f)
-            onRemainingChange(null)
+            setPlaying(false)
+            if (!isMuted) {
+                player.volume = 1f
+                webEngine.setVolume(1f)
+            }
+            onTick(null)
         }
     }
 
-    fun setSleepEndOfTrack(enabled: Boolean) { sleepJob?.cancel(); sleepJob = null; sleepEndOfTrack = enabled }
+    fun setSleepEndOfTrack(enabled: Boolean) {
+        sleepTimerJob?.cancel()
+        sleepEndOfTrack = enabled
+    }
 
     fun getSystemVolumeFraction(): Float {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return 0.7f
-        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-        return am.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / max.toFloat()
+        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        return (cur.toFloat() / max.toFloat()).coerceIn(0f, 1f)
     }
 
     fun setSystemVolumeFraction(fraction: Float) {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-        am.setStreamVolume(AudioManager.STREAM_MUSIC, (fraction.coerceIn(0f, 1f) * max).toInt(), 0)
+        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        val target = (fraction.coerceIn(0f, 1f) * max).toInt()
+        runCatching { audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0) }
     }
 
-    fun adjustVolumeStep(up: Boolean) {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        am.adjustStreamVolume(AudioManager.STREAM_MUSIC, if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+    fun getOutputDevices(isEn: Boolean): List<AudioOutputItem> {
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        val list = mutableListOf<AudioOutputItem>()
+        var hasExternal = false
+        devices.forEach { d ->
+            val type = d.type
+            val (he, en, lossless) = when (type) {
+                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLE_HEADSET -> Triple("אוזניות Bluetooth", "Bluetooth Audio", false)
+                AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_WIRED_HEADSET -> Triple("אוזניות חוטיות", "Wired Headphones", true)
+                AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> Triple("USB DAC / אודיו", "USB Audio / DAC", true)
+                else -> return@forEach
+            }
+            hasExternal = true
+            val name = d.productName?.toString()?.takeIf { it.isNotBlank() } ?: if (isEn) en else he
+            if (list.none { it.name == name }) {
+                list.add(AudioOutputItem(d.id, name, he, en, lossless, true))
+            }
+        }
+        list.add(
+            AudioOutputItem(
+                id = 0,
+                name = if (isEn) "This Phone" else "מכשיר זה",
+                typeLabelHe = "רמקול מובנה",
+                typeLabelEn = "Built-in Speaker",
+                isLosslessCapable = false,
+                isActive = !hasExternal
+            )
+        )
+        return list
     }
 
     fun openSystemAudioSettings() {
-        runCatching { context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
-            .onFailure { runCatching { context.startActivity(Intent(Settings.ACTION_SOUND_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
-    }
-
-    fun getOutputDevices(isEn: Boolean = false): List<AudioOutputItem> {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return emptyList()
-        val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        val hasExternal = devices.any {
-            it.type in listOf(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_USB_DEVICE)
+        runCatching {
+            val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+            context.startActivity(intent)
         }
-        return devices.mapNotNull { d ->
-            when (d.type) {
-                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> AudioOutputItem(
-                    id = d.id,
-                    name = if (isEn) "This Phone" else "המכשיר הזה",
-                    typeLabelHe = "רמקול מובנה",
-                    typeLabelEn = "Built-in Speaker",
-                    isLosslessCapable = false,
-                    isActive = !hasExternal
-                )
-                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> {
-                    val rawName = d.productName?.toString()?.trim().orEmpty()
-                    val friendly = if (rawName.isBlank() || rawName.equals(Build.MODEL, true)) {
-                        if (isEn) "Bluetooth Headphones" else "אוזניות Bluetooth"
-                    } else rawName
-                    AudioOutputItem(d.id, friendly, "אוזניות / רמקול Bluetooth", "Bluetooth Audio", false, true)
-                }
-                AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_WIRED_HEADSET -> AudioOutputItem(
-                    d.id, if (isEn) "Wired Headphones" else "אוזניות חוטיות",
-                    "חיבור חוטי • תומך Lossless", "Wired • Lossless Ready", true, true
-                )
-                AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> AudioOutputItem(
-                    d.id, d.productName?.toString()?.takeIf { it.isNotBlank() && !it.equals(Build.MODEL, true) } ?: "USB-C DAC",
-                    "USB-C Audio • תומך Lossless", "USB-C Audio • Lossless Ready", true, true
-                )
-                else -> null
-            }
-        }.distinctBy { "${it.name}_${it.typeLabelEn}" }
     }
 }
