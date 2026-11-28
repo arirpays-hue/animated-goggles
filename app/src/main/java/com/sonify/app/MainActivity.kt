@@ -107,9 +107,10 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
     }
 
     BackHandler(
-        enabled = state.showDjStudioSheet || state.showNowPlaying || state.showSettings || state.openedArtist != null || state.openedPlaylist != null || state.selectedFolderId != null || state.selectedTab != MainTab.HOME
+        enabled = state.samplesFeed != null || state.showDjStudioSheet || state.showNowPlaying || state.showSettings || state.openedArtist != null || state.openedPlaylist != null || state.selectedFolderId != null || state.selectedTab != MainTab.HOME
     ) {
         when {
+            state.samplesFeed != null -> vm.closeSamplesFeed()
             state.showDjStudioSheet -> vm.setShowDjStudioSheet(false)
             state.showNowPlaying -> vm.setShowNowPlaying(false)
             state.showSettings -> {
@@ -136,7 +137,7 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
         MaterialTheme(colorScheme = darkColors) {
             Box(modifier = Modifier.fillMaxSize().background(SpotifyBlack)) {
 
-                if (!(state.showNowPlaying && state.isVideoMode)) {
+                if (!(state.showNowPlaying && state.isVideoMode && state.samplesFeed == null)) {
                     AndroidView(
                         factory = { ctx -> FrameLayout(ctx).also { vm.audioEngine.attachWebView(it) } },
                         update = { vm.audioEngine.attachWebView(it) },
@@ -155,7 +156,7 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
                     }
                 }
 
-                if (!state.showSettings && !state.showNowPlaying) {
+                if (!state.showSettings && !state.showNowPlaying && state.samplesFeed == null) {
                     Column(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -182,6 +183,17 @@ fun SonifyRootApp(state: UiState, vm: AppViewModel) {
                     exit = slideOutVertically(targetOffsetY = { it / 2 }) + fadeOut()
                 ) {
                     NowPlayingScreen(state = state, vm = vm)
+                }
+
+                // Vertical Song Samples Discovery Screen ("דומה ל..." / "שירים של...")
+                AnimatedVisibility(
+                    visible = state.samplesFeed != null,
+                    enter = slideInVertically(initialOffsetY = { it / 3 }) + fadeIn(),
+                    exit = slideOutVertically(targetOffsetY = { it / 3 }) + fadeOut()
+                ) {
+                    state.samplesFeed?.let { feed ->
+                        SongSamplesScreen(feed = feed, state = state, vm = vm)
+                    }
                 }
 
                 if (state.showDevicesSheet) DevicesBottomSheet(state, vm)
